@@ -146,7 +146,15 @@ export interface HearthNode {
    * to debug, so it's one call instead of three.
    */
   start: () => void;
-  close: () => Promise<void>;
+  /**
+   * Stop, optionally letting requests already in flight finish first.
+   *
+   * `graceMs` defaults to 0, which destroys them where they stand -- the old
+   * behaviour, kept as the default because a test that just wants the socket
+   * back should not wait on a request it deliberately left hanging. The
+   * service passes `shutdownGraceMs`.
+   */
+  close: (graceMs?: number) => Promise<void>;
 }
 
 export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
@@ -562,7 +570,25 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     );
   }
 
+  /**
+   * Requests being served right now, for the drain in `close()`.
+   *
+   * Counted here rather than from `pool.jobs()` because a job is only the
+   * queued half: a passthrough render holds no job at all, and neither does a
+   * peer relay. What must not be destroyed mid-flight is a REQUEST, so that is
+   * what is counted.
+   */
+  let inFlight = 0;
+  let drained: (() => void) | null = null;
+
   const server = createServer((req, res) => {
+    inFlight++;
+    // "close" rather than "finish": it fires for a response that ended and for
+    // a client that hung up, which are the same thing to a drain and would
+    // otherwise leak the count upward until nothing could ever finish waiting.
+    res.on("close", () => {
+      if (--inFlight === 0) drained?.();
+    });
     void handle(req, res).catch((e) => {
       log.error("request.failed", { error: e instanceof Error ? e.message : String(e) });
       if (!res.headersSent) apiError(res, 500, "internal error", "server_error");
@@ -1987,15 +2013,41 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       peers.start();
       history.start();
     },
-    close: () =>
-      new Promise<void>((resolve) => {
-        peers.stop();
-        pool.stop();
-        history.stop();
-        uiServer?.close();
-        uiServer?.closeAllConnections?.();
-        server.close(() => resolve());
-        server.closeAllConnections?.();
-      }),
+    close: async (graceMs = 0) => {
+      peers.stop();
+      pool.stop();
+      history.stop();
+      // The page is not work. Nothing is lost by dropping a poll mid-flight,
+      // and a browser holding one open would otherwise pace the whole drain.
+      uiServer?.close();
+      uiServer?.closeAllConnections?.();
+
+      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      // Stop accepting, and drop the connections sitting idle. A keep-alive
+      // client holding one open is not work either, and waiting on it would
+      // make every drain take the full grace period.
+      server.closeIdleConnections?.();
+
+      if (graceMs > 0 && inFlight > 0) {
+        const t0 = Date.now();
+        log.info("drain.start", { inFlight, graceMs });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          new Promise<void>((resolve) => { drained = resolve; }),
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, graceMs); }),
+        ]);
+        if (timer !== undefined) clearTimeout(timer);
+        drained = null;
+        const ms = Date.now() - t0;
+        // Say which one it was. A drain that timed out means the deploy DID
+        // take work with it, and that is worth knowing before the reports come
+        // in rather than after.
+        if (inFlight > 0) log.warn("drain.cut", { abandoned: inFlight, ms });
+        else log.info("drain.done", { ms });
+      }
+
+      server.closeAllConnections?.();
+      await closed;
+    },
   };
 }

@@ -443,6 +443,22 @@ export interface HearthConfig {
    */
   peerFirstByteMs: number;
   /**
+   * How long a shutdown waits for requests already in flight, in ms. 0 kills
+   * them immediately, which is what this did before it was a number.
+   *
+   * A restart is a deploy, and the work in flight at that moment is somebody's
+   * chat turn or a render several GPU-minutes in. Destroying the socket loses
+   * it with no error the caller can act on -- the response simply stops -- and
+   * nothing retries it. Waiting costs the deploy a few seconds and the caller
+   * nothing.
+   *
+   * Bounded, because the alternative is a stuck deploy: past this the remaining
+   * connections are destroyed exactly as before. Keep the service manager's own
+   * stop timeout above this (systemd's `TimeoutStopSec`, default 90s) or it
+   * SIGKILLs mid-drain and the wait bought nothing.
+   */
+  shutdownGraceMs: number;
+  /**
    * What a cold model is worth to `fastest`, in queued-jobs-equivalent. 0 means
    * ignore warmth and compare queue depth alone.
    *
@@ -1103,6 +1119,9 @@ export function parseConfig(raw: unknown): HearthConfig {
     // like working peer failover right up until a peer hangs.
     peerFirstByteMs: atLeast(root.peerFirstByteMs, "peerFirstByteMs", 180_000),
     coldPenalty: atLeast(root.coldPenalty, "coldPenalty", 2),
+    // 30s covers a sidecar call, an embedding and most chat turns. A box whose
+    // routes are minutes-long renders wants more, and its TimeoutStopSec too.
+    shutdownGraceMs: atLeast(root.shutdownGraceMs, "shutdownGraceMs", 30_000),
   };
 }
 

@@ -90,6 +90,7 @@ Every key with its default. Only `backend.url` is required.
 | `peerPollMs` / `peerStaleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
 | `peerFirstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
 | `coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
+| `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them, which is what it used to do |
 | `peers` | `[]` | nodes you can send work to |
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
 | `stateFile` | `null` | fallback for Save when the config file itself cannot be written. Null unless you need it |
@@ -863,6 +864,7 @@ ExecStartPre=/usr/bin/node /opt/hearth/dist/cli.js serve --config /etc/hearth.ya
 ExecStart=/usr/bin/node /opt/hearth/dist/cli.js serve --config /etc/hearth.yaml
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=45
 ```
 
 `ReadWritePaths=` is what lets the console's Save button write your config.
@@ -878,9 +880,26 @@ them from the config as `env:NAME`, which is also what keeps the config
 committable. Note that `--check` will fail outside systemd unless you source
 that env file first, since a missing token is deliberately fatal.
 
-The queue is in memory, so a restart drops whatever was waiting. Pair
-`Restart=on-failure` with `StartLimitBurst` in `[Unit]` so a crash loop cannot
-quietly eat a job every five seconds.
+`TimeoutStopSec` is there because a stop is not instant any more. On SIGTERM
+hearth stops accepting connections, drops the idle ones, and gives whatever is
+already in flight up to `shutdownGraceMs` to finish — a chat turn mid-stream, a
+render several GPU-minutes in. Anything still running when that runs out is
+destroyed, and the drain says so in the log:
+
+```
+{"level":"info","msg":"drain.start","inFlight":3,"graceMs":30000}
+{"level":"warn","msg":"drain.cut","abandoned":1,"ms":30001}
+```
+
+Keep the unit's stop timeout comfortably above the grace, or systemd SIGKILLs
+mid-drain and the wait bought nothing. A second SIGTERM (or a second ^C) skips
+the rest of the wait and exits, for when you would rather not sit through it.
+
+A request still QUEUED is in flight too — its caller is holding the connection,
+so it gets its turn if the grace allows. The queue itself is memory only and
+nothing is written down, so whatever the grace does not cover is simply gone.
+Pair `Restart=on-failure` with `StartLimitBurst` in `[Unit]` so a crash loop
+cannot quietly eat a job every five seconds.
 
 ## What it won't do
 
