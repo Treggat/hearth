@@ -365,7 +365,7 @@ function useSparks(calls: Call[] | undefined): Spark[] {
 /** The shell every node shares: the click target, the selected ring, the tone. */
 function NodeBox({ p, tone, icon, selected, peer, dim, onSelect, onHover, title, children }: {
   p: Placed;
-  tone: "live" | "work" | "fault" | "idle";
+  tone: "live" | "work" | "fault" | "cold" | "idle";
   icon: IconKind;
   selected: boolean;
   /** A peer machine: a live peer takes the peer hue, self takes the success green. */
@@ -381,7 +381,8 @@ function NodeBox({ p, tone, icon, selected, peer, dim, onSelect, onHover, title,
   // same-shape machines still tell apart at a glance; down and busy keep the
   // shared state colours, which must stay consistent across the stage.
   const colour = tone === "live" ? (peer ? "peer.main" : "success.main")
-    : tone === "work" ? "warning.main" : tone === "fault" ? "error.main" : "faint";
+    : tone === "work" ? "warning.main" : tone === "fault" ? "error.main"
+    : tone === "cold" ? "cold.main" : "faint";
   // Big enough to be the thing you see first, and still inside a node narrow
   // enough that nine backends fit a laptop without the stage scrolling.
   const glyph = glyphFor(p.w);
@@ -444,10 +445,13 @@ function Head({ tone, name, right }: { tone: string; name: string; right?: React
   );
 }
 
-const Sub = ({ children, color = "faint" }: { children: React.ReactNode; color?: string }) => (
+const Sub = ({ children, color = "faint", sx }: {
+  children: React.ReactNode; color?: string; sx?: Record<string, unknown>;
+}) => (
   <Typography component="span" sx={{
     fontFamily: MONO, fontSize: 10.5, color, display: "block",
     overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+    ...sx,
   }}>{children}</Typography>
 );
 
@@ -803,8 +807,13 @@ export function Graph({ d, sel, onSelect }: {
             // and painting it amber is how a colour stops meaning anything.
             const stalled = held.length > 0 && q > 0;
             const loaded = (b.loaded ?? []).map((m) => displayId(m, d.aliases, d.net.available));
+            const loading = (b.loading ?? []).map((m) => displayId(m, d.aliases, d.net.available));
             const proxied = b.proxying ?? [];
-            const tone = stalled ? "work"
+            // A load outranks a running job for the node's own colour: the job IS
+            // the load, and "running" is the least useful of the two things to
+            // say about a backend that will be busy for another minute.
+            const tone = loading.length ? "cold"
+              : stalled ? "work"
               : used > 0 || proxied.length ? "live" : q > 0 ? "work" : "idle";
             return (
               <NodeBox key={b.name} p={p} tone={tone}
@@ -813,18 +822,30 @@ export function Graph({ d, sel, onSelect }: {
                        dim={dimmed(`backend:${b.name}`)}
                        onHover={(on) => setHover(on ? `backend:${b.name}` : null)}
                        onSelect={() => onSelect({ kind: "backend", id: b.name })}
-                       title={stalled
+                       title={loading.length
+                         ? `${b.name} is loading ${loading.join(", ")} from disk. Nothing else can start on its card until that finishes, and a cold load of a large model is tens of seconds — the request waiting on it is not stuck.`
+                         : stalled
                          ? `${q} waiting on hardware someone else holds — ${held.map((r) => `${r.holder} has ${r.name}`).join(", ")}`
                          : held.length
                            ? `idle. ${held.map((r) => `${r.holder} holds ${r.name}`).join(", ")}, so it could not start anyway — but it has nothing to start.`
                          : proxied.length
                            ? `${proxied.length} request(s) are being forwarded straight through to ${b.name}. hearth is not scheduling them: they hold no slot, wait for nothing, and the card arbiter cannot see them.`
                            : `${b.name}${b.url ? ` · ${b.url}` : ""} — click for its models`}>
-                <Head tone={stalled ? "warning.main"
+                <Head tone={loading.length ? "cold.main"
+                            : stalled ? "warning.main"
                             : used > 0 || proxied.length ? "success.main" : "faint"} name={b.name}
                       right={<Pips used={Math.max(0, used)} slots={slots} />} />
-                <Sub color={stalled ? "warning.main" : loaded.length ? "success.main" : "faint"}>
-                  {stalled ? `blocked · ${held.map((r) => r.name).join(", ")}`
+                {/* A load outranks everything else this line could say. While it
+                    runs the backend has nothing loaded and a job running, and
+                    both of those readings are true and useless — the fact that
+                    matters is that a file is coming off a disk and the wait is
+                    expected. It breathes because it is the one state here that
+                    ends on its own. */}
+                <Sub color={loading.length ? "cold.main"
+                  : stalled ? "warning.main" : loaded.length ? "success.main" : "faint"}
+                     sx={loading.length ? { animation: "hearth-breathe 1.8s ease-in-out infinite" } : undefined}>
+                  {loading.length ? `loading ${loading.join(", ")}`
+                    : stalled ? `blocked · ${held.map((r) => r.name).join(", ")}`
                     : loaded.length ? loaded.join(", ")
                     : held.length ? `${held.map((r) => r.name).join(", ")} busy`
                     : b.knowsWarm === false ? "warmth unknown" : "nothing loaded"}
@@ -857,29 +878,42 @@ export function Graph({ d, sel, onSelect }: {
             // saying is how many of the things on it are actually working.
             const inUse = backends.filter((b) => (b.resources ?? []).includes(r.name)
               && jobs.some((j) => !j.offbox && j.backend === b.name));
+            // A card whose backend is mid-load is not merely busy: nothing else
+            // can have it for as long as the read takes, and that is the number
+            // worth knowing when you are looking at why a queue is not moving.
+            const filling = backends.filter((b) => (b.resources ?? []).includes(r.name)
+              && (b.loading ?? []).length > 0);
             return (
               <NodeBox key={r.name} p={p}
                        // Shared hardware is never "held", so it never goes green
                        // for a holder. Busy is still busy: work on it still reads
                        // as work.
-                       tone={r.holder ? "live" : unqueued.length ? "work"
+                       tone={filling.length ? "cold"
+                         : r.holder ? "live" : unqueued.length ? "work"
                          : r.shared && inUse.length ? "live" : "idle"}
                        icon={resourceIcon(r.kind)}
                        selected={sel?.kind === "resource" && sel.id === r.name}
                        dim={dimmed(`resource:${r.name}`)}
                        onHover={(on) => setHover(on ? `resource:${r.name}` : null)}
                        onSelect={() => onSelect({ kind: "resource", id: r.name })}
-                       title={r.shared
+                       title={filling.length
+                         ? `${filling.map((b) => b.name).join(", ")} is reading a model onto ${r.name}. A cold load is tens of seconds and nothing else can have the card until it finishes — so a queue that looks stopped is waiting on a disk, not on a decision.`
+                         : r.shared
                          ? `${r.name} is shared: everything declared on it runs at once, so hearth does not arbitrate it and nothing waits for it. ${backends.filter((b) => (b.resources ?? []).includes(r.name)).length} backend(s) use it.`
                          : r.holder
                          ? `${r.holder} is running on ${r.name}; everything else declared on it waits`
                          : unqueued.length
                            ? `${r.name} is busy: ${unqueued.map((b) => b.name).join(", ")} is working on it. But hearth is not scheduling that work — it was forwarded straight through — so hearth cannot make anything else wait for this card while it runs.`
                            : `${r.name} is free — free and still loaded is the normal resting state`}>
-                <Head tone={r.holder ? "success.main" : unqueued.length ? "warning.main" : "faint"} name={r.name} />
-                <Sub color={r.holder || (r.shared && inUse.length) ? "success.main"
-                  : unqueued.length ? "warning.main" : "faint"}>
-                  {r.shared
+                <Head tone={filling.length ? "cold.main"
+                  : r.holder ? "success.main" : unqueued.length ? "warning.main" : "faint"} name={r.name} />
+                <Sub color={filling.length ? "cold.main"
+                  : r.holder || (r.shared && inUse.length) ? "success.main"
+                  : unqueued.length ? "warning.main" : "faint"}
+                     sx={filling.length ? { animation: "hearth-breathe 1.8s ease-in-out infinite" } : undefined}>
+                  {filling.length
+                    ? `${filling[0]!.name} · loading`
+                    : r.shared
                     ? (inUse.length ? `${inUse.length} of ${backends.filter((b) => (b.resources ?? []).includes(r.name)).length} working` : "shared · idle")
                     : r.holder ? `${r.holder} holding`
                     : unqueued.length ? `${unqueued[0]!.name} · in use`

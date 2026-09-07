@@ -22,6 +22,18 @@ import { getJson, send } from "./upstream.js";
 
 /** llama-swap only counts a model as loaded once it's ready to serve. */
 const READY = "ready";
+/**
+ * ...and this is what it says for the minute before that.
+ *
+ * A cold load is the longest thing that happens on this box — 47.8s measured
+ * for a 32k-context model off the disk — and it was the one event the console
+ * could not name. The backend drew "nothing loaded" with a job running on it,
+ * which is true twice over and explains nothing: the model is not loaded, and
+ * the request is running, and the reason it will sit there for another minute
+ * is that a file is coming off a disk. llama-swap has been saying so on every
+ * event frame all along; we filtered it out one line above.
+ */
+const STARTING = "starting";
 
 /** How long we'll trust a quiet stream before going and asking. */
 const STALE_MS = 60_000;
@@ -36,6 +48,7 @@ interface ModelStatus {
 
 export class BackendState {
   private loadedIds: string[] = [];
+  private loadingIds: string[] = [];
   private catalogIds: string[] = [];
   /** False for `kind: none`, where an empty warm set means "we cannot see",
    *  not "nothing is warm". Callers must not turn one into the other. */
@@ -319,6 +332,7 @@ export class BackendState {
 
   private apply(models: ModelStatus[]): void {
     this.catalogIds = models.map((m) => m.id);
+    this.loadingIds = models.filter((m) => m.state === STARTING).map((m) => m.id);
     this.setLoaded(models.filter((m) => m.state === READY).map((m) => m.id));
     this.lastUpdateAt = Date.now();
     this.lastOkAt = this.lastUpdateAt;
@@ -400,6 +414,17 @@ export class BackendState {
     return this.lastOkAt > 0 && Date.now() - this.lastOkAt <= STALE_MS;
   }
 
+  /**
+   * Models being read off the disk right now, newest information first.
+   *
+   * Empty for every backend that cannot tell us — which is not the same as
+   * nothing loading, and is why the page draws this only when it is non-empty
+   * rather than drawing an absence.
+   */
+  loading(): string[] {
+    return [...this.loadingIds];
+  }
+
   /** Whatever this kind of backend calls "what is loaded right now". */
   private async readWarm(): Promise<string[]> {
     if (this.kind === "ollama") {
@@ -419,6 +444,13 @@ export class BackendState {
         `${this.url}/running`,
         { headersTimeoutMs: 3_000 },
       );
+      // The poll is the fallback for a backend with no event stream, and it
+      // reports the same states — so it must learn the same thing, or a load
+      // would be visible on one transport and invisible on the other.
+      this.loadingIds = (running.running ?? [])
+        .filter((m) => m.state === STARTING)
+        .map((m) => m.model ?? "")
+        .filter((m) => m !== "");
       return (running.running ?? [])
         .filter((m) => (m.state ?? READY) === READY)
         .map((m) => m.model ?? "")

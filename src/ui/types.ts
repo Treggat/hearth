@@ -42,6 +42,15 @@ export interface Backend {
   url?: string;
   kind?: string;
   loaded?: string[];
+  /**
+   * Models being read off the disk right now.
+   *
+   * A cold load is tens of seconds — 48 of them for a 32k model here — and it
+   * is the reason a request that looks stuck is not stuck. Empty where the
+   * backend cannot report it, which is why the page draws it only when there
+   * is something in it.
+   */
+  loading?: string[];
   serves?: string[];
   /** Only llama-swap. An ollama backend keeps its set resident, so it cannot thrash. */
   evicts?: boolean;
