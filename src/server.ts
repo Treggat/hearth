@@ -23,7 +23,7 @@ import type { Logger } from "./log.js";
 import { PeerRegistry, PeerStatusError } from "./peers.js";
 import { BackendPool } from "./pool.js";
 import { decide } from "./route.js";
-import { History } from "./history.js";
+import { History, KEEP } from "./history.js";
 import { QueueFullError } from "./scheduler.js";
 import { needsOf, unfit, type ModelStats } from "./stats.js";
 import { UI_HTML } from "./ui.js";
@@ -580,6 +580,21 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    */
   let inFlight = 0;
   let drained: (() => void) | null = null;
+  /** Responses that are open but are not work — the event stream. */
+  const parked = new WeakSet<ServerResponse>();
+
+  /**
+   * Stop counting this response as work in flight.
+   *
+   * For a long-lived stream: it is open for as long as somebody has a tab
+   * open, so counting it would make every shutdown sit out the full drain
+   * waiting for a page that is never going to finish.
+   */
+  function notWork(res: ServerResponse): void {
+    if (parked.has(res)) return;
+    parked.add(res);
+    if (--inFlight === 0) drained?.();
+  }
 
   const server = createServer((req, res) => {
     inFlight++;
@@ -587,6 +602,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // a client that hung up, which are the same thing to a drain and would
     // otherwise leak the count upward until nothing could ever finish waiting.
     res.on("close", () => {
+      if (parked.has(res)) return;
       if (--inFlight === 0) drained?.();
     });
     void handle(req, res).catch((e) => {
@@ -1415,11 +1431,19 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       return;
     }
 
-    if (path === "/ui" || path === "/ui/" || path === "/ui/data") {
+    if (path === "/ui" || path === "/ui/" || path === "/ui/data" || path === "/ui/events") {
       // On the MAIN port the page stays loopback-only. Reaching it from
       // elsewhere is what uiListen is for, and that is a separate socket.
       if (!isLoopback(req)) {
         apiError(res, 403, "the status page is loopback-only", "permission_error");
+        return;
+      }
+      // Same gate, same data, different transport. EventSource cannot send an
+      // Authorization header, which is exactly why the page's sockets are
+      // decided by ADDRESS and not by credential — so the stream needs no
+      // separate story about auth, and gets none.
+      if (path === "/ui/events") {
+        await serveUiEvents(req, res, true);
         return;
       }
       await serveUi(path, res, true);
@@ -1648,64 +1672,217 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    */
   const writeMode = (): "open" | "key" => (cfg.apiKeys.length === 0 ? "open" : "key");
 
+  /**
+   * Everything the page draws, in one object.
+   *
+   * Extracted from `serveUi` so the poll and the event stream cannot drift:
+   * `/ui/data` is one of these serialised, and a stream frame is the diff
+   * between two of them. A field added here reaches both by construction.
+   *
+   * ensureFresh, not probeAll: this is built every second while a page is
+   * open, and a forced round trip to every peer each time would turn a status
+   * page into a load generator.
+   */
+  async function uiPayload(canWarm: boolean): Promise<Record<string, unknown>> {
+    await peers.ensureFresh();
+    return {
+      canWarm,
+      // How this page must authenticate its writes, decided per socket rather
+      // than assumed. "off" when the socket serves no write routes at all.
+      control: canWarm ? writeMode() : "off",
+      // Shown on both sockets, since knowing you are paused matters most when
+      // you are looking at a page that says nothing is being served. The
+      // BUTTONS are gated on canWarm, which is really "is this the socket that
+      // can perform actions" — the standalone UI listener answers three paths
+      // and /control is not one of them, so a switch there would always fail.
+      controls: controls.state(),
+      // Everything the sharing and mapping controls need to render: what we
+      // could lend, what the file says we lend, what we lend right now, and
+      // what differs. Sent even to the read-only listener, which renders the
+      // same facts without the buttons.
+      share: shared(),
+      configuredShare: cfg.share,
+      catalog: pool.catalog(),
+      contexts: (() => {
+        const out: Record<string, number> = {};
+        for (const id of pool.catalog()) {
+          const ctx = pool.contextLength(id);
+          if (ctx !== null) out[id] = ctx;
+        }
+        return out;
+      })(),
+      // Which advertised ids are one seat under another name. `models.<id>.as`
+      // rewrites the id on the way to a local backend, so an id whose `as` is
+      // itself an advertised model is a VARIANT of that model: the same weights
+      // answering to a second id, usually with different `params`. The page
+      // folds those under their parent instead of drawing sixteen rows for
+      // eleven models. An `as` that names a backend-only wire id (nomic-embed
+      // -> nomic-embed-text-v2-moe:latest) is a rename, not a variant; the page
+      // can tell the two apart because it also has the catalog, so both are
+      // sent as they are.
+      aliases: aliasView(),
+      overrides: overrideView(),
+      net: networkView(),
+      q: {
+        jobs: pool.jobs(),
+        capacity: pool.loadedAggregate(),
+        backends: pool.all().map((b) => ({ name: b.name, ...pool.loadedCapacity(b) })),
+      },
+      hist: history.all(),
+      // Every call that ran here in the same window, so the page can draw the
+      // lanes per request rather than per 5s reading, and say how long each took.
+      calls: history.calls(),
+      // How many samples the ring holds. The stream sends new samples one at a
+      // time and the page trims to this, so its history stays the same length
+      // as ours instead of growing for as long as the tab is open.
+      histKeep: KEEP,
+    };
+  }
+
+  /**
+   * The page, pushed instead of polled.
+   *
+   * The poll was 95KB every 3 seconds per open tab, and 93% of it was `hist` --
+   * 120 samples of which the client already had 119. So the stream sends one
+   * snapshot on connect and then only what changed, with new history samples
+   * appended one at a time. An idle box goes from ~31KB/s to nothing at all.
+   *
+   * Frames are diffs of the SAME object `/ui/data` serves, so there is one
+   * payload builder and the two transports cannot drift. `/ui/data` stays
+   * exactly as it was: it is the fallback when EventSource cannot connect, and
+   * it is what every test reads.
+   *
+   * One baseline is shared by every subscriber, which is why `canWarm` and
+   * `control` are stamped per connection at snapshot time and never appear in a
+   * patch -- they describe the SOCKET, not the node, and they never change for
+   * the life of one.
+   */
+  const streams = new Set<ServerResponse>();
+  let lastSent: Record<string, unknown> | null = null;
+  let uiTimer: ReturnType<typeof setInterval> | null = null;
+  let lastFlushAt = 0;
+
+  /** 1s, against the page's old 3s. Cheap now that a quiet tick sends nothing,
+   *  and it is the difference between a graph that animates and one that
+   *  lurches. Not configurable: a knob here would only ever be turned down to
+   *  save traffic that no longer exists. */
+  const UI_TICK_MS = 1_000;
+  /** Comment frames keep an idle connection alive through anything that times
+   *  out a quiet socket. Nothing should be between us and the browser, but a
+   *  stream that dies silently after 60s is a bad way to find out otherwise. */
+  const UI_PING_MS = 15_000;
+
+  /**
+   * Everything after `prev`'s last element, when `next` is `prev` with items
+   * appended (and possibly some dropped off the front, which is what a ring
+   * does). Null when it cannot be expressed that way and the array must be
+   * sent whole.
+   *
+   * By value rather than by index: a fixed-size ring gives no stable position,
+   * and by timestamp would drop the second of two samples that share a
+   * millisecond -- the same trap that made the queue table lose rows.
+   */
+  function appendedTail(prev: unknown[], next: unknown[]): unknown[] | null {
+    if (prev.length === 0) return null;
+    const last = JSON.stringify(prev[prev.length - 1]);
+    for (let i = next.length - 1; i >= 0; i--) {
+      if (JSON.stringify(next[i]) === last) return next.slice(i + 1);
+    }
+    return null;
+  }
+
+  function uiDiff(
+    prev: Record<string, unknown>,
+    next: Record<string, unknown>,
+  ): { set?: Record<string, unknown>; add?: { hist: unknown[] } } | null {
+    const set: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(next)) {
+      if (k === "hist" || k === "canWarm" || k === "control") continue;
+      if (JSON.stringify(v) !== JSON.stringify(prev[k])) set[k] = v;
+    }
+    let add: { hist: unknown[] } | undefined;
+    const ph = (prev.hist ?? []) as unknown[];
+    const nh = (next.hist ?? []) as unknown[];
+    if (JSON.stringify(ph) !== JSON.stringify(nh)) {
+      const tail = appendedTail(ph, nh);
+      // A tail of nothing means the ring rolled without gaining anything, which
+      // cannot happen -- but sending `add: {hist: []}` would be a frame saying
+      // nothing, so treat it as no change rather than as a resync.
+      if (tail && tail.length > 0) add = { hist: tail };
+      else if (!tail) set.hist = nh;
+    }
+    if (Object.keys(set).length === 0 && !add) return null;
+    return { ...(Object.keys(set).length ? { set } : {}), ...(add ? { add } : {}) };
+  }
+
+  function writeFrame(res: ServerResponse, event: string, data: unknown): void {
+    // Backpressure is ignored on purpose. Every frame is derived from a
+    // snapshot the client can re-request, so a slow reader falling behind
+    // costs it freshness and nothing else -- and the alternative, buffering
+    // per client, is how a status page starts holding memory.
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  async function broadcast(): Promise<void> {
+    if (streams.size === 0) return;
+    const next = await uiPayload(false);
+    const patch = lastSent ? uiDiff(lastSent, next) : null;
+    lastSent = next;
+    if (patch) {
+      for (const res of streams) writeFrame(res, "patch", patch);
+      lastFlushAt = Date.now();
+      return;
+    }
+    if (Date.now() - lastFlushAt >= UI_PING_MS) {
+      for (const res of streams) res.write(": ping\n\n");
+      lastFlushAt = Date.now();
+    }
+  }
+
+  async function serveUiEvents(req: IncomingMessage, res: ServerResponse, canWarm: boolean): Promise<void> {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-store",
+      Connection: "keep-alive",
+    });
+    // An open stream is not work in flight. Without this every page left open
+    // in a tab would hold a shutdown for the whole drain, which is the exact
+    // failure the drain was added to prevent, arriving by a different door.
+    notWork(res);
+
+    lastSent ??= await uiPayload(false);
+    writeFrame(res, "snapshot", {
+      ...lastSent,
+      canWarm,
+      control: canWarm ? writeMode() : "off",
+    });
+    lastFlushAt = Date.now();
+
+    streams.add(res);
+    if (uiTimer === null) {
+      uiTimer = setInterval(() => void broadcast(), UI_TICK_MS);
+      uiTimer.unref?.();
+    }
+    const drop = (): void => {
+      streams.delete(res);
+      // Nobody watching, nothing to build. The payload is only assembled while
+      // a page is actually open.
+      if (streams.size === 0 && uiTimer !== null) {
+        clearInterval(uiTimer);
+        uiTimer = null;
+        lastSent = null;
+      }
+    };
+    res.on("close", drop);
+    req.on("aborted", drop);
+  }
+
   async function serveUi(path: string, res: ServerResponse, canWarm = false): Promise<void> {
     if (path === "/ui/data") {
       // One payload rather than three fetches. It also means /network and
       // /queue keep their own auth gate untouched: nothing here relaxes them,
       // the page simply does not use them.
-      //
-      // ensureFresh, not probeAll: the page polls every few seconds, and a
-      // forced round trip to every peer on every poll would turn a status page
-      // into a load generator.
-      await peers.ensureFresh();
-      json(res, 200, {
-        canWarm,
-        // How this page must authenticate its writes, decided per socket rather
-        // than assumed. "off" when the socket serves no write routes at all.
-        control: canWarm ? writeMode() : "off",
-        // Shown on both sockets, since knowing you are paused matters most when
-        // you are looking at a page that says nothing is being served. The
-        // BUTTONS are gated on canWarm, which is really "is this the socket that
-        // can perform actions" — the standalone UI listener answers three paths
-        // and /control is not one of them, so a switch there would always fail.
-        controls: controls.state(),
-        // Everything the sharing and mapping controls need to render: what we
-        // could lend, what the file says we lend, what we lend right now, and
-        // what differs. Sent even to the read-only listener, which renders the
-        // same facts without the buttons.
-        share: shared(),
-        configuredShare: cfg.share,
-        catalog: pool.catalog(),
-        contexts: (() => {
-          const out: Record<string, number> = {};
-          for (const id of pool.catalog()) {
-            const ctx = pool.contextLength(id);
-            if (ctx !== null) out[id] = ctx;
-          }
-          return out;
-        })(),
-        // Which advertised ids are one seat under another name. `models.<id>.as`
-        // rewrites the id on the way to a local backend, so an id whose `as` is
-        // itself an advertised model is a VARIANT of that model: the same weights
-        // answering to a second id, usually with different `params`. The page
-        // folds those under their parent instead of drawing sixteen rows for
-        // eleven models. An `as` that names a backend-only wire id (nomic-embed
-        // -> nomic-embed-text-v2-moe:latest) is a rename, not a variant; the page
-        // can tell the two apart because it also has the catalog, so both are
-        // sent as they are.
-        aliases: aliasView(),
-        overrides: overrideView(),
-        net: networkView(),
-        q: {
-          jobs: pool.jobs(),
-          capacity: pool.loadedAggregate(),
-          backends: pool.all().map((b) => ({ name: b.name, ...pool.loadedCapacity(b) })),
-        },
-        hist: history.all(),
-        // Every call that ran here in the same window, so the page can draw the
-        // lanes per request rather than per 5s reading, and say how long each took.
-        calls: history.calls(),
-      });
+      json(res, 200, await uiPayload(canWarm));
       return;
     }
     res.writeHead(200, {
@@ -1753,7 +1930,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   const proxying = new Set<{ id: string; backend: string; model: string | null }>();
 
   const uiWritable = cfg.uiListen?.control === "key";
-  const UI_PATHS = new Set(["/ui", "/ui/", "/ui/data", "/"]);
+  const UI_PATHS = new Set(["/ui", "/ui/", "/ui/data", "/ui/events", "/"]);
   const uiServer = cfg.uiListen
     ? createServer((req, res) => {
         const path = new URL(req.url ?? "/", "http://localhost").pathname;
@@ -1770,6 +1947,13 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             log.error("ui.write_failed", { error: e instanceof Error ? e.message : String(e) });
             if (!res.headersSent) json(res, 500, { error: "internal error" });
             else res.end();
+          });
+          return;
+        }
+        if (path === "/ui/events") {
+          void serveUiEvents(req, res, uiWritable).catch((e) => {
+            log.error("ui.stream_failed", { error: e instanceof Error ? e.message : String(e) });
+            res.end();
           });
           return;
         }
@@ -2073,6 +2257,13 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // and a browser holding one open would otherwise pace the whole drain.
       uiServer?.close();
       uiServer?.closeAllConnections?.();
+      // Event streams go first and explicitly. They are already excluded from
+      // the in-flight count, so they would not HOLD the drain — but leaving
+      // them open means a page keeps its connection to a node that is going
+      // away, and reconnects to nothing. Ending them lets EventSource start
+      // retrying immediately.
+      for (const res of streams) res.end();
+      streams.clear();
 
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       // Stop accepting, and drop the connections sitting idle. A keep-alive

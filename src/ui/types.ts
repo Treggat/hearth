@@ -261,4 +261,12 @@ export interface UiData {
    * 10-minute window as the samples, oldest first.
    */
   calls?: Call[];
+  /**
+   * How many samples the server's ring holds.
+   *
+   * The stream appends new samples one at a time, so without this the page
+   * would keep every sample it ever saw and slowly disagree with the server
+   * about what "the last ten minutes" means.
+   */
+  histKeep?: number;
 }

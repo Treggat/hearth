@@ -55,18 +55,31 @@ import type { UiData } from "./types.js";
 /* ------------------------------------------------------------------ data */
 
 /**
- * The poll, guarded on both sides.
+ * Pushed, with the poll kept as the way back.
  *
- * /ui/data calls peers.ensureFresh(), which can exceed the 3s interval exactly
- * when a peer is timing out — which is exactly when you are watching. Unguarded,
- * requests stack and an older response can land after a newer one and render
- * stale state over fresh. document.hidden stops a forgotten background tab
- * polling a peer-probing endpoint forever.
+ * /ui/events sends one snapshot and then only what changed. The poll it
+ * replaces asked for 95KB every 3 seconds and 93% of that was history the page
+ * already had, so an idle box now sends nothing at all.
+ *
+ * The fallback is not decoration. EventSource is the one transport a proxy, an
+ * extension or an older server can break in a way that looks like silence, and
+ * a status page that renders nothing is worse than one that renders slowly. So
+ * a stream that never delivers a snapshot is abandoned for the poll, and the
+ * page carries on exactly as it used to.
+ *
+ * The poll keeps both its old guards. /ui/data calls peers.ensureFresh(), which
+ * can exceed the 3s interval exactly when a peer is timing out — which is
+ * exactly when you are watching. Unguarded, requests stack and an older
+ * response can land after a newer one and render stale state over fresh.
+ * document.hidden stops a forgotten background tab polling a peer-probing
+ * endpoint forever.
  */
-function useData(): { data: UiData | null; dead: boolean; refresh: () => void } {
+function useData(): { data: UiData | null; dead: boolean; live: boolean; refresh: () => void } {
   const [data, setData] = useState<UiData | null>(null);
   const [dead, setDead] = useState(false);
+  const [live, setLive] = useState(false);
   const inFlight = useRef(false);
+  const polling = useRef<number | null>(null);
 
   const poll = useCallback((force: boolean) => {
     // force=true skips the visibility check but NEVER the in-flight check.
@@ -78,19 +91,90 @@ function useData(): { data: UiData | null; dead: boolean; refresh: () => void } 
       .finally(() => { inFlight.current = false; });
   }, []);
 
-  useEffect(() => {
+  const startPolling = useCallback(() => {
+    if (polling.current !== null) return;
     // The FIRST load is forced: document.hidden is true more often than you
     // would think — a background tab, a prerender, an embedded pane — and
     // gating the initial fetch on it left the page permanently blank there,
     // waiting on a visibilitychange that may never come.
     poll(true);
-    const id = setInterval(() => poll(false), 3000);
-    const back = () => { if (!document.hidden) poll(true); };
-    document.addEventListener("visibilitychange", back);
-    return () => { clearInterval(id); document.removeEventListener("visibilitychange", back); };
+    polling.current = window.setInterval(() => poll(false), 3000);
   }, [poll]);
 
-  return { data, dead, refresh: () => poll(true) };
+  useEffect(() => {
+    let es: EventSource | null = null;
+    let got = false;
+    let gone = false;
+
+    const fallBack = () => {
+      if (gone) return;
+      gone = true;
+      es?.close();
+      setLive(false);
+      startPolling();
+    };
+
+    try {
+      es = new EventSource("/ui/events");
+    } catch {
+      startPolling();
+      return;
+    }
+
+    // Nothing at all within ten seconds is a stream that is not going to work,
+    // whatever the reason. Long enough not to race a slow first build, short
+    // enough that a broken transport is not a blank page.
+    const giveUp = window.setTimeout(() => { if (!got) fallBack(); }, 10_000);
+
+    es.addEventListener("snapshot", (e) => {
+      got = true;
+      setData(JSON.parse((e as MessageEvent<string>).data) as UiData);
+      setDead(false);
+      setLive(true);
+    });
+
+    es.addEventListener("patch", (e) => {
+      const p = JSON.parse((e as MessageEvent<string>).data) as {
+        set?: Partial<UiData>;
+        add?: { hist: UiData["hist"] };
+      };
+      setData((prev) => {
+        // A patch before the snapshot is a patch against nothing. Dropping it
+        // is right: the next snapshot carries everything anyway.
+        if (!prev) return prev;
+        const next = { ...prev, ...(p.set ?? {}) };
+        if (p.add?.hist) {
+          // Trimmed to the server's own ring length, or a tab left open all
+          // day would accumulate a history the server stopped keeping hours
+          // ago and draw a chart nothing else agrees with.
+          next.hist = [...next.hist, ...p.add.hist].slice(-(prev.histKeep ?? 120));
+        }
+        return next;
+      });
+      setDead(false);
+    });
+
+    es.onerror = () => {
+      // EventSource retries by itself, and a node restarting is the common
+      // case — so an error AFTER we have data is not a reason to abandon the
+      // transport, only to say the page is stale. One that arrives before the
+      // first snapshot is a transport that does not work here.
+      if (!got) fallBack();
+      else setDead(true);
+    };
+
+    const back = () => { if (!document.hidden && polling.current !== null) poll(true); };
+    document.addEventListener("visibilitychange", back);
+    return () => {
+      window.clearTimeout(giveUp);
+      es?.close();
+      if (polling.current !== null) window.clearInterval(polling.current);
+      polling.current = null;
+      document.removeEventListener("visibilitychange", back);
+    };
+  }, [poll, startPolling]);
+
+  return { data, dead, live, refresh: () => poll(true) };
 }
 
 /* --------------------------------------------------------------- drawers */
@@ -122,8 +206,8 @@ function DrawerTab({ label, count, hot, open, onClick }: {
 
 /* ------------------------------------------------------------ graph view */
 
-function Console({ d, ctx, dead, menu }: {
-  d: UiData | null; ctx: Ctx; dead: boolean; menu?: React.ReactNode;
+function Console({ d, ctx, dead, live, menu }: {
+  d: UiData | null; ctx: Ctx; dead: boolean; live: boolean; menu?: React.ReactNode;
 }) {
   const [sel, setSel] = useState<Sel>(null);
   const [drawer, setDrawer] = useState<Drawer>(null);
@@ -207,7 +291,7 @@ function Console({ d, ctx, dead, menu }: {
                          open={drawer === "history"} onClick={() => toggle("history")} />
               <Spacer />
               <Typography sx={{ fontFamily: MONO, fontSize: 10, color: "faint", pr: 1.5, display: { xs: "none", sm: "block" } }}>
-                polls /ui/data every 3s
+                {live ? "live · pushed from /ui/events" : "polls /ui/data every 3s"}
               </Typography>
             </Row>
             {drawer && (
@@ -348,7 +432,7 @@ function ViewMenu({ view, onView }: { view: View; onView: (v: View) => void }) {
 /* ------------------------------------------------------------------ page */
 
 export default function App() {
-  const { data, dead, refresh } = useData();
+  const { data, dead, live, refresh } = useData();
   const prefersDark = useMediaQuery("(prefers-color-scheme: dark)");
   const theme = useMemo(() => makeTheme(prefersDark ? "dark" : "light"), [prefersDark]);
   const [view, setView] = useView();
@@ -365,8 +449,8 @@ export default function App() {
       <CssBaseline />
       <KeyDialog />
       {view === "graph"
-        ? <Console d={data} ctx={ctx} dead={dead} menu={menu} />
-        : <Dashboard d={data} ctx={ctx} dead={dead} menu={menu} />}
+        ? <Console d={data} ctx={ctx} dead={dead} live={live} menu={menu} />
+        : <Dashboard d={data} ctx={ctx} dead={dead} live={live} menu={menu} />}
     </ThemeProvider>
   );
 }

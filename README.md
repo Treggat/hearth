@@ -109,12 +109,48 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/control` | local | read or change what leaves this node: lending, borrowing, per-model sharing, peer model maps |
 | `/network` | local | every node, what each one serves, and what's **loaded right now**. Also lists peer models you haven't mapped, which is usually the config mistake people actually make |
 | `/queue` | local | jobs in flight, with lane, caller and position |
+| `/ui/events` | same as `/ui` | the page's data, pushed. A snapshot then diffs |
 | `/healthz` | anyone | whether this node can serve. `503` when it can't. The one unauthenticated endpoint |
 | `/peer/hello`, `/peer/state` | peers | identity and capacity, per model |
 
 Anything else gets proxied to your backend untouched, so a client already using
 `/unload` or llama-swap's `/upstream/<model>/…` keeps working. Those passthrough
 paths **are not queued**, see below.
+
+### The page is pushed, not polled
+
+`/ui/events` is an SSE stream: one `snapshot` frame with the whole payload,
+then a `patch` frame whenever something changes.
+
+```
+event: snapshot
+data: {"net":{...},"q":{...},"hist":[...120 samples...],"histKeep":120,...}
+
+event: patch
+data: {"set":{"q":{...},"calls":[...]},"add":{"hist":[{...one sample...}]}}
+```
+
+The poll it replaces asked for 95KB every three seconds, and **93% of that was
+history the page already had** — 120 samples, of which 119 were unchanged. New
+samples now arrive one at a time, and a node with nothing happening sends
+nothing at all.
+
+A patch is a diff of the same object `/ui/data` serves, built by the same
+function, so the two transports cannot drift: add a field and both carry it.
+`canWarm` and `control` are the exception — they describe the SOCKET rather
+than the node, so they are stamped on the snapshot and never repeated.
+
+`/ui/data` is unchanged and is still there. EventSource is the one transport an
+extension or a proxy can break in a way that looks like silence, so a stream
+that has not delivered a snapshot within ten seconds is abandoned and the page
+goes back to polling exactly as before. An error *after* the first snapshot is
+left to EventSource's own retry — a node restarting is the common case — and
+only marks the page stale.
+
+The stream is deliberately not counted as a request in flight, so a page left
+open in a tab cannot hold a shutdown open for the whole `shutdownGraceMs`.
+Streams are ended first when the node stops, so the browser starts retrying
+straight away.
 
 ### What `/healthz` actually checks
 
