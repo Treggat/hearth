@@ -380,13 +380,23 @@ export class BackendState {
   /**
    * Has anything come back from this backend lately?
    *
-   * For the status page, and only meaningful where knowsWarm() is true: a
-   * `kind: none` backend is never read at all, so silence from one says
-   * nothing. Not a health check — hearth does not probe backends it is not
-   * using — but "we have not heard from this in a minute" is a fact, and it is
-   * the difference between a backend that is idle and one that is gone.
+   * For the status page, and only meaningful where watched() is true — see
+   * there. Not a health check: hearth does not probe backends it is not using.
+   * But "we have not heard from this in a minute" is a fact, and it is the
+   * difference between a backend that is idle and one that is gone.
+   *
+   * An OPEN EVENT STREAM counts as having heard from it, and that is not a
+   * technicality. Frames only arrive when something changes, so a backend that
+   * is up, connected and simply not being used goes quiet for as long as the
+   * box is quiet — and this read false for every one of them after a minute,
+   * while the page drew each one a red "nothing back in a minute". Measured on
+   * a live node: nine backends, all silent by this measure, one with a model
+   * resident. The connection being open is a live fact about the backend, held
+   * by the OS and dropped the moment it goes; that is the thing worth
+   * reporting, and the timestamp is the fallback for when there is no stream.
    */
   answering(): boolean {
+    if (this.streaming) return true;
     return this.lastOkAt > 0 && Date.now() - this.lastOkAt <= STALE_MS;
   }
 

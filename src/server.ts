@@ -1905,12 +1905,18 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             // backend that cannot see is not the same claim as one from a
             // backend that looked, and the page must not render it as such.
             knowsWarm: b.state.knowsWarm(),
-            // Whether anything has come back from it lately. A backend that
-            // stopped answering keeps its last known slot counts and an empty
-            // queue, which draws as "idle" — the one word it certainly is not.
-            // Not a health check and not claiming to be: "we have not heard
-            // from this in a minute" is the honest thing we actually know.
-            answering: b.state.answering(),
+            // Whether anything has come back from it lately, and ONLY for the
+            // backends where silence means something — the ones whose event
+            // stream we hold open. A polled or `none` backend is never
+            // contacted unless something is being asked of it, so hearing
+            // nothing from one is not evidence of anything, and sending `false`
+            // there had the page draw a red "nothing back in a minute" against
+            // every CPU sidecar on a perfectly healthy box.
+            //
+            // Omitted rather than sent as `false`, so the distinction lives on
+            // the wire instead of in a rule the page has to remember. Same
+            // reasoning as `knowsWarm` above: not knowing is its own answer.
+            ...(b.state.watched() ? { answering: b.state.answering() } : {}),
             // Only llama-swap evicts. An ollama backend keeps its set resident
             // and serves them together, so there is no thrash to warn about.
             evicts: b.cfg.kind === "llama-swap",

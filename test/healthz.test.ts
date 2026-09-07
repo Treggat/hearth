@@ -168,4 +168,68 @@ const until = async (base: string, want: (h: Health) => boolean, ms = 4_000) => 
   s.close();
 }
 
+// --- and the same signal, as the page reads it -----------------------------
+// `answering` is the page-facing half of this finding, and it had the same
+// bug: frames arrive only when something CHANGES, so a connected backend on a
+// quiet box went silent by the clock after a minute and the console drew it a
+// red "nothing back in a minute". An open stream is a live fact about the
+// backend regardless of how long it has been since it said anything.
+{
+  const { s, drop } = swapBackend();
+  await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+  const { node, base } = await start({
+    name: "hz4",
+    backends: [
+      { name: "swap", url: `http://127.0.0.1:${(s.address() as AddressInfo).port}`, kind: "llama-swap" },
+      { name: "side", url: "http://127.0.0.1:9", kind: "single", serves: ["side"] },
+    ],
+  });
+
+  const backends = async () => {
+    const d = (await (await fetch(`${base}/ui/data`)).json()) as {
+      net: { nodes: { self?: boolean; backends?: { name: string; answering?: boolean }[] }[] };
+    };
+    const list = d.net.nodes.find((n) => n.self)!.backends!;
+    return Object.fromEntries(list.map((b) => [b.name, b]));
+  };
+
+  await until(base, (h) => h.backends.connected > 0);
+  assert.equal((await backends()).swap!.answering, true);
+  assert.ok(!("answering" in (await backends()).side!),
+    "a backend we never contact is not reported quiet — we simply cannot tell");
+
+  // Two minutes on, with nothing having happened. The old measure was purely
+  // this clock, so it read false here while the stream was open and fine.
+  const realNow = Date.now;
+  Date.now = () => realNow() + 120_000;
+  try {
+    assert.equal((await backends()).swap!.answering, true,
+      "an idle stream is still a connected backend");
+  } finally {
+    Date.now = realNow;
+  }
+
+  // And when it genuinely goes, it still says so -- but only once the clock
+  // agrees. A dropped stream alone is NOT enough: we heard from it a moment
+  // ago, and the timestamp is the fallback precisely so that a reconnect in
+  // progress does not flash a fault. Both have to be true, which is why this
+  // needs the stream gone AND time moved on.
+  drop();
+  await until(base, (h) => h.backends.connected === 0);
+  assert.equal((await backends()).swap!.answering, true,
+    "a stream that just dropped is not yet a backend we have not heard from");
+
+  Date.now = () => realNow() + 120_000;
+  try {
+    assert.equal((await backends()).swap!.answering, false,
+      "gone, and long enough ago to say so");
+  } finally {
+    Date.now = realNow;
+  }
+
+  await node.close();
+  s.closeAllConnections();
+  s.close();
+}
+
 console.log("healthz.test.ts ok");
