@@ -47,8 +47,14 @@ export interface Backend {
   evicts?: boolean;
   /** False when it cannot report warm state at all, which is not the same as cold. */
   knowsWarm?: boolean;
-  /** False when nothing has come back from it in a minute. Not a health check,
-   *  and only meaningful where `knowsWarm` is true. */
+  /**
+   * False when nothing has come back from it in a minute. Not a health check.
+   *
+   * ABSENT where silence means nothing — a backend hearth does not hold an
+   * event stream to is never contacted unless something is being asked of it.
+   * So `undefined` is "we cannot tell", `false` is "we are watching and it has
+   * gone quiet", and only the second is worth drawing.
+   */
   answering?: boolean;
   slots?: number;
   free?: number;
@@ -255,4 +261,12 @@ export interface UiData {
    * 10-minute window as the samples, oldest first.
    */
   calls?: Call[];
+  /**
+   * How many samples the server's ring holds.
+   *
+   * The stream appends new samples one at a time, so without this the page
+   * would keep every sample it ever saw and slowly disagree with the server
+   * about what "the last ten minutes" means.
+   */
+  histKeep?: number;
 }

@@ -90,6 +90,7 @@ Every key with its default. Only `backend.url` is required.
 | `peerPollMs` / `peerStaleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
 | `peerFirstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
 | `coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
+| `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them, which is what it used to do |
 | `peers` | `[]` | nodes you can send work to |
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
 | `stateFile` | `null` | fallback for Save when the config file itself cannot be written. Null unless you need it |
@@ -108,12 +109,83 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/control` | local | read or change what leaves this node: lending, borrowing, per-model sharing, peer model maps |
 | `/network` | local | every node, what each one serves, and what's **loaded right now**. Also lists peer models you haven't mapped, which is usually the config mistake people actually make |
 | `/queue` | local | jobs in flight, with lane, caller and position |
-| `/healthz` | anyone | liveness. The one unauthenticated endpoint |
+| `/ui/events` | same as `/ui` | the page's data, pushed. A snapshot then diffs |
+| `/healthz` | anyone | whether this node can serve. `503` when it can't. The one unauthenticated endpoint |
 | `/peer/hello`, `/peer/state` | peers | identity and capacity, per model |
 
 Anything else gets proxied to your backend untouched, so a client already using
 `/unload` or llama-swap's `/upstream/<model>/…` keeps working. Those passthrough
 paths **are not queued**, see below.
+
+### The page is pushed, not polled
+
+`/ui/events` is an SSE stream: one `snapshot` frame with the whole payload,
+then a `patch` frame whenever something changes.
+
+```
+event: snapshot
+data: {"net":{...},"q":{...},"hist":[...120 samples...],"histKeep":120,...}
+
+event: patch
+data: {"set":{"q":{...},"calls":[...]},"add":{"hist":[{...one sample...}]}}
+```
+
+The poll it replaces asked for 95KB every three seconds, and **93% of that was
+history the page already had** — 120 samples, of which 119 were unchanged. New
+samples now arrive one at a time, and a node with nothing happening sends
+nothing at all.
+
+A patch is a diff of the same object `/ui/data` serves, built by the same
+function, so the two transports cannot drift: add a field and both carry it.
+`canWarm` and `control` are the exception — they describe the SOCKET rather
+than the node, so they are stamped on the snapshot and never repeated.
+
+`/ui/data` is unchanged and is still there. EventSource is the one transport an
+extension or a proxy can break in a way that looks like silence, so a stream
+that has not delivered a snapshot within ten seconds is abandoned and the page
+goes back to polling exactly as before. An error *after* the first snapshot is
+left to EventSource's own retry — a node restarting is the common case — and
+only marks the page stale.
+
+The stream is deliberately not counted as a request in flight, so a page left
+open in a tab cannot hold a shutdown open for the whole `shutdownGraceMs`.
+Streams are ended first when the node stops, so the browser starts retrying
+straight away.
+
+### What `/healthz` actually checks
+
+It answers `200` with counts, or `503` when every backend it is watching has
+gone:
+
+```json
+{"ok":true,"name":"web",
+ "backends":{"total":9,"watched":2,"connected":2},
+ "peers":{"total":1,"up":1}}
+```
+
+`watched` is the backends whose event stream hearth holds open — llama-swap,
+today. That connection is the signal: when the backend dies the stream drops,
+and hearth knows within a reconnect without having asked it anything. `503`
+means every one of them is gone.
+
+What this is deliberately NOT built on is "have we heard from it lately". On an
+idle box nothing is heard from anything, so that reads silent across the board
+while the node is perfectly well — a probe built on it goes red and stays red.
+It is a decoration on the page, not a health signal, and the distinction is why
+`answering` says so in its own docs.
+
+`watched: 0` is an honest answer too, and worth reading. A node of `single` or
+`none` backends — CPU sidecars — is never contacted unless something is being
+asked of it, so hearth has no evidence either way and will not invent a verdict.
+The check is weak for that config and says so in the number rather than
+pretending.
+
+Peers never affect `ok`. A peer being down is a routing input, not this node's
+health.
+
+It is unauthenticated and the main port may be bound wide, so it reports counts
+and never names. Model ids, backend names and peer names stay behind the page's
+gate.
 
 ## The status page
 
@@ -863,6 +935,7 @@ ExecStartPre=/usr/bin/node /opt/hearth/dist/cli.js serve --config /etc/hearth.ya
 ExecStart=/usr/bin/node /opt/hearth/dist/cli.js serve --config /etc/hearth.yaml
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=45
 ```
 
 `ReadWritePaths=` is what lets the console's Save button write your config.
@@ -878,9 +951,26 @@ them from the config as `env:NAME`, which is also what keeps the config
 committable. Note that `--check` will fail outside systemd unless you source
 that env file first, since a missing token is deliberately fatal.
 
-The queue is in memory, so a restart drops whatever was waiting. Pair
-`Restart=on-failure` with `StartLimitBurst` in `[Unit]` so a crash loop cannot
-quietly eat a job every five seconds.
+`TimeoutStopSec` is there because a stop is not instant any more. On SIGTERM
+hearth stops accepting connections, drops the idle ones, and gives whatever is
+already in flight up to `shutdownGraceMs` to finish — a chat turn mid-stream, a
+render several GPU-minutes in. Anything still running when that runs out is
+destroyed, and the drain says so in the log:
+
+```
+{"level":"info","msg":"drain.start","inFlight":3,"graceMs":30000}
+{"level":"warn","msg":"drain.cut","abandoned":1,"ms":30001}
+```
+
+Keep the unit's stop timeout comfortably above the grace, or systemd SIGKILLs
+mid-drain and the wait bought nothing. A second SIGTERM (or a second ^C) skips
+the rest of the wait and exits, for when you would rather not sit through it.
+
+A request still QUEUED is in flight too — its caller is holding the connection,
+so it gets its turn if the grace allows. The queue itself is memory only and
+nothing is written down, so whatever the grace does not cover is simply gone.
+Pair `Restart=on-failure` with `StartLimitBurst` in `[Unit]` so a crash loop
+cannot quietly eat a job every five seconds.
 
 ## What it won't do
 

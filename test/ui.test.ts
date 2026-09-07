@@ -325,8 +325,16 @@ const base = await new Promise<string>((ready) =>
     "a route backend is described by its paths, since it has no models to show");
   assert.deepEqual(backends.find((b) => b.name === "embed")!.resources, [],
     "a backend that declares nothing competes for nothing, and draws as unpinned");
-  assert.equal(typeof backends[0]!.answering, "boolean",
-    "and whether we have heard from it lately, so silence is not drawn as idle");
+  // Silence is only evidence where we are listening. None of these backends
+  // has an event stream — the mock has no /api/events — so hearth is never in
+  // contact with them unless something is being asked, and it says nothing
+  // rather than saying `false` and having the page draw a fault against a
+  // backend that is perfectly well. The stream-backed case is pinned in
+  // healthz.test.ts, where the mock can actually hold one open.
+  for (const b of backends) {
+    assert.ok(!("answering" in b),
+      `${b.name}: not knowing whether we have heard from it is its own answer`);
+  }
 
   await shared.close();
 }

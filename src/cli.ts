@@ -236,9 +236,19 @@ async function main(): Promise<void> {
     });
   }
 
+  // A second signal means it. Somebody watching a deploy hang wants the next
+  // ^C to work, and a service manager that follows SIGTERM with another one is
+  // saying the same thing -- waiting the full grace out twice is not a drain,
+  // it is a hang with a nice name.
+  let stopping = false;
   const shutdown = (sig: string) => {
-    log.info("shutting down", { signal: sig });
-    void node.close().then(() => process.exit(0));
+    if (stopping) {
+      log.warn("shutdown.forced", { signal: sig });
+      process.exit(1);
+    }
+    stopping = true;
+    log.info("shutting down", { signal: sig, graceMs: cfg.shutdownGraceMs });
+    void node.close(cfg.shutdownGraceMs).then(() => process.exit(0));
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));

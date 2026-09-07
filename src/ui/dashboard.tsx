@@ -38,8 +38,8 @@ function Card({ children }: { children: ReactNode }) {
   );
 }
 
-export default function Dashboard({ d, ctx, dead, menu }: {
-  d: UiData | null; ctx: Ctx; dead: boolean; menu?: ReactNode;
+export default function Dashboard({ d, ctx, dead, live, menu }: {
+  d: UiData | null; ctx: Ctx; dead: boolean; live: boolean; menu?: ReactNode;
 }) {
   const self = d?.net.nodes.find((n) => n.self);
   const peers = (d?.net.nodes ?? []).filter((n) => !n.self);
@@ -166,7 +166,9 @@ export default function Dashboard({ d, ctx, dead, menu }: {
       )}
 
       <Typography sx={{ mt: 4, pt: 1.5, borderTop: "1px solid", borderColor: "line", color: "faint", fontSize: 11.5 }}>
-        Polls <Box component="code" sx={{ fontFamily: MONO, fontSize: 11 }}>/ui/data</Box> every 3s. The same
+        {live ? "Pushed from " : "Polls "}
+        <Box component="code" sx={{ fontFamily: MONO, fontSize: 11 }}>{live ? "/ui/events" : "/ui/data"}</Box>
+        {live ? " as it changes." : " every 3s."} The same
         facts as the graph, laid out to read top to bottom instead of by clicking. Forward the port over SSH
         rather than widening the bind.
       </Typography>
