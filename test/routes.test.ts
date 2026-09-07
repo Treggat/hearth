@@ -288,6 +288,34 @@ console.log("routes.test.ts ok");
   assert.notEqual(pool.forPath("/upstream/image/generate")!.rule.model, "img");
 }
 
+// --- a pattern route matches the id we ADVERTISE ---------------------------
+// The captured segment is whatever the caller typed, and `declaredBy` asks
+// what the backend serves -- which is the raw id. For an aliased model those
+// are different, and the advertised one is the ONLY name a client has: the raw
+// id is hidden from the catalog precisely because it exists to be renamed. So
+// the route never fired for it, the request fell through to the unqueued
+// passthrough, and a `routes:` entry silently did nothing on the model it was
+// written for -- while the console drew an idle backend and a free card.
+{
+  const cfg = parseConfig({
+    name: "alias-pat",
+    backends: [{
+      name: "img", url: "http://127.0.0.1:1", serves: ["image"],
+      routes: [{ path: "/upstream/{model}/generate", lane: "batch" }],
+    }],
+    models: { "image-hq": { backend: "img", as: "image" } },
+  });
+  const pool = new BackendPool(cfg, silentLogger);
+
+  assert.deepEqual(pool.catalog(), ["image-hq"], "the raw id is not offered to anyone");
+  const hit = pool.forPath("/upstream/image-hq/generate");
+  assert.ok(hit, "the advertised id matches the route");
+  assert.equal(hit.rule.model, "image-hq", "and is reported in OUR vocabulary, not the wire's");
+  assert.ok(pool.forPath("/upstream/image/generate"), "the raw id still matches");
+  assert.equal(pool.forPath("/upstream/coder/generate"), undefined,
+    "and a model this backend does not serve still falls through");
+}
+
 // A path may carry at most one placeholder, as a whole segment, and may not
 // also name a model — the path already supplies it.
 for (const bad of [
@@ -314,3 +342,104 @@ assert.throws(
   /both \{model\} in the path and model:/,
   "naming a model as well as capturing one is two answers to one question",
 );
+
+// --- a routed model still gets renamed on the wire -------------------------
+// `as:` exists because a backend's real id is often unusable — ollama's
+// `nomic-embed-text-v2-moe:latest`, a bare llama-server's gguf path — and the
+// passthrough has always rewritten it on the way out. Declaring a route for
+// that same path used to switch that off: the id that selects a BACKEND has to
+// be empty once a route has chosen one, and the rewrite was reading the same
+// value. So queueing an embedder cost you its alias, and the backend answered
+// 404 for a name only hearth ever knew.
+{
+  const wire = "nomic-embed-text-v2-moe:latest";
+  const asked: (string | undefined)[] = [];
+  let raw = "";
+  const backend = createServer((req, res) => {
+    if (req.url === "/v1/models") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ data: [{ id: wire }] }));
+      return;
+    }
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.url === "/v1/rerank") {
+        raw = body;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      if (req.url !== "/v1/embeddings") { res.writeHead(404); res.end(); return; }
+      const m = (JSON.parse(body || "{}") as { model?: string }).model;
+      asked.push(m);
+      // Exactly what ollama does with a name it doesn't have.
+      if (m !== wire) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `model '${m}' not found` }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ data: [{ embedding: [0.1] }] }));
+    });
+  });
+  await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
+
+  const node = createNode(
+    parseConfig({
+      name: "alias",
+      backends: [{
+        name: "ollama", url, serves: [wire, "plain"],
+        routes: [
+          { path: "/v1/embeddings", model: "nomic-embed", lane: "chat" },
+          { path: "/v1/rerank", model: "plain", lane: "chat" },
+        ],
+      }],
+      models: { "nomic-embed": { backend: "ollama", as: wire } },
+    }),
+    silentLogger,
+  );
+  node.start();
+  const base = await new Promise<string>((ready) =>
+    node.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(node.server.address() as AddressInfo).port}`)),
+  );
+
+  const res = await fetch(`${base}/v1/embeddings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "nomic-embed", input: "hi" }),
+  });
+  assert.equal(res.status, 200, "a routed alias reaches the backend under its real id");
+  assert.deepEqual(asked, [wire], "the advertised id never went out on the wire");
+
+  // And the route still did its job: this was queued, not forwarded blind.
+  const d = (await (await fetch(`${base}/ui/data`)).json()) as {
+    calls?: { model: string; backend: string; ok: boolean }[];
+  };
+  const call = d.calls?.at(-1);
+  assert.equal(call?.model, "nomic-embed", "recorded under the id the operator declared");
+  assert.equal(call?.backend, "ollama");
+  assert.equal(call?.ok, true);
+
+  // ...and a model with no alias is still forwarded byte for byte. Translating
+  // is the ONE exception to that promise, so it must not fire when there is
+  // nothing to translate: rebuilding the body would change its bytes and its
+  // length for every routed request on the box.
+  {
+    const sent = '{\n  "model": "plain",\n  "query":  "hi"\n}';
+    await fetch(`${base}/v1/rerank`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: sent,
+    });
+    assert.equal(raw, sent, "an un-aliased routed body reaches the backend untouched");
+  }
+
+  await node.close();
+  backend.closeAllConnections();
+  backend.close();
+}
+
+console.log("routes.test.ts alias ok");
