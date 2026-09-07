@@ -77,7 +77,7 @@ Every key with its default. Only `backend.url` is required.
 | `scheduler.warmBonus` | `40` | priority discount for a model already loaded |
 | `scheduler.maxPerLane` | `100` | how long one lane's queue may get before new work is refused. Off-box jobs are bounded separately, on their own count |
 | `scheduler.maxPerCaller` | `0`, or `2` with apiKeys | queued-or-running jobs per caller per lane. Off without apiKeys, where every local caller is one identity |
-| `apiKeys` | `[]` | keys allowed on `/v1/*`. Empty means loopback only. Setting it means loopback needs a key too, including any local tool you point at this |
+| `apiKeys` | `[]` | keys allowed on `/v1/*`. Empty means loopback only. Setting it means loopback needs a key too, including any local tool you point at this. An entry may be `{ key, label }` to name a caller — see below |
 | `uiListen` | unset | give the status page its own `{host, port}`. Unset keeps it on the main port, loopback-only |
 | `maxBodyBytes` | `33554432` | largest accepted request body |
 | `share` | `[]` | models you'll run for a peer. Empty lends nothing |
@@ -98,6 +98,25 @@ Every key with its default. Only `backend.url` is required.
 | `models` | `{}` | routing policy per model. Anything unlisted stays local |
 
 Tokens accept `env:NAME`, so the config stays committable.
+
+An `apiKeys` entry can be a bare secret or `{ key, label }`. A keyed caller
+otherwise shows up as `key:<hash>` — the first bytes of `sha256(key)`, so no
+guessable key material lands in a log — which keeps two callers apart but says
+nothing about who they are. A label replaces that with your own word for the
+caller, so the log, `/queue` and the console read `key:dsh` instead:
+
+```yaml
+apiKeys:
+  - env:HEARTH_API_KEY                        # bare: still shows as key:<hash>
+  - { key: "H_…dsh", label: dsh }
+  - { key: env:NOVA_KEY, label: nova }
+```
+
+The label is your word, not a secret, so it is never taken through `env:` and
+never hashed — and it appears wherever caller ids do, a widened `uiListen`
+port included. That is the one thing to weigh: name the keys you are content to
+see named on whatever the status page is reachable from. Leave a key bare and
+it stays a hash.
 
 ## Endpoints
 
