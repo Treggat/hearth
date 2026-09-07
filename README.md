@@ -152,6 +152,52 @@ open in a tab cannot hold a shutdown open for the whole `shutdownGraceMs`.
 Streams are ended first when the node stops, so the browser starts retrying
 straight away.
 
+### Weights that are not on the card
+
+A model too big for its card can still run: llama.cpp assigns part of it to the
+host and computes that part on the CPU. It is the trade that makes a large MoE
+fit at all — and it is invisible. The model is loaded, the card is busy, every
+number on the page looks normal, and the thing is simply slow, because **every
+token** pays for it, not just the first one.
+
+hearth reads it off the launch command and draws it: the backend says
+`32 layers on host`, and a `host` node appears in the card row with a steady
+violet edge **to the card the model is split with** — because that pair is the
+thing that explains the speed. The two halves exchange on every token, and the
+chain reads end to end: the backend, its card, and the other half of the model.
+Steady, not travelling: this is not traffic passing through, it is where part of
+a model lives, and it does not finish.
+
+**"On the host" is as far as this goes, and the limit is deliberate.** Weights
+are mmap'd from the model file, so whether they are served out of RAM or faulted
+off the disk depends on whether the model fits in RAM. Measured on one box: an
+88 GB model against a 44 GB memory cap kept 33% of its mapping resident and
+faulted 6-8k pages off the disk on *every* generation, never settling. That is a
+live measurement on the machine running the model — `/proc/<pid>/stat` and
+`smaps` — not something a launch command knows, and not something a proxy on
+another machine can see. hearth reports the assignment, which it can prove, and
+does not guess at the medium, which it cannot.
+
+The command line is the only source. Checked against a live box:
+
+| | reports placement? |
+|---|---|
+| llama-server `/props` | no — no layer counts, no buffer sizes, nothing |
+| llama-swap `/api/events` | no — `{id, state, unlisted}` |
+| llama-swap `/running` | **yes** — the full `cmd` |
+
+So it is read once per change in what is resident, and never on a timer: a
+running process's argv cannot change under it. Only two flags are trusted,
+because only two say something unambiguous on their own — `--n-cpu-moe N`
+(N layers of experts on the CPU) and `-ngl 0` (a CPU model, which is a
+different statement). A partial `--n-gpu-layers 20` is just as interesting and
+is deliberately NOT read: the useful form is "20 of 33", and nothing here
+reports a model's layer count, so a bare 20 would be a number with nothing to
+compare it to.
+
+None of this is a fault to clear. It is a fact worth knowing about the model
+that is paying for it.
+
 ### What `/healthz` actually checks
 
 It answers `200` with counts, or `503` when every backend it is watching has

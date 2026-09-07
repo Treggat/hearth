@@ -46,9 +46,74 @@ interface ModelStatus {
   unlisted?: boolean;
 }
 
+/**
+ * Where a resident model's weights actually are.
+ *
+ * Not everything a model needs fits on the card, and the usual answer is to
+ * assign some of it to the host and compute it on the CPU. That is a PERMANENT
+ * condition, not a startup cost: every token pays for it, not just the first.
+ * It is also invisible — the model is loaded, the card is busy, the numbers all
+ * look normal, and the thing is simply slow.
+ *
+ * "On the host" is as far as this goes, deliberately. The weights are mmap'd
+ * from the model file, so whether they are served out of RAM or faulted off the
+ * disk depends on whether the model fits in RAM — measured on one box, an 88 GB
+ * model against a 44 GB cap faulted 6-8k pages off the disk on EVERY
+ * generation, and never settled. Which of those is happening is a live
+ * measurement on the machine running the model, not something a launch command
+ * can tell you, and not something a proxy on another box can see.
+ *
+ * Read off the launch command, because nothing else reports it. llama-server's
+ * /props carries no layer counts, no buffer sizes and nothing about placement;
+ * llama-swap's event frames carry `{id, state, unlisted}`. Its /running does
+ * carry the full `cmd`, and that is the only source there is.
+ */
+export interface Placement {
+  /** Layers whose experts are computed on the CPU, from `--n-cpu-moe`. */
+  cpuLayers: number | null;
+  /** Every layer of MoE experts, from `--cpu-moe` with no number. */
+  cpuExpertsAll: boolean;
+  /** The whole model runs on the CPU: `-ngl 0`, and no card is involved. */
+  cpuOnly: boolean;
+}
+
+/**
+ * What a llama-server command line says about placement, or null if it says
+ * nothing worth reporting.
+ *
+ * Deliberately narrow. Only the flags that are unambiguous on their own are
+ * read: `--n-cpu-moe N` means N layers of experts are on the CPU whatever else
+ * is going on, and `-ngl 0` means nothing is on the card at all. A partial
+ * `-ngl 20` is just as interesting and is NOT read, because the useful form of
+ * it is "20 of 33" and no API here reports a model's layer count — a bare 20
+ * would be a number with nothing to compare it to.
+ */
+export function parsePlacement(cmd: string): Placement | null {
+  const flag = (...names: string[]): string | null => {
+    for (const n of names) {
+      const m = new RegExp(`(?:^|\\s)${n}(?:[=\\s]+)(\\S+)`).exec(cmd);
+      if (m) return m[1]!;
+    }
+    return null;
+  };
+  const has = (...names: string[]): boolean =>
+    names.some((n) => new RegExp(`(?:^|\\s)${n}(?:\\s|$)`).test(cmd));
+
+  const moe = flag("--n-cpu-moe", "-ncmoe");
+  const cpuLayers = moe !== null && /^\d+$/.test(moe) ? Number(moe) : null;
+  const cpuExpertsAll = has("--cpu-moe");
+  const ngl = flag("--n-gpu-layers", "-ngl");
+  const cpuOnly = ngl === "0";
+
+  if (cpuLayers === null && !cpuExpertsAll && !cpuOnly) return null;
+  return { cpuLayers, cpuExpertsAll, cpuOnly };
+}
+
 export class BackendState {
   private loadedIds: string[] = [];
   private loadingIds: string[] = [];
+  private placements = new Map<string, Placement>();
+  private placementFor: string = "";
   private catalogIds: string[] = [];
   /** False for `kind: none`, where an empty warm set means "we cannot see",
    *  not "nothing is warm". Callers must not turn one into the other. */
@@ -334,6 +399,11 @@ export class BackendState {
     this.catalogIds = models.map((m) => m.id);
     this.loadingIds = models.filter((m) => m.state === STARTING).map((m) => m.id);
     this.setLoaded(models.filter((m) => m.state === READY).map((m) => m.id));
+    // The event frame does not carry the launch command — only /running does —
+    // so placement is fetched when the RESIDENT SET CHANGES and at no other
+    // time. One request per load, not a poll: what a running process was
+    // started with cannot change under it.
+    void this.learnPlacement();
     this.lastUpdateAt = Date.now();
     this.lastOkAt = this.lastUpdateAt;
   }
@@ -415,6 +485,52 @@ export class BackendState {
   }
 
   /**
+   * Where each resident model's weights are, keyed by wire id.
+   *
+   * Only holds an entry for a model whose command line says something worth
+   * reporting, so an empty map means "nothing to say", never "everything is on
+   * the card" — the usual rule here.
+   */
+  placement(): Map<string, Placement> {
+    return new Map(this.placements);
+  }
+
+  /**
+   * Ask /running what the resident models were launched with.
+   *
+   * Keyed on the resident set so it fires once per change and then not again:
+   * a process's argv is fixed for its lifetime, so re-reading it on a timer
+   * would be a request per interval to learn the same string.
+   */
+  private async learnPlacement(): Promise<void> {
+    if (this.kind !== "llama-swap") return;
+    const key = [...this.loadedIds].sort().join("\u0000");
+    if (key === this.placementFor) return;
+    this.placementFor = key;
+    if (this.loadedIds.length === 0) {
+      this.placements.clear();
+      return;
+    }
+    try {
+      const running = await getJson<{ running?: { model?: string; cmd?: string }[] }>(
+        `${this.url}/running`,
+        { headersTimeoutMs: 3_000 },
+      );
+      const next = new Map<string, Placement>();
+      for (const r of running.running ?? []) {
+        if (!r.model || !r.cmd) continue;
+        const p = parsePlacement(r.cmd);
+        if (p) next.set(r.model, p);
+      }
+      this.placements = next;
+    } catch {
+      // Placement is a nicety. Failing to read it must not disturb warm state,
+      // which is what this backend is actually for.
+      this.placementFor = "";
+    }
+  }
+
+  /**
    * Models being read off the disk right now, newest information first.
    *
    * Empty for every backend that cannot tell us — which is not the same as
@@ -440,10 +556,18 @@ export class BackendState {
         .filter((m) => m !== "");
     }
     if (this.kind === "llama-swap") {
-      const running = await getJson<{ running?: { model?: string; state?: string }[] }>(
+      const running = await getJson<{ running?: { model?: string; state?: string; cmd?: string }[] }>(
         `${this.url}/running`,
         { headersTimeoutMs: 3_000 },
       );
+      // The poll already has the payload the SSE path has to go and ask for,
+      // so it reads placement straight out of it.
+      const next = new Map<string, Placement>();
+      for (const r of running.running ?? []) {
+        const p = r.model && r.cmd ? parsePlacement(r.cmd) : null;
+        if (p && r.model) next.set(r.model, p);
+      }
+      this.placements = next;
       // The poll is the fallback for a backend with no event stream, and it
       // reports the same states — so it must learn the same thing, or a load
       // would be visible on one transport and invisible on the other.

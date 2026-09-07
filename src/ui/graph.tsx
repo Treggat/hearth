@@ -42,6 +42,14 @@ import { CELL, GAP, grid, H, MIN_GAP, MIN_STAGE, PAD, STACK, tiers } from "./lay
 import type { Backend, Call, Job, Node, Resource, UiData } from "./types.js";
 
 /** What the inspector is currently showing. Null is the overview. */
+/** The synthetic card that stands for "not the card".
+ *
+ *  Named for the SIDE, not the medium. It was "host memory" until a
+ *  measurement said otherwise: those weights are mmap'd from the model file,
+ *  so whether they are served from RAM or read off the disk depends on whether
+ *  the model fits in RAM — and an 88 GB model on a 44 GB box does not. */
+const HOST = "host";
+
 export type Sel =
   | { kind: "self" }
   | { kind: "peer"; id: string }
@@ -278,7 +286,21 @@ function layout(width: number, height: number, self: Node | undefined, peers: No
     push(`peer:${p.name}`, "self", "across", 14);
   }
   for (const b of backends) push("self", `backend:${b.name}`, "down");
-  for (const r of resources) for (const b of r.backends) push(`backend:${b}`, `resource:${r.name}`, "down");
+  for (const r of resources) {
+    // The host's line is drawn to the CARD, not to the backend. A backend
+    // "using" the host is a fact about a process; a model split across a
+    // card and the host is a fact about the hardware, and it is the second
+    // one that explains the speed — the two halves exchange on every token.
+    // The chain still reads end to end: backend, its card, and the other half.
+    if (r.host) continue;
+    for (const b of r.backends) push(`backend:${b}`, `resource:${r.name}`, "down");
+  }
+  const host = resources.find((r) => r.host);
+  if (host) {
+    for (const card of host.host!.cards) {
+      push(`resource:${card}`, `resource:${host.name}`, "across");
+    }
+  }
 
   void self;
   // Fill the stage when the content is shorter than it, so there is no strip of
@@ -545,7 +567,45 @@ export function Graph({ d, sel, onSelect }: {
   const self = d.net.nodes.find((n) => n.self);
   const peers = d.net.nodes.filter((n) => !n.self);
   const backends = self?.backends ?? [];
-  const resources = d.net.resources ?? [];
+  // The host side, as a node, when and only when something is living there. Synthesised rather than declared: it is not hardware the operator
+  // configured, it is the place weights go when they do not fit on the card
+  // they were meant for — so it appears with the model that spilled and goes
+  // when that model does.
+  //
+  // Modelled as a Resource on purpose. Cards already sit under the backends
+  // that use them, already draw an edge per user, and already wrap and spread
+  // with everything else in their tier; the host behaves the same way in every
+  // one of those respects, and saying so costs nothing but this comment.
+  const declared = d.net.resources ?? [];
+  const spilling = backends
+    .map((b) => ({
+      b,
+      split: (b.offload ?? []).filter((o) => o.cpuLayers !== null || o.cpuExpertsAll),
+    }))
+    .filter((x) => x.split.length > 0);
+  const hostNode: Resource | null = spilling.length && !declared.some((r) => r.name === HOST)
+    ? {
+        name: HOST,
+        kind: "other",
+        // Several backends can have weights there at once and none of them
+        // waits for another, which is exactly what `shared` means.
+        shared: true,
+        holder: null,
+        backends: spilling.map((x) => x.b.name),
+        host: {
+          // The cards this is the other half OF. A split model is running on a
+          // card AND here at once, and the pair is the thing worth drawing:
+          // every token crosses between them.
+          cards: [...new Set(spilling.flatMap((x) => x.b.resources ?? []))]
+            .filter((name) => declared.some((r) => r.name === name && !r.shared)),
+          detail: spilling
+            .flatMap((x) => x.split.map((o) => `${o.model} · ${
+              o.cpuExpertsAll ? "all experts" : `${o.cpuLayers} layers`}`))
+            .join(", "),
+        },
+      }
+    : null;
+  const resources = hostNode ? [...declared, hostNode] : declared;
 
   const scene = useMemo(
     () => layout(box.w, box.h, self, peers, backends, resources),
@@ -660,14 +720,21 @@ export function Graph({ d, sel, onSelect }: {
               // "success.main"` emits that string as CSS, the browser drops the
               // declaration, and every edge on the page draws with no stroke at
               // all. Which is exactly how this shipped the first time.
+              // The one edge that is a standing condition rather than traffic:
+              // weights on the host are not a request passing through, they are
+              // where part of a model LIVES. So it is drawn lit and still —
+              // no dashes, nothing travelling — because nothing about it is
+              // going to finish.
+              const spill = e.to === `resource:${HOST}`;
               return (
                 <path key={e.id} d={e.d} fill="none"
-                      stroke={loose ? t.palette.warning.main : hot ? t.palette.success.main : t.palette.line}
-                      strokeWidth={hot ? 1.4 : 1}
-                      strokeDasharray={hot ? "3 8" : undefined}
-                      opacity={off ? 0.12 : hot ? 0.85 : 0.55}
+                      stroke={spill ? t.palette.cold.main
+                        : loose ? t.palette.warning.main : hot ? t.palette.success.main : t.palette.line}
+                      strokeWidth={spill || hot ? 1.4 : 1}
+                      strokeDasharray={hot && !spill ? "3 8" : undefined}
+                      opacity={off ? 0.12 : spill ? 0.75 : hot ? 0.85 : 0.55}
                       style={{
-                        animation: hot ? "hearth-dash 900ms linear infinite" : undefined,
+                        animation: hot && !spill ? "hearth-dash 900ms linear infinite" : undefined,
                         transition: "stroke 240ms, opacity 240ms",
                       }} />
               );
@@ -808,6 +875,7 @@ export function Graph({ d, sel, onSelect }: {
             const stalled = held.length > 0 && q > 0;
             const loaded = (b.loaded ?? []).map((m) => displayId(m, d.aliases, d.net.available));
             const loading = (b.loading ?? []).map((m) => displayId(m, d.aliases, d.net.available));
+            const split = (b.offload ?? []).filter((o) => o.cpuLayers !== null || o.cpuExpertsAll);
             const proxied = b.proxying ?? [];
             // A load outranks a running job for the node's own colour: the job IS
             // the load, and "running" is the least useful of the two things to
@@ -850,6 +918,20 @@ export function Graph({ d, sel, onSelect }: {
                     : held.length ? `${held.map((r) => r.name).join(", ")} busy`
                     : b.knowsWarm === false ? "warmth unknown" : "nothing loaded"}
                 </Sub>
+                {split.length > 0 && (
+                  // Said on the backend as well as on the host node, because
+                  // this is the line you read when you are asking why THIS
+                  // backend is slow, and the node is the one you read when you
+                  // are asking what is on the host.
+                  <Sub color="cold.main">
+                    {/* The model is named on the line above; repeating it here
+                        only bought a truncated ellipsis, the same way it did
+                        for the forwarded count. */}
+                    {split.map((o) => o.cpuExpertsAll
+                      ? "experts on host"
+                      : `${o.cpuLayers} layers on host`).join(", ")}
+                  </Sub>
+                )}
                 {q > 0 && <Sub color="warning.main">{q} waiting</Sub>}
                 {proxied.length > 0 && (
                   // The model is already on the line above; repeating it here
@@ -888,15 +970,17 @@ export function Graph({ d, sel, onSelect }: {
                        // Shared hardware is never "held", so it never goes green
                        // for a holder. Busy is still busy: work on it still reads
                        // as work.
-                       tone={filling.length ? "cold"
+                       tone={r.host || filling.length ? "cold"
                          : r.holder ? "live" : unqueued.length ? "work"
                          : r.shared && inUse.length ? "live" : "idle"}
-                       icon={resourceIcon(r.kind)}
+                       icon={r.host ? "ram" : resourceIcon(r.kind)}
                        selected={sel?.kind === "resource" && sel.id === r.name}
                        dim={dimmed(`resource:${r.name}`)}
                        onHover={(on) => setHover(on ? `resource:${r.name}` : null)}
                        onSelect={() => onSelect({ kind: "resource", id: r.name })}
-                       title={filling.length
+                       title={r.host
+                         ? `Weights that did not fit on a card: ${r.host.detail}. They are assigned to the host and computed on the CPU, so EVERY token pays for them — this is the model's running speed, not a startup cost. Whether they are served from RAM or read off the disk depends on whether the model fits in RAM, which cannot be seen from here. It is the trade that lets a model too big for the card run at all, so it is a fact to know rather than a fault to clear.`
+                         : filling.length
                          ? `${filling.map((b) => b.name).join(", ")} is reading a model onto ${r.name}. A cold load is tens of seconds and nothing else can have the card until it finishes — so a queue that looks stopped is waiting on a disk, not on a decision.`
                          : r.shared
                          ? `${r.name} is shared: everything declared on it runs at once, so hearth does not arbitrate it and nothing waits for it. ${backends.filter((b) => (b.resources ?? []).includes(r.name)).length} backend(s) use it.`
@@ -905,13 +989,17 @@ export function Graph({ d, sel, onSelect }: {
                          : unqueued.length
                            ? `${r.name} is busy: ${unqueued.map((b) => b.name).join(", ")} is working on it. But hearth is not scheduling that work — it was forwarded straight through — so hearth cannot make anything else wait for this card while it runs.`
                            : `${r.name} is free — free and still loaded is the normal resting state`}>
-                <Head tone={filling.length ? "cold.main"
+                <Head tone={r.host || filling.length ? "cold.main"
                   : r.holder ? "success.main" : unqueued.length ? "warning.main" : "faint"} name={r.name} />
-                <Sub color={filling.length ? "cold.main"
+                <Sub color={r.host || filling.length ? "cold.main"
                   : r.holder || (r.shared && inUse.length) ? "success.main"
                   : unqueued.length ? "warning.main" : "faint"}
-                     sx={filling.length ? { animation: "hearth-breathe 1.8s ease-in-out infinite" } : undefined}>
-                  {filling.length
+                     sx={filling.length && !r.host
+                       ? { animation: "hearth-breathe 1.8s ease-in-out infinite" }
+                       : undefined}>
+                  {/* Steady, not breathing. A load ends; this does not. */}
+                  {r.host ? r.host.detail
+                    : filling.length
                     ? `${filling[0]!.name} · loading`
                     : r.shared
                     ? (inUse.length ? `${inUse.length} of ${backends.filter((b) => (b.resources ?? []).includes(r.name)).length} working` : "shared · idle")
