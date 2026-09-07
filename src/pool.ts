@@ -426,6 +426,12 @@ export class BackendPool {
     return ids;
   }
 
+  /** The id we advertise for something a backend calls `raw`. The way back
+   *  from a backend's vocabulary into ours, for anything read off the wire. */
+  advertised(raw: string): string {
+    return this.advertisedId(raw);
+  }
+
   private advertisedId(raw: string): string {
     // Built per call rather than cached: `models` is small, and a cache here
     // would need invalidating on any future config reload.

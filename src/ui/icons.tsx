@@ -25,14 +25,19 @@ import {
   CpuIcon,
   GpuIcon,
   PinLocation01Icon,
+  RamMemoryIcon,
   Route01Icon,
   ServerStack01Icon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 
-export type IconKind = "self" | "peer" | "swap" | "single" | "path" | "card" | "cpu" | "chip";
+export type IconKind = "self" | "peer" | "swap" | "single" | "path" | "card" | "cpu" | "chip" | "ram";
 
 const GLYPH = {
+  /** Host memory: where a model's weights go when they do not fit on a card.
+   *  A memory module rather than a chip, because the point is WHERE the weights
+   *  are sitting, not what is computing them. */
+  ram: RamMemoryIcon,
   /** This node — the machine the page is served from. */
   self: ServerStack01Icon,
   /**

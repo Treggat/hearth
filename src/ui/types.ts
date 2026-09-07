@@ -51,6 +51,28 @@ export interface Backend {
    * is something in it.
    */
   loading?: string[];
+  /**
+   * Resident models whose weights are not all on the card.
+   *
+   * A permanent condition rather than a startup cost: with experts on the CPU
+   * every token pays, not just the first. Invisible otherwise — the model is
+   * loaded, the card is busy, every number looks normal, and the thing is
+   * simply slow.
+   *
+   * Says WHERE they were assigned, not what medium serves them. Weights are
+   * mmap'd from the file, so a model too big for host RAM is read off the disk
+   * on every generation — which is a measurement on that machine, not something
+   * the launch command knows.
+   */
+  offload?: {
+    model: string;
+    /** Layers whose experts run on the CPU (`--n-cpu-moe`). */
+    cpuLayers: number | null;
+    /** Every layer of experts (`--cpu-moe`). */
+    cpuExpertsAll: boolean;
+    /** The whole model is on the CPU (`-ngl 0`) — not a split, just not a card model. */
+    cpuOnly: boolean;
+  }[];
   serves?: string[];
   /** Only llama-swap. An ollama backend keeps its set resident, so it cannot thrash. */
   evicts?: boolean;
@@ -94,6 +116,13 @@ export interface Backend {
  */
 export interface Resource {
   name: string;
+  /**
+   * Synthesised by the page, not sent by the server: the host's own memory,
+   * standing in for "not the card". It exists only while some resident model
+   * has weights over there, and it is the one node here that is not hardware
+   * the operator declared.
+   */
+  host?: { detail: string; cards: string[] };
   /** What to draw it as. Never reaches admission. */
   kind?: "gpu" | "cpu" | "other";
   /**

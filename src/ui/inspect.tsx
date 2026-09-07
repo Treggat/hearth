@@ -860,9 +860,14 @@ function Overview({ d }: { d: UiData }) {
         <Box component="span" sx={{ color: "warning.main" }}>Amber</Box> is work hearth is only
         forwarding — image generation arrives on a path it passes straight through, so it runs
         without a slot and the card arbiter cannot see it. Busy either way; managed only when green.{" "}
-        <Box component="span" sx={{ color: "cold.main" }}>Violet</Box> is a model being read off
-        the disk — tens of seconds for a large one, and nothing else can have the card until it
-        lands, so a queue that looks stopped is waiting on a disk rather than on a decision.
+        <Box component="span" sx={{ color: "cold.main" }}>Violet</Box> is weights not on the card.
+        Breathing, it is a model being read in — tens of seconds for a large one, and nothing else
+        can have the card until it lands. Steady, it is a model whose weights did not FIT: part of
+        it is assigned to the host and computed on the CPU, so every token pays for it, not just
+        the first. Where that part actually comes from depends on whether the model fits in host
+        RAM; one that does not is read off the disk on every generation. A trade rather than a
+        fault — it is what lets a model too big for the card run at all — but worth knowing which
+        of your models is paying it.
       </Typography>
       <Typography sx={{ fontSize: 11, color: "faint", lineHeight: 1.7 }}>
         Click anything above to act on it. The self node holds the federation switches

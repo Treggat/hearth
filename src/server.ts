@@ -2128,6 +2128,15 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             // Empty for a backend that cannot tell us, which is not a claim
             // that nothing is loading — so the page draws this only when there
             // IS something in it, and draws no absence.
+            // Where a resident model's weights actually are, when the launch
+            // command says something worth reporting. Permanent, unlike a
+            // load: every token crosses the boundary, not just the first.
+            offload: [...b.state.placement()].map(([wire, p]) => ({
+              model: pool.advertised(wire),
+              cpuLayers: p.cpuLayers,
+              cpuExpertsAll: p.cpuExpertsAll,
+              cpuOnly: p.cpuOnly,
+            })),
             loading: b.cfg.serves.length
               ? [...b.cfg.serves].filter((m) => b.state.loading().includes(pool.outboundId(m)))
               : b.state.loading(),
