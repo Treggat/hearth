@@ -2119,6 +2119,18 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             loaded: b.cfg.serves.length
               ? [...b.cfg.serves].filter((m) => b.state.isWarm(pool.outboundId(m)))
               : b.state.loaded(),
+            // Being read off the disk right now. The longest thing that happens
+            // on this box, and until now the only one the page could not name:
+            // a cold load drew as "nothing loaded" with a job running on it,
+            // which is true twice and explains nothing. Same translation as
+            // `loaded` above, for the same reason.
+            //
+            // Empty for a backend that cannot tell us, which is not a claim
+            // that nothing is loading — so the page draws this only when there
+            // IS something in it, and draws no absence.
+            loading: b.cfg.serves.length
+              ? [...b.cfg.serves].filter((m) => b.state.loading().includes(pool.outboundId(m)))
+              : b.state.loading(),
             // Unqueued work we are proxying for this backend right now. Real
             // traffic, no admission — see `proxying` above.
             proxying: [...proxying]

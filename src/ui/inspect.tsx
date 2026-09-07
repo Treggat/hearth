@@ -859,7 +859,10 @@ function Overview({ d }: { d: UiData }) {
         scheduled: it took a slot and waited its turn.{" "}
         <Box component="span" sx={{ color: "warning.main" }}>Amber</Box> is work hearth is only
         forwarding — image generation arrives on a path it passes straight through, so it runs
-        without a slot and the card arbiter cannot see it. Busy either way; managed only when green.
+        without a slot and the card arbiter cannot see it. Busy either way; managed only when green.{" "}
+        <Box component="span" sx={{ color: "cold.main" }}>Violet</Box> is a model being read off
+        the disk — tens of seconds for a large one, and nothing else can have the card until it
+        lands, so a queue that looks stopped is waiting on a disk rather than on a decision.
       </Typography>
       <Typography sx={{ fontSize: 11, color: "faint", lineHeight: 1.7 }}>
         Click anything above to act on it. The self node holds the federation switches
