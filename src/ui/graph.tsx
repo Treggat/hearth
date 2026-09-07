@@ -6,11 +6,15 @@
  * backend stands on a card, and that another backend is waiting for the same
  * card. Those are edges, and a table has no edges.
  *
- * Structure, three rows, top to bottom:
+ * Structure, three tiers, top to bottom:
  *
  *   self and its peers   who we are, who we can borrow from
  *   backends             the admission domains
  *   cards                the silicon they take turns on
+ *
+ * A tier wraps onto more than one row when it runs out of width — see
+ * layout.ts, which is the whole of the geometry and the only part of this page
+ * that can be checked without a browser.
  *
  * Nodes are ordinary HTML positioned absolutely; only the edges and the things
  * travelling along them are SVG. Text in SVG cannot wrap, cannot use the theme's
@@ -34,6 +38,7 @@ import { backendIcon, resourceIcon, TypeIcon, type IconKind } from "./icons.js";
 import { MONO } from "./theme.js";
 import { displayId } from "./lib.js";
 import { blockers } from "./why.js";
+import { CELL, GAP, grid, H, MIN_GAP, MIN_STAGE, PAD, STACK, tiers } from "./layout.js";
 import type { Backend, Call, Job, Node, Resource, UiData } from "./types.js";
 
 /** What the inspector is currently showing. Null is the overview. */
@@ -49,23 +54,6 @@ export const selEq = (a: Sel, b: Sel): boolean =>
     && (a.kind === "self" || b.kind === "self" || a.id === (b as { id: string }).id));
 
 /* ----------------------------------------------------------------- layout */
-
-const GAP = 18;
-const PAD = 10;
-const H = { self: 82, peer: 82, backend: 86, resource: 66 } as const;
-/** Below this the columns stop being readable and the stage scrolls instead. */
-const MIN_STAGE = 640;
-/** The tightest the three rows go before the edges are too short to read. */
-const MIN_GAP = 72;
-const MAX_GAP = 150;
-
-/** Row tops for a given stage height: the rows share whatever is spare. */
-function rows(height: number): [number, number, number] {
-  const content = H.self + H.backend + H.resource;
-  const gap = Math.max(MIN_GAP, Math.min(MAX_GAP, (height - content - PAD * 2) / 2));
-  const top = Math.max(PAD, (height - content - gap * 2) / 2);
-  return [top, top + H.self + gap, top + H.self + gap + H.backend + gap];
-}
 
 interface Placed {
   id: string;
@@ -169,55 +157,111 @@ function layout(width: number, height: number, self: Node | undefined, peers: No
                 backends: Backend[], resources: Resource[]): Scene {
   const nodes = new Map<string, Placed>();
   const inner = width - PAD * 2;
-  const ROW_Y = rows(height);
 
-  // Row 0. Self anchors the left; peers fill from the right so the gap between
+  // How many rows of backends the height can take before the tiers themselves
+  // have nowhere to go. Wrapping trades height for width, and this is the
+  // budget: past it, a wrapped row would push the cards off the stage.
+  const budget = height - PAD * 2 - H.self - H.resource - MIN_GAP * 2 + STACK;
+  const maxRows = Math.max(1, Math.min(4, Math.floor(budget / (H.backend + STACK))));
+  const bPlan = grid(inner, backends.length, CELL.backend, maxRows);
+  const rPlan = grid(inner, resources.length, CELL.resource, 2);
+  const Y = tiers(height, Math.max(1, bPlan.sizes.length), Math.max(1, rPlan.sizes.length));
+
+  // Tier 0. Self anchors the left; peers fill from the right so the gap between
   // them is the visual span of the link, and one peer sits opposite us.
   const selfW = Math.min(240, Math.max(190, inner * 0.24));
-  nodes.set("self", { id: "self", kind: "self", x: PAD, y: ROW_Y[0], w: selfW, h: H.self });
+  nodes.set("self", { id: "self", kind: "self", x: PAD, y: Y.self, w: selfW, h: H.self });
   if (peers.length) {
-    const pw = Math.min(210, Math.max(150, (inner * 0.55 - (peers.length - 1) * GAP) / peers.length));
-    const span = peers.length * pw + (peers.length - 1) * GAP;
+    // What is left after self has taken its side. Without this a fourth peer
+    // pushed the row off the left edge and drew ON TOP of us, which reads as a
+    // peer that IS us — the one thing this row exists to distinguish.
+    const room = inner - selfW - GAP;
+    const pw = Math.max(
+      100,
+      Math.min(CELL.peer.max, Math.max(CELL.peer.min, (room - (peers.length - 1) * GAP) / peers.length)),
+    );
+    const span = Math.min(room, peers.length * pw + (peers.length - 1) * GAP);
+    const step = peers.length > 1 ? (span - pw) / (peers.length - 1) : 0;
     const start = PAD + inner - span;
     peers.forEach((p, i) => nodes.set(`peer:${p.name}`, {
-      id: `peer:${p.name}`, kind: "peer", x: start + i * (pw + GAP), y: ROW_Y[0], w: pw, h: H.peer,
+      id: `peer:${p.name}`, kind: "peer", x: start + i * step, y: Y.self, w: pw, h: H.peer,
     }));
   }
 
-  // Row 1. Backends share the full width; below the clamp the stage scrolls
-  // rather than squeezing a name into 60px.
-  const n = backends.length;
-  if (n) {
-    const bw = Math.min(184, Math.max(118, (inner - (n - 1) * GAP) / n));
-    const span = n * bw + (n - 1) * GAP;
-    const start = PAD + Math.max(0, (inner - span) / 2);
-    backends.forEach((b, i) => nodes.set(`backend:${b.name}`, {
-      id: `backend:${b.name}`, kind: "backend", x: start + i * (bw + GAP), y: ROW_Y[1], w: bw, h: H.backend,
-    }));
+  // Tier 1. Backends, over as many rows as it takes to keep a name readable.
+  {
+    let i = 0;
+    bPlan.sizes.forEach((count, row) => {
+      const span = count * bPlan.w + (count - 1) * GAP;
+      const start = PAD + Math.max(0, (inner - span) / 2);
+      for (let c = 0; c < count; c++, i++) {
+        const b = backends[i];
+        if (!b) return;
+        nodes.set(`backend:${b.name}`, {
+          id: `backend:${b.name}`, kind: "backend",
+          x: start + c * (bPlan.w + GAP),
+          y: Y.backends + row * (H.backend + STACK),
+          w: bPlan.w, h: H.backend,
+        });
+      }
+    });
   }
 
-  // Row 2. A card sits under the backends that declare it, then siblings are
+  // Tier 2. A card sits under the backends that declare it, then siblings are
   // pushed apart — two cards drawn on top of each other is worse than two cards
   // slightly away from the backends they belong to, because the edges still say
-  // which is which.
-  const rw = Math.min(200, Math.max(120, (inner - (resources.length - 1) * GAP) / Math.max(1, resources.length)));
-  const wanted = resources.map((r) => {
-    const members = r.backends
-      .map((b) => nodes.get(`backend:${b}`))
-      .filter((p): p is Placed => !!p);
-    const mid = members.length
-      ? members.reduce((s, p) => s + p.x + p.w / 2, 0) / members.length
-      : PAD + inner / 2;
-    return { r, x: mid - rw / 2 };
-  }).sort((a, b) => a.x - b.x);
+  // which is which. Cards wrap on the same rule as backends; the packing then
+  // runs per row, so a card is only pushed off its own backends by a card it
+  // actually shares the row with.
+  {
+    const rw = rPlan.w;
+    const wanted = resources.map((r) => {
+      const members = r.backends
+        .map((b) => nodes.get(`backend:${b}`))
+        .filter((p): p is Placed => !!p);
+      const mid = members.length
+        ? members.reduce((s, p) => s + p.x + p.w / 2, 0) / members.length
+        : PAD + inner / 2;
+      return { r, x: mid - rw / 2 };
+    }).sort((a, b) => a.x - b.x);
 
-  let cursor = PAD;
-  for (const w of wanted) {
-    const x = Math.max(cursor, Math.min(w.x, PAD + inner - rw));
-    nodes.set(`resource:${w.r.name}`, {
-      id: `resource:${w.r.name}`, kind: "resource", x, y: ROW_Y[2], w: rw, h: H.resource,
+    let i = 0;
+    rPlan.sizes.forEach((count, row) => {
+      // Pack in order at the position each card wants...
+      const placed: { r: Resource; x: number }[] = [];
+      let cursor = PAD;
+      for (let c = 0; c < count; c++, i++) {
+        const w = wanted[i];
+        if (!w) break;
+        const x = Math.max(cursor, Math.min(w.x, PAD + inner - rw));
+        placed.push({ r: w.r, x });
+        cursor = x + rw + GAP;
+      }
+      // ...then stretch the row to the full width, keeping the order and the
+      // spacing's proportions. Cards follow the backends above them, and those
+      // cluster: six sidecars sharing one CPU drag it to their average, which
+      // put every card in the left third and left half the stage empty. The
+      // edges are what say which card belongs to which backend — position only
+      // has to agree with them about the ORDER.
+      if (placed.length > 1) {
+        const first = placed[0]!.x;
+        const last = placed[placed.length - 1]!.x;
+        const used = last - first;
+        const room = inner - rw;
+        if (used > 0 && used < room) {
+          const scale = room / used;
+          for (const p of placed) p.x = PAD + (p.x - first) * scale;
+        }
+      } else if (placed.length === 1) {
+        placed[0]!.x = PAD + (inner - rw) / 2;
+      }
+      for (const p of placed) {
+        nodes.set(`resource:${p.r.name}`, {
+          id: `resource:${p.r.name}`, kind: "resource",
+          x: p.x, y: Y.resources + row * (H.resource + STACK), w: rw, h: H.resource,
+        });
+      }
     });
-    cursor = x + rw + GAP;
   }
 
   const edges: Edge[] = [];
@@ -237,7 +281,10 @@ function layout(width: number, height: number, self: Node | undefined, peers: No
   for (const r of resources) for (const b of r.backends) push(`backend:${b}`, `resource:${r.name}`, "down");
 
   void self;
-  return { nodes, edges, width, height };
+  // Fill the stage when the content is shorter than it, so there is no strip of
+  // dead page under the cards; grow past it only when even the tight layout
+  // does not fit, which is the one case worth a scrollbar.
+  return { nodes, edges, width, height: Math.max(height, Y.needed) };
 }
 
 /* --------------------------------------------------------------- traffic */
