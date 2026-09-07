@@ -187,7 +187,15 @@ export class BackendPool {
       } catch {
         continue; // a malformed escape is not a model id
       }
-      if (!this.declaredBy(p.slot, model)) continue;
+      // Match in the BACKEND's vocabulary and report in ours. The captured
+      // segment is whatever the caller typed, and for an aliased model that is
+      // the only id we advertise -- `image-hq` when the backend serves `image`
+      // and the raw id is hidden precisely because it exists to be renamed. So
+      // asking against the raw segment meant the route never fired for the one
+      // name a client could legitimately use: the request fell through to the
+      // unqueued passthrough, and the operator's `routes:` entry silently did
+      // nothing on the model it was written for.
+      if (!this.declaredBy(p.slot, this.outboundId(model))) continue;
       return { slot: p.slot, rule: { ...p.rule, model } };
     }
     return undefined;

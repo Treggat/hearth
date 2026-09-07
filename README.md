@@ -392,8 +392,8 @@ render would give you a progress bar that updates once the work is finished.
 
 A route defaults to the lowest-priority lane you've configured (`batch` in the
 stock config) and reports under the backend's name. Both are overridable per
-route with `lane:` and `model:`. The body is never inspected — a declared path
-is forwarded byte for byte like everything else on that route.
+route with `lane:` and `model:`. A declared path is forwarded byte for byte like
+everything else on that route, apart from the one `as:` rename described below.
 
 **Synchronous endpoints only.** ComfyUI's `POST /prompt` → poll `/history/{id}`
 does not fit: holding a slot across two unrelated requests leaks it the moment
@@ -469,11 +469,17 @@ A request for `nomic-embed` is dispatched to the backend as
 already does for a peer, applied to a local backend — so `as:` is refused on a
 model with a peer policy, where the peer's own mapping already owns the id.
 
-The rewrite applies to **both** dispatch paths, which is the part that matters:
+The rewrite applies to **every** dispatch path, which is the part that matters:
 chat completions go through the router, while `/v1/embeddings` and the other
-passthrough routes do not. An alias honoured on only one of them would appear
-to work until you used the other endpoint. It is the single deliberate exception
-to the passthrough's otherwise byte-for-byte forwarding.
+passthrough routes do not, and a path you have named in `routes:` is queued but
+still forwarded. An alias honoured on only some of them would appear to work
+until you used another endpoint. It is the single deliberate exception to the
+passthrough's otherwise byte-for-byte forwarding.
+
+`as:` and `routes:` therefore compose, in both directions. A queued path reaches
+the backend under the backend's id, and a `{model}` route matches on the id you
+advertise — which for an aliased model is the only id a client has, since the
+raw one is hidden from `/v1/models` precisely because it exists to be renamed.
 
 `/v1/models`, the status page, and warm state all report the advertised id. Warm
 state is not cosmetic here: it feeds the scheduler's warm bonus, so an untranslated

@@ -1410,7 +1410,12 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         // Not JSON, or not ours to understand. The fallback covers it.
       }
     }
-    const named = routed ? undefined : (viaPath ?? viaBody);
+    // What the CALLER asked for, kept apart from `named` below. The two used to
+    // be one value, which quietly meant a declared route could not also be an
+    // aliased model: `named` picks the backend, a route has already picked one,
+    // so it had to be undefined here — and that also switched off the rewrite.
+    const asked = viaPath ?? viaBody;
+    const named = routed ? undefined : asked;
     const target = routed ? routed.slot : named ? pool.for(named) : pool.first();
     if (named && !pool.single) {
       log.debug("passthrough.resolved", { path, model: named, backend: target.name });
@@ -1425,15 +1430,21 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // and never touches the chat dispatch above, so without this the alias
     // works for chat and fails for embeddings, which is worse than not having it.
     //
+    // A DECLARED route needs the same rewrite, for the same reason. Queueing a
+    // path does not change what the backend calls the model, so `routes:` and
+    // `as:` used to be mutually exclusive in a way nothing said out loud: the
+    // route matched, the request was scheduled, and the backend was then handed
+    // an id it had never heard of.
+    //
     // Scoped as tightly as possible: only when the id actually differs, only for
     // a JSON body that already parsed, and only the `model` field. The path
     // form (/upstream/<model>/...) is rewritten too, since llama-swap routes on
     // that segment.
     let outBody = body;
     let outPath = path;
-    if (named) {
-      const wire = pool.outboundId(named);
-      if (wire !== named) {
+    if (asked) {
+      const wire = pool.outboundId(asked);
+      if (wire !== asked) {
         if (viaPath) {
           outPath = path.replace(`/upstream/${viaPath}/`, `/upstream/${wire}/`);
         } else if (body && body.length > 0) {
@@ -1444,7 +1455,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             // Unparseable bodies are forwarded untouched, exactly as before.
           }
         }
-        log.debug("passthrough.aliased", { path, from: named, to: wire });
+        log.debug("passthrough.aliased", { path, from: asked, to: wire });
       }
     }
 
