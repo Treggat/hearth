@@ -109,12 +109,47 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/control` | local | read or change what leaves this node: lending, borrowing, per-model sharing, peer model maps |
 | `/network` | local | every node, what each one serves, and what's **loaded right now**. Also lists peer models you haven't mapped, which is usually the config mistake people actually make |
 | `/queue` | local | jobs in flight, with lane, caller and position |
-| `/healthz` | anyone | liveness. The one unauthenticated endpoint |
+| `/healthz` | anyone | whether this node can serve. `503` when it can't. The one unauthenticated endpoint |
 | `/peer/hello`, `/peer/state` | peers | identity and capacity, per model |
 
 Anything else gets proxied to your backend untouched, so a client already using
 `/unload` or llama-swap's `/upstream/<model>/…` keeps working. Those passthrough
 paths **are not queued**, see below.
+
+### What `/healthz` actually checks
+
+It answers `200` with counts, or `503` when every backend it is watching has
+gone:
+
+```json
+{"ok":true,"name":"web",
+ "backends":{"total":9,"watched":2,"connected":2},
+ "peers":{"total":1,"up":1}}
+```
+
+`watched` is the backends whose event stream hearth holds open — llama-swap,
+today. That connection is the signal: when the backend dies the stream drops,
+and hearth knows within a reconnect without having asked it anything. `503`
+means every one of them is gone.
+
+What this is deliberately NOT built on is "have we heard from it lately". On an
+idle box nothing is heard from anything, so that reads silent across the board
+while the node is perfectly well — a probe built on it goes red and stays red.
+It is a decoration on the page, not a health signal, and the distinction is why
+`answering` says so in its own docs.
+
+`watched: 0` is an honest answer too, and worth reading. A node of `single` or
+`none` backends — CPU sidecars — is never contacted unless something is being
+asked of it, so hearth has no evidence either way and will not invent a verdict.
+The check is weak for that config and says so in the number rather than
+pretending.
+
+Peers never affect `ok`. A peer being down is a routing input, not this node's
+health.
+
+It is unauthenticated and the main port may be bound wide, so it reports counts
+and never names. Model ids, backend names and peer names stay behind the page's
+gate.
 
 ## The status page
 

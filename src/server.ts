@@ -647,8 +647,54 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       return;
     }
 
+    /**
+     * Whether this node can serve, for an external probe.
+     *
+     * It used to answer `{ok: true}` unconditionally, which made it a check
+     * that the socket accepts connections and nothing more -- every backend
+     * dead and every peer gone still read healthy, so the one thing monitoring
+     * it could tell you was the one thing you already knew from the fact that
+     * it answered.
+     *
+     * The honest signal is the event stream. Where we hold one open, a backend
+     * going away drops it within a reconnect; that is real, it is continuously
+     * maintained, and it costs nothing to read. What it is NOT built on is
+     * `answering()`, which means "something came back from this lately" -- on a
+     * quiet box nothing does, so every backend reads silent while all of them
+     * are fine. (Verified on the live box before writing this: nine backends,
+     * `answering: false` on all nine, including one with a model resident.)
+     *
+     * So: 503 only when we are watching backends and have lost every one of
+     * them. A config we cannot watch reports `watched: 0` and stays ok, because
+     * hearth does not probe backends it is not using and will not invent a
+     * verdict it has no evidence for -- and a probe that cried wolf on an idle
+     * box would be worse than the unconditional true it replaced.
+     *
+     * Peers never affect `ok`. A peer being down is a routing input, not this
+     * node's health, and every model that matters has a local fallback.
+     *
+     * UNAUTHENTICATED, and on a port that may be bound wide -- so counts, never
+     * names. What is loaded, who is calling and which models exist stay behind
+     * the page's gate.
+     */
     if (path === "/healthz") {
-      json(res, 200, { ok: true, name: cfg.name });
+      const local = pool.all();
+      const watched = local.filter((b) => b.state.watched());
+      const connected = watched.filter((b) => b.state.streamingNow());
+      const ok = watched.length === 0 || connected.length > 0;
+      json(res, ok ? 200 : 503, {
+        ok,
+        name: cfg.name,
+        backends: {
+          total: local.length,
+          watched: watched.length,
+          connected: connected.length,
+        },
+        peers: {
+          total: cfg.peers.length,
+          up: peers.all().filter((p) => p.up).length,
+        },
+      });
       return;
     }
 

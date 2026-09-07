@@ -169,6 +169,20 @@ export class BackendState {
   }
 
   /**
+   * Is this backend's liveness continuously observable?
+   *
+   * True where we hold an event stream open, which is the only place silence
+   * means anything: the stream drops when the backend goes, within a reconnect
+   * rather than a poll interval. A polled or `none` backend is never contacted
+   * unless something is being asked of it, so hearing nothing from one is not
+   * evidence of anything — see `answering()`, which is why that is a page
+   * decoration and not a health signal.
+   */
+  watched(): boolean {
+    return this.useEvents;
+  }
+
+  /**
    * The context window for a model we have learned about, or null if unknown.
    *
    * Read-only; learnContext fills the cache. A null is not a failure — it
