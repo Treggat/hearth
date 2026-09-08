@@ -445,6 +445,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       const up = await send(`${local.cfg.url}/v1/chat/completions`, {
         json: pool.outboundBody(model, payload),
         signal,
+        ...backendDeadline(),
       });
       localStatus = await pipeThrough(up, res);
     };
@@ -680,803 +681,966 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     return out;
   }
 
-  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    const path = url.pathname;
+  /**
+   * One request, with its caller already established.
+   *
+   * `peer` and `caller` are resolved by the table below and handed in, so a
+   * handler never re-asks who is calling — which is what let one route's answer
+   * differ from another's.
+   */
+  interface Call {
+    req: IncomingMessage;
+    res: ServerResponse;
+    url: URL;
+    path: string;
+    /** The peer whose token authenticated this, or null for a local caller. */
+    peer: string | null;
+    /** Who to bill and to log: a peer's name, "local", or "key:<label>".
+     *  Empty for routes that need no caller. */
+    caller: string;
+  }
 
+  /**
+   * Who a route lets in.
+   *
+   * Declared once per path instead of re-derived inside each handler. The
+   * routes here differ in ways that are easy to get subtly wrong by hand — one
+   * is deliberately open, one is decided by address rather than credential, and
+   * three accept either a peer or a local caller — and the way that goes wrong
+   * is a route that quietly accepts more than it meant to.
+   */
+  type Auth =
+    /** No credential at all. Only /healthz, which is built to say nothing. */
+    | "open"
+    /**
+     * By ADDRESS, never by credential.
+     *
+     * The status page's own gate. EventSource cannot send an Authorization
+     * header, so deciding these sockets by address is what lets the stream and
+     * the poll share one story about auth instead of needing two.
+     */
+    | "loopback"
+    /** A peer's token, and nothing else. */
+    | "peer"
+    /** This machine, or one of our api keys. Never a peer. */
+    | "local"
+    /** Either — work a peer may send us, and we may ask for ourselves. */
+    | "either";
+
+  /**
+   * The refusal's shape, because clients parse it.
+   *
+   * The /v1 surface answers in OpenAI's error envelope because that is what an
+   * OpenAI client reads; the control and peer surfaces answer in the plain
+   * `{error}` shape they always have. Stated per route so the pairing is a
+   * decision rather than a coincidence of which helper was nearest.
+   */
+  type Envelope = "plain" | "openai";
+
+  interface Route {
+    path: string | string[];
+    /**
+     * Methods this route claims. Anything else FALLS THROUGH to the
+     * passthrough, which is how a `GET /v1/chat/completions` has always
+     * reached the backend untouched.
+     */
+    methods?: string[];
+    auth: Auth;
+    envelope?: Envelope;
+    handler: (c: Call) => Promise<void>;
+  }
+
+  const refuse = (res: ServerResponse, status: number, msg: string, env: Envelope): void => {
+    if (env === "openai") apiError(res, status, msg, status === 401 ? "authentication_error" : "permission_error");
+    else json(res, status, { error: msg });
+  };
+
+  /**
+   * Resolve the caller for a route, or answer the refusal and return null.
+   *
+   * The single place a credential is turned into an identity. A handler that
+   * wants to know who is calling reads it off `Call`; there is nowhere else to
+   * ask.
+   */
+  function authorize(r: Route, req: IncomingMessage, res: ServerResponse): Call | null {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const base = { req, res, url, path: url.pathname };
+    const env = r.envelope ?? "plain";
+
+    if (r.auth === "open") return { ...base, peer: null, caller: "" };
+
+    if (r.auth === "loopback") {
+      if (!isLoopback(req)) {
+        refuse(res, 403, "the status page is loopback-only", env);
+        return null;
+      }
+      return { ...base, peer: null, caller: "" };
+    }
+
+    const asPeer = r.auth === "local" ? null : peerCaller(req);
+    if (r.auth === "peer") {
+      if (asPeer === null) {
+        refuse(res, 401, "unknown peer token", env);
+        return null;
+      }
+      return { ...base, peer: asPeer, caller: asPeer };
+    }
+
+    const asLocal = localCaller(req);
+    if (asPeer === null && asLocal === null) {
+      refuse(res, 401, "unauthorized", env);
+      return null;
+    }
+    return { ...base, peer: asPeer, caller: asPeer ?? asLocal! };
+  }
+
+  /**
+   * Every path this node answers, in the order they are tried.
+   *
+   * The point of the table is the `auth` column: it is the one property of a
+   * route that must never be got wrong, and having it beside the path makes a
+   * new route's policy a thing you choose rather than a thing you remember to
+   * copy. The passthrough is last and claims everything left, which is what
+   * makes pointing an app at hearth instead of its backend change nothing the
+   * app can see.
+   */
+  const ROUTES: Route[] = [
+    // Unauthenticated on purpose, and on a port that may be bound wide, so it
+    // answers in counts and never in names.
+    { path: "/healthz", auth: "open", handler: routeHealthz },
+
+    { path: ["/peer/hello", "/peer/state"], auth: "peer", handler: routePeer },
+
+    // Local only. /control is the one route here that CHANGES anything, so a
+    // peer must never reach it: switching off our lending is a denial of
+    // service against ourselves, and switching it back on after we paused it
+    // is worse.
+    { path: "/network", auth: "local", handler: routeNetwork },
+    { path: "/control", auth: "local", handler: routeControl },
+    { path: "/queue", auth: "local", handler: routeQueue },
+
+    // The OpenAI surface: a peer may send us work here, and so may we.
+    { path: "/v1/warm", methods: ["POST"], auth: "either", envelope: "openai", handler: routeWarm },
+    { path: "/v1/models", auth: "either", envelope: "openai", handler: routeModels },
+    { path: "/v1/chat/completions", methods: ["POST"], auth: "either", envelope: "openai",
+      handler: routeChat },
+
+    // On the MAIN port the page stays loopback-only. Reaching it from
+    // elsewhere is what uiListen is for, and that is a separate socket.
+    { path: ["/ui", "/ui/", "/ui/data", "/ui/events"], auth: "loopback", envelope: "openai",
+      handler: routeUi },
+
+    { path: "*", auth: "local", envelope: "openai", handler: routePassthrough },
+  ];
+
+  const claims = (r: Route, path: string, method: string | undefined): boolean => {
+    if (r.path !== "*") {
+      const paths = Array.isArray(r.path) ? r.path : [r.path];
+      if (!paths.includes(path)) return false;
+    }
+    return r.methods === undefined || r.methods.includes(method ?? "GET");
+  };
+
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+
+    // Before anything is routed, because it is a fact about the REQUEST rather
+    // than about any one path: a browser on some other site's page must not be
+    // able to POST here just because loopback is trusted.
     if (crossOriginWrite(req)) {
       log.warn("request.cross_origin", { path, method: req.method, origin: req.headers.origin });
       apiError(res, 403, "cross-origin writes are refused", "permission_error");
       return;
     }
 
-    /**
-     * Whether this node can serve, for an external probe.
-     *
-     * It used to answer `{ok: true}` unconditionally, which made it a check
-     * that the socket accepts connections and nothing more -- every backend
-     * dead and every peer gone still read healthy, so the one thing monitoring
-     * it could tell you was the one thing you already knew from the fact that
-     * it answered.
-     *
-     * The honest signal is the event stream. Where we hold one open, a backend
-     * going away drops it within a reconnect; that is real, it is continuously
-     * maintained, and it costs nothing to read. What it is NOT built on is
-     * `answering()`, which means "something came back from this lately" -- on a
-     * quiet box nothing does, so every backend reads silent while all of them
-     * are fine. (Verified on the live box before writing this: nine backends,
-     * `answering: false` on all nine, including one with a model resident.)
-     *
-     * So: 503 only when we are watching backends and have lost every one of
-     * them. A config we cannot watch reports `watched: 0` and stays ok, because
-     * hearth does not probe backends it is not using and will not invent a
-     * verdict it has no evidence for -- and a probe that cried wolf on an idle
-     * box would be worse than the unconditional true it replaced.
-     *
-     * Peers never affect `ok`. A peer being down is a routing input, not this
-     * node's health, and every model that matters has a local fallback.
-     *
-     * UNAUTHENTICATED, and on a port that may be bound wide -- so counts, never
-     * names. What is loaded, who is calling and which models exist stay behind
-     * the page's gate.
-     */
-    if (path === "/healthz") {
-      const local = pool.all();
-      const watched = local.filter((b) => b.state.watched());
-      const connected = watched.filter((b) => b.state.streamingNow());
-      const ok = watched.length === 0 || connected.length > 0;
-      json(res, ok ? 200 : 503, {
-        ok,
-        name: cfg.name,
-        backends: {
-          total: local.length,
-          watched: watched.length,
-          connected: connected.length,
-        },
-        peers: {
-          total: cfg.peers.length,
-          up: peers.all().filter((p) => p.up).length,
-        },
-      });
+    for (const r of ROUTES) {
+      if (!claims(r, path, req.method)) continue;
+      const c = authorize(r, req, res);
+      if (c === null) return;
+      await r.handler(c);
       return;
     }
+  }
 
-    // ---- peer surface ----
-    if (path === "/peer/hello" || path === "/peer/state") {
-      const who = peerCaller(req);
-      if (who === null) {
-        json(res, 401, { error: "unknown peer token" });
-        return;
-      }
-      // Control plane, not work, so it gets its own budget. See overBudget.
-      if (controlOverLimit(who)) {
-        json(res, 429, { error: "rate capped" });
-        return;
-      }
-      if (path === "/peer/hello") {
-        json(res, 200, {
-          name: cfg.name,
-          protocol: 2,
-          models: shared(),
-          lanes: Object.keys(cfg.scheduler.lanes),
-          // Additive rather than a protocol bump: an older peer ignores an
-          // unknown field, and a newer one can tell "supports warming" from
-          // "will 404" without probing for it. peers.ts already warns on a
-          // protocol number it does not recognise, so bumping would have made
-          // every existing peer log a warning to gain one boolean.
-          capabilities: ["warm"],
-        });
-        return;
-      }
-      // loaded/serves ride along with capacity so one probe answers both "can
-      // you take work" and "what's warm over there".
-      //
-      // Both filtered to what we share. `resident` needed that too and didn't
-      // have it, so a peer got told which model we had warm even when it was one
-      // they can't ask for. Nothing breaks, but it's our business rather than
-      // theirs, and it looked like a contradiction next to an empty `loaded`.
-      const warmAndShared = pool.loaded().filter((m) => shared().includes(m));
-      const agg = pool.aggregate();
-      // Protocol 2: what each shared model would actually cost, which is the
-      // capacity of the backend that serves it. The aggregate rides along
-      // unchanged so a protocol-1 borrower keeps scoring us the old way instead
-      // of seeing an unrecognisable answer and marking us down.
-      const models: Record<string, unknown> = {};
-      for (const m of shared()) {
-        // Capacity says whether they can start now; stats say whether their
-        // request can run at all. Both are per model, both are things a
-        // borrower has no other way of finding out, and they ride the same
-        // poll. Absent when we have never loaded it — silence is not a claim
-        // that there is no limit, see unfit().
-        const stats = pool.statsFor(m);
-        models[m] = { ...pool.capacityFor(m), ...(stats ? { stats } : {}) };
-      }
+  /**
+   * Whether this node can serve, for an external probe.
+   *
+   * It used to answer `{ok: true}` unconditionally, which made it a check
+   * that the socket accepts connections and nothing more -- every backend
+   * dead and every peer gone still read healthy, so the one thing monitoring
+   * it could tell you was the one thing you already knew from the fact that
+   * it answered.
+   *
+   * The honest signal is the event stream. Where we hold one open, a backend
+   * going away drops it within a reconnect; that is real, it is continuously
+   * maintained, and it costs nothing to read. What it is NOT built on is
+   * `answering()`, which means "something came back from this lately" -- on a
+   * quiet box nothing does, so every backend reads silent while all of them
+   * are fine. (Verified on the live box before writing this: nine backends,
+   * `answering: false` on all nine, including one with a model resident.)
+   *
+   * So: 503 only when we are watching backends and have lost every one of
+   * them. A config we cannot watch reports `watched: 0` and stays ok, because
+   * hearth does not probe backends it is not using and will not invent a
+   * verdict it has no evidence for -- and a probe that cried wolf on an idle
+   * box would be worse than the unconditional true it replaced.
+   *
+   * Peers never affect `ok`. A peer being down is a routing input, not this
+   * node's health, and every model that matters has a local fallback.
+   *
+   * UNAUTHENTICATED, and on a port that may be bound wide -- so counts, never
+   * names. What is loaded, who is calling and which models exist stay behind
+   * the page's gate.
+   */
+  async function routeHealthz(c: Call): Promise<void> {
+    const { res } = c;
+    const local = pool.all();
+    const watched = local.filter((b) => b.state.watched());
+    const connected = watched.filter((b) => b.state.streamingNow());
+    const ok = watched.length === 0 || connected.length > 0;
+    json(res, ok ? 200 : 503, {
+      ok,
+      name: cfg.name,
+      backends: {
+        total: local.length,
+        watched: watched.length,
+        connected: connected.length,
+      },
+      peers: {
+        total: cfg.peers.length,
+        up: peers.all().filter((p) => p.up).length,
+      },
+    });
+    return;
+  }
+
+  // ---- peer surface ----
+  async function routePeer(c: Call): Promise<void> {
+    const { res, path } = c;
+    const who = c.peer!;
+    // Control plane, not work, so it gets its own budget. See overBudget.
+    if (controlOverLimit(who)) {
+      json(res, 429, { error: "rate capped" });
+      return;
+    }
+    if (path === "/peer/hello") {
       json(res, 200, {
-        ...agg,
-        resident: agg.resident !== null && shared().includes(agg.resident) ? agg.resident : null,
-        loaded: warmAndShared,
-        serves: shared(),
-        models,
+        name: cfg.name,
+        protocol: 2,
+        models: shared(),
+        lanes: Object.keys(cfg.scheduler.lanes),
+        // Additive rather than a protocol bump: an older peer ignores an
+        // unknown field, and a newer one can tell "supports warming" from
+        // "will 404" without probing for it. peers.ts already warns on a
+        // protocol number it does not recognise, so bumping would have made
+        // every existing peer log a warning to gain one boolean.
+        capabilities: ["warm"],
       });
       return;
     }
+    // loaded/serves ride along with capacity so one probe answers both "can
+    // you take work" and "what's warm over there".
+    //
+    // Both filtered to what we share. `resident` needed that too and didn't
+    // have it, so a peer got told which model we had warm even when it was one
+    // they can't ask for. Nothing breaks, but it's our business rather than
+    // theirs, and it looked like a contradiction next to an empty `loaded`.
+    const warmAndShared = pool.loaded().filter((m) => shared().includes(m));
+    const agg = pool.aggregate();
+    // Protocol 2: what each shared model would actually cost, which is the
+    // capacity of the backend that serves it. The aggregate rides along
+    // unchanged so a protocol-1 borrower keeps scoring us the old way instead
+    // of seeing an unrecognisable answer and marking us down.
+    const models: Record<string, unknown> = {};
+    for (const m of shared()) {
+      // Capacity says whether they can start now; stats say whether their
+      // request can run at all. Both are per model, both are things a
+      // borrower has no other way of finding out, and they ride the same
+      // poll. Absent when we have never loaded it — silence is not a claim
+      // that there is no limit, see unfit().
+      const stats = pool.statsFor(m);
+      models[m] = { ...pool.capacityFor(m), ...(stats ? { stats } : {}) };
+    }
+    json(res, 200, {
+      ...agg,
+      resident: agg.resident !== null && shared().includes(agg.resident) ? agg.resident : null,
+      loaded: warmAndShared,
+      serves: shared(),
+      models,
+    });
+    return;
+  }
 
-    if (path === "/network") {
-      if (localCaller(req) === null) {
-        json(res, 401, { error: "unauthorized" });
-        return;
-      }
-      // Ask everyone now instead of reading a cache. Someone is sitting there
-      // waiting on this, and the cost is one parallel round trip capped at 1.5s
-      // per peer.
-      await Promise.all([peers.probeAll(), ...pool.all().map((b) => b.state.ensureFresh())]);
-      json(res, 200, networkView());
+  async function routeNetwork(c: Call): Promise<void> {
+    const { res } = c;
+    // Ask everyone now instead of reading a cache. Someone is sitting there
+    // waiting on this, and the cost is one parallel round trip capped at 1.5s
+    // per peer.
+    await Promise.all([peers.probeAll(), ...pool.all().map((b) => b.state.ensureFresh())]);
+    json(res, 200, networkView());
+    return;
+  }
+
+  /**
+   * Turn either direction of federation on or off, without a restart.
+   *
+   * LOCAL ONLY, like /queue and /network — and this one matters more than
+   * those, because it is the only route here that CHANGES anything. A peer
+   * must never be able to switch off our lending (a denial of service against
+   * ourselves) or, worse, switch it back on after we paused it.
+   *
+   * GET reads, POST writes. A POST body may carry any of the fields or all of
+   * them; omitted fields are left alone so changing one thing cannot clobber
+   * another with a stale value.
+   *
+   *   lending / borrowing   the master switches
+   *   share                 {model: true|false|null} — null hands it back to
+   *                         the config, which is why it is not two lists
+   *   link / unlink         {peer, mine, theirs?} — a peer's model map and
+   *                         the route that makes it do anything, together
+   *
+   * One route rather than four because the status page posts here already and
+   * `uiListen.control: key` allows exactly two paths — a new path would have
+   * to be added to that allowlist as well, and an allowlist you have to
+   * remember to extend is one that eventually gets forgotten.
+   */
+  async function routeControl(c: Call): Promise<void> {
+    const { req, res } = c;
+    if (req.method === "GET") {
+      json(res, 200, {
+        ...controls.state(),
+        share: shared(),
+        configuredShare: cfg.share,
+        catalog: pool.catalog(),
+        ...overrideView(),
+      });
       return;
     }
-
-    /**
-     * Turn either direction of federation on or off, without a restart.
-     *
-     * LOCAL ONLY, like /queue and /network — and this one matters more than
-     * those, because it is the only route here that CHANGES anything. A peer
-     * must never be able to switch off our lending (a denial of service against
-     * ourselves) or, worse, switch it back on after we paused it.
-     *
-     * GET reads, POST writes. A POST body may carry any of the fields or all of
-     * them; omitted fields are left alone so changing one thing cannot clobber
-     * another with a stale value.
-     *
-     *   lending / borrowing   the master switches
-     *   share                 {model: true|false|null} — null hands it back to
-     *                         the config, which is why it is not two lists
-     *   link / unlink         {peer, mine, theirs?} — a peer's model map and
-     *                         the route that makes it do anything, together
-     *
-     * One route rather than four because the status page posts here already and
-     * `uiListen.control: key` allows exactly two paths — a new path would have
-     * to be added to that allowlist as well, and an allowlist you have to
-     * remember to extend is one that eventually gets forgotten.
-     */
-    if (path === "/control") {
-      if (localCaller(req) === null) {
-        json(res, 401, { error: "unauthorized" });
+    if (req.method !== "POST") {
+      apiError(res, 405, "use GET to read or POST to change");
+      return;
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
+    } catch (e) {
+      if (e instanceof BodyTooLargeError) {
+        res.setHeader("Connection", "close");
+        apiError(res, 413, e.message);
         return;
       }
-      if (req.method === "GET") {
-        json(res, 200, {
-          ...controls.state(),
-          share: shared(),
-          configuredShare: cfg.share,
-          catalog: pool.catalog(),
-          ...overrideView(),
-        });
+      apiError(res, 400, `body was not JSON: ${String(e)}`);
+      return;
+    }
+    // Strict booleans. A missing field means "leave it", so accepting a
+    // truthy string here would make `{"lending":"false"}` turn lending ON —
+    // the exact opposite of what someone typing that in a hurry wants.
+    for (const k of ["lending", "borrowing"]) {
+      if (body[k] !== undefined && typeof body[k] !== "boolean") {
+        apiError(res, 400, `${k} must be true or false`);
         return;
       }
-      if (req.method !== "POST") {
-        apiError(res, 405, "use GET to read or POST to change");
+    }
+
+    // Per-model sharing. Validated against the local catalog before anything
+    // is stored: lending a model we cannot serve advertises it to peers and
+    // then 404s every request for it, and the peer's operator has no way to
+    // tell that from a broken link.
+    if (body.share !== undefined) {
+      if (typeof body.share !== "object" || body.share === null || Array.isArray(body.share)) {
+        apiError(res, 400, "share must be an object of model -> true, false or null");
         return;
       }
-      let body: Record<string, unknown>;
-      try {
-        body = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
-      } catch (e) {
-        if (e instanceof BodyTooLargeError) {
-          res.setHeader("Connection", "close");
-          apiError(res, 413, e.message);
+      const catalog = pool.catalog();
+      for (const [model, want] of Object.entries(body.share as Record<string, unknown>)) {
+        if (want !== true && want !== false && want !== null) {
+          apiError(res, 400, `share.${model} must be true, false or null`);
           return;
         }
-        apiError(res, 400, `body was not JSON: ${String(e)}`);
-        return;
-      }
-      // Strict booleans. A missing field means "leave it", so accepting a
-      // truthy string here would make `{"lending":"false"}` turn lending ON —
-      // the exact opposite of what someone typing that in a hurry wants.
-      for (const k of ["lending", "borrowing"]) {
-        if (body[k] !== undefined && typeof body[k] !== "boolean") {
-          apiError(res, 400, `${k} must be true or false`);
-          return;
-        }
-      }
-
-      // Per-model sharing. Validated against the local catalog before anything
-      // is stored: lending a model we cannot serve advertises it to peers and
-      // then 404s every request for it, and the peer's operator has no way to
-      // tell that from a broken link.
-      if (body.share !== undefined) {
-        if (typeof body.share !== "object" || body.share === null || Array.isArray(body.share)) {
-          apiError(res, 400, "share must be an object of model -> true, false or null");
-          return;
-        }
-        const catalog = pool.catalog();
-        for (const [model, want] of Object.entries(body.share as Record<string, unknown>)) {
-          if (want !== true && want !== false && want !== null) {
-            apiError(res, 400, `share.${model} must be true, false or null`);
-            return;
-          }
-          if (want === true && !catalog.includes(model)) {
-            apiError(
-              res,
-              400,
-              `cannot lend "${model}" — no backend here serves it (${catalog.join(", ") || "nothing"})`,
-            );
-            return;
-          }
-        }
-      }
-
-      // Mapping edits, and both blocks are ordered so a POST carrying share AND
-      // a link either lands whole or changes nothing: everything above only
-      // VALIDATES, link() validates before it mutates, and the share values are
-      // written last, once nothing is left that can refuse.
-      if (body.link !== undefined && body.unlink !== undefined) {
-        // Silently preferring one is how you end up having removed a mapping
-        // you thought you were adding.
-        apiError(res, 400, "send link or unlink, not both");
-        return;
-      }
-      if (body.link !== undefined || body.unlink !== undefined) {
-        const edit = (body.link ?? body.unlink) as Record<string, unknown>;
-        if (typeof edit !== "object" || edit === null || Array.isArray(edit)) {
-          apiError(res, 400, "link/unlink must be an object");
-          return;
-        }
-        const peerName = typeof edit.peer === "string" ? edit.peer : "";
-        const mine = typeof edit.mine === "string" ? edit.mine : "";
-        if (peerName === "" || mine === "") {
-          apiError(res, 400, "link/unlink need peer and mine");
-          return;
-        }
-        try {
-          if (body.unlink !== undefined) {
-            overrides.unlink(peerName, mine);
-            log.info("control.unlink", { peer: peerName, model: mine });
-          } else {
-            const theirs = typeof edit.theirs === "string" && edit.theirs !== "" ? edit.theirs : mine;
-            // The default depends on whether we serve it too, and getting this
-            // wrong is the whole difficulty of the feature. Serving it here
-            // means both sides can run it, so `fastest` picks whichever starts
-            // sooner and home is a safe fallback. Not serving it means home is
-            // a backend that has never heard of the id, so falling back there
-            // turns a busy peer into a 404 rather than a wait.
-            const local = pool.catalog().includes(mine);
-            const policy = (edit.policy as RoutePolicy | undefined) ?? (local ? "fastest" : "peer");
-            if (!["local", "peer", "spillover", "fastest"].includes(policy)) {
-              apiError(res, 400, `policy must be local, peer, spillover or fastest (got ${policy})`);
-              return;
-            }
-            const fallback = typeof edit.fallbackLocal === "boolean" ? edit.fallbackLocal : local;
-            overrides.link(peerName, mine, theirs, policy, fallback);
-            log.info("control.link", { peer: peerName, model: mine, theirs, policy, fallbackLocal: fallback });
-          }
-        } catch (e) {
-          apiError(res, 400, e instanceof Error ? e.message : String(e));
-          return;
-        }
-      }
-
-      if (body.share !== undefined) {
-        for (const [model, want] of Object.entries(body.share as Record<string, boolean | null>)) {
-          controls.setShare(model, want);
-        }
-        log.info("control.share", { share: shared() });
-      }
-
-      const changed = controls.set({
-        lending: body.lending as boolean | undefined,
-        borrowing: body.borrowing as boolean | undefined,
-      });
-      // Only the transitions. This is a thing a human did to a live system, so
-      // it belongs at info — but a no-op POST should not leave a trail implying
-      // something moved.
-      if (Object.keys(changed).length > 0) log.info("control.changed", changed);
-
-      // Saving is LAST, and deliberately a separate verb rather than something
-      // every write does on its way out. Trying a link on a hunch should not
-      // outlive the hunch; only what somebody pressed Save on does. Being last
-      // also means one POST can change something and keep it in a single call.
-      if (body.save === true) {
-        const to = savesTo();
-        if (to === null) {
+        if (want === true && !catalog.includes(model)) {
           apiError(
             res,
             400,
-            cfg.configPath
-              ? `${cfg.configPath} is not writable, and no stateFile is set — add ReadWritePaths=${cfg.configPath} ` +
-                `to the unit (ProtectSystem=strict makes everything outside WorkingDirectory read-only), ` +
-                `or set stateFile for a sidecar instead`
-              : "this node was not loaded from a config file and has no stateFile, so there is nowhere to save",
+            `cannot lend "${model}" — no backend here serves it (${catalog.join(", ") || "nothing"})`,
           );
           return;
         }
-        if (to === "config") {
-          // The effective list BEFORE the overrides are folded away, since that
-          // is what gets written as `share:`.
-          const effective = [...shared()];
-          try {
-            overrides.saveConfig(effective);
-          } catch (e) {
-            apiError(res, e instanceof ConfigError ? 409 : 500, e instanceof Error ? e.message : String(e));
-            return;
-          }
-          controls.clearShareOverrides();
-          overrides.rebase(effective);
-          // Whatever was in the sidecar is in the config now, and leaving it
-          // would re-apply a stale copy of it over the file on the next start.
-          if (cfg.stateFile) {
-            try {
-              writeState(cfg.stateFile, overrides.pending({}));
-            } catch (e) {
-              log.warn("state.stale", { path: cfg.stateFile, error: String(e) });
-            }
-          }
-          overrides.markSaved(overrides.pending({}));
-          log.info("config.saved", { path: cfg.configPath });
-        } else {
-          const state = overrides.pending(controls.shareOverrides());
-          try {
-            writeState(cfg.stateFile!, state);
-          } catch (e) {
-            // A write that fails must not report success: the operator would
-            // walk away believing a restart is safe.
-            apiError(res, 500, `could not write ${cfg.stateFile}: ${String(e)}`);
-            return;
-          }
-          overrides.markSaved(state);
-          log.info("state.saved", { path: cfg.stateFile });
-        }
       }
+    }
 
-      json(res, 200, { ...controls.state(), share: shared(), changed, ...overrideView() });
+    // Mapping edits, and both blocks are ordered so a POST carrying share AND
+    // a link either lands whole or changes nothing: everything above only
+    // VALIDATES, link() validates before it mutates, and the share values are
+    // written last, once nothing is left that can refuse.
+    if (body.link !== undefined && body.unlink !== undefined) {
+      // Silently preferring one is how you end up having removed a mapping
+      // you thought you were adding.
+      apiError(res, 400, "send link or unlink, not both");
+      return;
+    }
+    if (body.link !== undefined || body.unlink !== undefined) {
+      const edit = (body.link ?? body.unlink) as Record<string, unknown>;
+      if (typeof edit !== "object" || edit === null || Array.isArray(edit)) {
+        apiError(res, 400, "link/unlink must be an object");
+        return;
+      }
+      const peerName = typeof edit.peer === "string" ? edit.peer : "";
+      const mine = typeof edit.mine === "string" ? edit.mine : "";
+      if (peerName === "" || mine === "") {
+        apiError(res, 400, "link/unlink need peer and mine");
+        return;
+      }
+      try {
+        if (body.unlink !== undefined) {
+          overrides.unlink(peerName, mine);
+          log.info("control.unlink", { peer: peerName, model: mine });
+        } else {
+          const theirs = typeof edit.theirs === "string" && edit.theirs !== "" ? edit.theirs : mine;
+          // The default depends on whether we serve it too, and getting this
+          // wrong is the whole difficulty of the feature. Serving it here
+          // means both sides can run it, so `fastest` picks whichever starts
+          // sooner and home is a safe fallback. Not serving it means home is
+          // a backend that has never heard of the id, so falling back there
+          // turns a busy peer into a 404 rather than a wait.
+          const local = pool.catalog().includes(mine);
+          const policy = (edit.policy as RoutePolicy | undefined) ?? (local ? "fastest" : "peer");
+          if (!["local", "peer", "spillover", "fastest"].includes(policy)) {
+            apiError(res, 400, `policy must be local, peer, spillover or fastest (got ${policy})`);
+            return;
+          }
+          const fallback = typeof edit.fallbackLocal === "boolean" ? edit.fallbackLocal : local;
+          overrides.link(peerName, mine, theirs, policy, fallback);
+          log.info("control.link", { peer: peerName, model: mine, theirs, policy, fallbackLocal: fallback });
+        }
+      } catch (e) {
+        apiError(res, 400, e instanceof Error ? e.message : String(e));
+        return;
+      }
+    }
+
+    if (body.share !== undefined) {
+      for (const [model, want] of Object.entries(body.share as Record<string, boolean | null>)) {
+        controls.setShare(model, want);
+      }
+      log.info("control.share", { share: shared() });
+    }
+
+    const changed = controls.set({
+      lending: body.lending as boolean | undefined,
+      borrowing: body.borrowing as boolean | undefined,
+    });
+    // Only the transitions. This is a thing a human did to a live system, so
+    // it belongs at info — but a no-op POST should not leave a trail implying
+    // something moved.
+    if (Object.keys(changed).length > 0) log.info("control.changed", changed);
+
+    // Saving is LAST, and deliberately a separate verb rather than something
+    // every write does on its way out. Trying a link on a hunch should not
+    // outlive the hunch; only what somebody pressed Save on does. Being last
+    // also means one POST can change something and keep it in a single call.
+    if (body.save === true) {
+      const to = savesTo();
+      if (to === null) {
+        apiError(
+          res,
+          400,
+          cfg.configPath
+            ? `${cfg.configPath} is not writable, and no stateFile is set — add ReadWritePaths=${cfg.configPath} ` +
+              `to the unit (ProtectSystem=strict makes everything outside WorkingDirectory read-only), ` +
+              `or set stateFile for a sidecar instead`
+            : "this node was not loaded from a config file and has no stateFile, so there is nowhere to save",
+        );
+        return;
+      }
+      if (to === "config") {
+        // The effective list BEFORE the overrides are folded away, since that
+        // is what gets written as `share:`.
+        const effective = [...shared()];
+        try {
+          overrides.saveConfig(effective);
+        } catch (e) {
+          apiError(res, e instanceof ConfigError ? 409 : 500, e instanceof Error ? e.message : String(e));
+          return;
+        }
+        controls.clearShareOverrides();
+        overrides.rebase(effective);
+        // Whatever was in the sidecar is in the config now, and leaving it
+        // would re-apply a stale copy of it over the file on the next start.
+        if (cfg.stateFile) {
+          try {
+            writeState(cfg.stateFile, overrides.pending({}));
+          } catch (e) {
+            log.warn("state.stale", { path: cfg.stateFile, error: String(e) });
+          }
+        }
+        overrides.markSaved(overrides.pending({}));
+        log.info("config.saved", { path: cfg.configPath });
+      } else {
+        const state = overrides.pending(controls.shareOverrides());
+        try {
+          writeState(cfg.stateFile!, state);
+        } catch (e) {
+          // A write that fails must not report success: the operator would
+          // walk away believing a restart is safe.
+          apiError(res, 500, `could not write ${cfg.stateFile}: ${String(e)}`);
+          return;
+        }
+        overrides.markSaved(state);
+        log.info("state.saved", { path: cfg.stateFile });
+      }
+    }
+
+    json(res, 200, { ...controls.state(), share: shared(), changed, ...overrideView() });
+    return;
+  }
+
+  async function routeQueue(c: Call): Promise<void> {
+    const { res } = c;
+    json(res, 200, {
+      jobs: pool.jobs(),
+      // Narrowed to what the loaded model can hold, not the backend's flat
+      // number: a seat whose resident model declares fewer slots would
+      // otherwise report free slots next to jobs that can never use them,
+      // which reads as a stuck queue rather than a cap doing its job.
+      capacity: pool.loadedAggregate(),
+      backends: pool.all().map((b) => ({ name: b.name, ...pool.loadedCapacity(b) })),
+    });
+    return;
+  }
+
+  // Ask a model to be resident, without generating anything.
+  //
+  // THROUGH THE SCHEDULER, deliberately. A warm on a llama-swap backend is an
+  // EVICTION of whatever is loaded, so letting it jump the queue would mean a
+  // button that steals the GPU from a turn already in flight. As a job it
+  // cannot preempt (a running job always finishes), it waits its turn, and it
+  // holds a slot while loading so nothing dispatches into a half-loaded
+  // backend. It also does not earn the warm bonus — its model is cold by
+  // definition — so it sorts behind work for whatever is already resident.
+  //
+  // Nothing RESERVES warmth. The next request for another model evicts it
+  // again. This is best-effort and the response says so rather than implying
+  // a guarantee it cannot make.
+  async function routeWarm(c: Call): Promise<void> {
+    const { req, res } = c;
+    const fromPeer = c.peer;
+    const caller = c.caller;
+    // A peer's warm is rate-limited like any other work it sends.
+    if (fromPeer !== null && peerOverLimit(fromPeer)) {
+      apiError(res, 429, "rate capped", "rate_limit_error");
       return;
     }
 
-    if (path === "/queue") {
-      if (localCaller(req) === null) {
-        json(res, 401, { error: "unauthorized" });
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
+    } catch (e) {
+      if (e instanceof BodyTooLargeError) {
+        res.setHeader("Connection", "close");
+        apiError(res, 413, e.message, "invalid_request_error");
         return;
       }
-      json(res, 200, {
-        jobs: pool.jobs(),
-        // Narrowed to what the loaded model can hold, not the backend's flat
-        // number: a seat whose resident model declares fewer slots would
-        // otherwise report free slots next to jobs that can never use them,
-        // which reads as a stuck queue rather than a cap doing its job.
-        capacity: pool.loadedAggregate(),
-        backends: pool.all().map((b) => ({ name: b.name, ...pool.loadedCapacity(b) })),
+      apiError(res, 400, `body was not JSON: ${String(e)}`);
+      return;
+    }
+    const model = typeof body.model === "string" ? body.model : "";
+    if (model === "") {
+      apiError(res, 400, "model is required");
+      return;
+    }
+    if (fromPeer !== null && !shared().includes(model)) {
+      // Same gate as chat: lending is opt-in per model, and a warm is a way
+      // of spending the GPU, so it cannot reach anything you did not offer.
+      apiError(res, 403, `${cfg.name} does not share "${model}"`, "permission_error");
+      return;
+    }
+
+    // Same routing question chat asks. Phase 1 implements only the local
+    // answer, but asking it here is what makes peer warming a branch of this
+    // route later rather than a second endpoint with its own opinions.
+    const slotFor = pool.for(model);
+    const capFor = slotFor.scheduler.capacityFor(model);
+    const decision = fromPeer !== null
+      // A peer's warm is served here or nowhere. Forwarding it onward would
+      // let two nodes that each prefer the other bounce a warm between them,
+      // the same loop the chat route avoids by not re-routing peer work.
+      ? ({ target: "local", reason: "from a peer" } as const)
+      : decide(model, cfg, peers, {
+          queued: Object.values(capFor.queued).reduce((a, b) => a + b, 0),
+          free: capFor.free,
+          slots: capFor.slots,
+          loaded: slotFor.state.loaded(),
+        });
+
+    // THE DECLINE. A peer may ask; it may not make us wait.
+    //
+    // A local warm queues happily — it is your box and your call, and the
+    // queue is what stops it stealing a slot. A peer is different in two
+    // ways: it would hold a connection open across our queue for speculative
+    // work, and honouring it evicts OUR resident model at a moment we did not
+    // choose. So it is taken only if it can start about now, and refused
+    // plainly otherwise. A peer that must obey is a peer who can thrash your
+    // GPU from across the tailnet.
+    if (fromPeer !== null && capFor.free <= 0) {
+      json(res, 503, {
+        model, warmed: false, declined: true,
+        note: `${cfg.name} is busy; warm requests from peers are only taken when a slot is free`,
       });
       return;
     }
 
-    // Ask a model to be resident, without generating anything.
-    //
-    // THROUGH THE SCHEDULER, deliberately. A warm on a llama-swap backend is an
-    // EVICTION of whatever is loaded, so letting it jump the queue would mean a
-    // button that steals the GPU from a turn already in flight. As a job it
-    // cannot preempt (a running job always finishes), it waits its turn, and it
-    // holds a slot while loading so nothing dispatches into a half-loaded
-    // backend. It also does not earn the warm bonus — its model is cold by
-    // definition — so it sorts behind work for whatever is already resident.
-    //
-    // Nothing RESERVES warmth. The next request for another model evicts it
-    // again. This is best-effort and the response says so rather than implying
-    // a guarantee it cannot make.
-    if (path === "/v1/warm" && req.method === "POST") {
-      const fromPeer = peerCaller(req);
-      const caller = fromPeer ?? localCaller(req);
-      if (caller === null) {
-        apiError(res, 401, "unauthorized", "authentication_error");
+    if (decision.target === "peer") {
+      const p = peers.config(decision.peer);
+      const theirId = peers.theirModelId(decision.peer, model);
+      if (!p || theirId === undefined) {
+        apiError(res, 502, `no route to ${decision.peer} for ${model}`, "server_error");
         return;
       }
-      // A peer's warm is rate-limited like any other work it sends.
-      if (fromPeer !== null && peerOverLimit(fromPeer)) {
-        apiError(res, 429, "rate capped", "rate_limit_error");
+      // ASK, do not guess. Measured against a real older peer: it answers
+      // 401, not 404, because /v1/warm is unknown to it and falls through to
+      // a passthrough that only trusts local callers. A status-code heuristic
+      // would have reported "bad credentials" for "feature not present".
+      if (!peers.supports(decision.peer, "warm")) {
+        apiError(res, 501,
+          `peer ${decision.peer} does not advertise warm support`,
+          "invalid_request_error");
         return;
       }
-
-      let body: Record<string, unknown>;
+      // Their id, not ours — the same rewrite the chat peer branch does.
+      // No local slot is taken: this warms THEIR hardware, not ours.
       try {
-        body = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
-      } catch (e) {
-        if (e instanceof BodyTooLargeError) {
-          res.setHeader("Connection", "close");
-          apiError(res, 413, e.message, "invalid_request_error");
-          return;
-        }
-        apiError(res, 400, `body was not JSON: ${String(e)}`);
-        return;
-      }
-      const model = typeof body.model === "string" ? body.model : "";
-      if (model === "") {
-        apiError(res, 400, "model is required");
-        return;
-      }
-      if (fromPeer !== null && !shared().includes(model)) {
-        // Same gate as chat: lending is opt-in per model, and a warm is a way
-        // of spending the GPU, so it cannot reach anything you did not offer.
-        apiError(res, 403, `${cfg.name} does not share "${model}"`, "permission_error");
-        return;
-      }
-
-      // Same routing question chat asks. Phase 1 implements only the local
-      // answer, but asking it here is what makes peer warming a branch of this
-      // route later rather than a second endpoint with its own opinions.
-      const slotFor = pool.for(model);
-      const capFor = slotFor.scheduler.capacityFor(model);
-      const decision = fromPeer !== null
-        // A peer's warm is served here or nowhere. Forwarding it onward would
-        // let two nodes that each prefer the other bounce a warm between them,
-        // the same loop the chat route avoids by not re-routing peer work.
-        ? ({ target: "local", reason: "from a peer" } as const)
-        : decide(model, cfg, peers, {
-            queued: Object.values(capFor.queued).reduce((a, b) => a + b, 0),
-            free: capFor.free,
-            slots: capFor.slots,
-            loaded: slotFor.state.loaded(),
-          });
-
-      // THE DECLINE. A peer may ask; it may not make us wait.
-      //
-      // A local warm queues happily — it is your box and your call, and the
-      // queue is what stops it stealing a slot. A peer is different in two
-      // ways: it would hold a connection open across our queue for speculative
-      // work, and honouring it evicts OUR resident model at a moment we did not
-      // choose. So it is taken only if it can start about now, and refused
-      // plainly otherwise. A peer that must obey is a peer who can thrash your
-      // GPU from across the tailnet.
-      if (fromPeer !== null && capFor.free <= 0) {
-        json(res, 503, {
-          model, warmed: false, declined: true,
-          note: `${cfg.name} is busy; warm requests from peers are only taken when a slot is free`,
+        const up = await send(`${p.url}/v1/warm`, {
+          method: "POST",
+          json: { model: theirId },
+          headers: { Authorization: `Bearer ${p.token}` },
+          signal: AbortSignal.any([
+            AbortSignal.timeout(900_000),
+          ]),
         });
-        return;
-      }
-
-      if (decision.target === "peer") {
-        const p = peers.config(decision.peer);
-        const theirId = peers.theirModelId(decision.peer, model);
-        if (!p || theirId === undefined) {
-          apiError(res, 502, `no route to ${decision.peer} for ${model}`, "server_error");
-          return;
-        }
-        // ASK, do not guess. Measured against a real older peer: it answers
-        // 401, not 404, because /v1/warm is unknown to it and falls through to
-        // a passthrough that only trusts local callers. A status-code heuristic
-        // would have reported "bad credentials" for "feature not present".
-        if (!peers.supports(decision.peer, "warm")) {
+        const text = await up.text().catch(() => "");
+        let parsed: Record<string, unknown> = {};
+        try { parsed = JSON.parse(text) as Record<string, unknown>; } catch { /* not json */ }
+        if (up.status === 404 || up.status === 501 || up.status === 401) {
+          // Belt and braces: it advertised the capability but did not honour
+          // it, so it is mid-upgrade or misconfigured. Name the node, rather
+          // than surfacing a bare status from a machine you do not own.
           apiError(res, 501,
-            `peer ${decision.peer} does not advertise warm support`,
+            `peer ${decision.peer} advertised warm support but answered ${up.status}`,
             "invalid_request_error");
           return;
         }
-        // Their id, not ours — the same rewrite the chat peer branch does.
-        // No local slot is taken: this warms THEIR hardware, not ours.
-        try {
-          const up = await send(`${p.url}/v1/warm`, {
-            method: "POST",
-            json: { model: theirId },
-            headers: { Authorization: `Bearer ${p.token}` },
-            signal: AbortSignal.any([
-              AbortSignal.timeout(900_000),
-            ]),
-          });
-          const text = await up.text().catch(() => "");
-          let parsed: Record<string, unknown> = {};
-          try { parsed = JSON.parse(text) as Record<string, unknown>; } catch { /* not json */ }
-          if (up.status === 404 || up.status === 501 || up.status === 401) {
-            // Belt and braces: it advertised the capability but did not honour
-            // it, so it is mid-upgrade or misconfigured. Name the node, rather
-            // than surfacing a bare status from a machine you do not own.
-            apiError(res, 501,
-              `peer ${decision.peer} advertised warm support but answered ${up.status}`,
-              "invalid_request_error");
-            return;
-          }
-          log.info("warm.peer", { model, peer: decision.peer, status: up.status });
-          // Pass their answer through, including a decline, in OUR id.
-          json(res, up.ok ? 200 : up.status, { ...parsed, model, peer: decision.peer });
-        } catch (e) {
-          apiError(res, 502, e instanceof Error ? e.message : String(e), "server_error");
-        }
-        return;
-      }
-
-      const slot = slotFor;
-      const wire = pool.outboundId(model);
-      // Only an evicting backend has anything to do. A `single` backend holds
-      // its model resident forever, and saying "warmed" there would claim work
-      // that did not happen.
-      if (slot.cfg.kind !== "llama-swap") {
-        json(res, 200, {
-          model, backend: slot.name, warmed: false,
-          note: `${slot.name} keeps its models resident, so there is nothing to warm`,
-        });
-        return;
-      }
-      if (slot.state.isWarm(wire)) {
-        json(res, 200, {
-          model, backend: slot.name, warmed: false, note: "already resident",
-        });
-        return;
-      }
-
-      const ctrl = new AbortController();
-      res.on("close", () => { if (!res.writableEnded) ctrl.abort(); });
-      const queuedAt = Date.now();
-      let startedAt = 0;
-      try {
-        await slot.scheduler.submit(
-          {
-            lane: WARM_LANE, model, caller,
-            ...(cfg.scheduler.maxPerCaller > 0 ? { maxPerCaller: cfg.scheduler.maxPerCaller } : {}),
-            signal: ctrl.signal,
-          },
-          async () => {
-            startedAt = Date.now();
-            // A health probe on the model's own upstream. llama-swap starts the
-            // server to answer it, which loads the model without generating a
-            // token — cheaper and more honest than a one-token completion.
-            // BOUNDED. send() has no default deadline, so a backend that
-            // accepts the connection and never answers would hold this
-            // backend's slot forever and wedge every other job queued behind
-            // it — a hung warm taking the whole queue down with it. 900s
-            // matches the chat path and is generous enough for a cold load of
-            // a large model off a slow disk.
-            const up = await send(`${slot.cfg.url}/upstream/${encodeURIComponent(wire)}/health`, {
-              method: "GET",
-              signal: AbortSignal.any([ctrl.signal, AbortSignal.timeout(900_000)]),
-            });
-            if (!up.ok) throw new Error(`backend returned ${up.status} warming ${wire}`);
-            await up.text().catch(() => "");
-            // So the very next /ui/data or /network sees it, rather than waiting
-            // out the poll interval and looking like the warm did nothing.
-            await slot.state.refresh().catch(() => {});
-          },
-        );
+        log.info("warm.peer", { model, peer: decision.peer, status: up.status });
+        // Pass their answer through, including a decline, in OUR id.
+        json(res, up.ok ? 200 : up.status, { ...parsed, model, peer: decision.peer });
       } catch (e) {
-        // A full lane is the caller's cue to back off, not a broken server.
-        // Reported as 502 it looks like the backend failed, and a client that
-        // retries on 429 but not 502 would give up on a queue that just needed
-        // a moment.
-        if (e instanceof QueueFullError) {
-          apiError(res, 429, e.message, "rate_limit_error");
-          return;
-        }
-        const msg = e instanceof Error ? e.message : String(e);
-        log.warn("warm.failed", { model, backend: slot.name, error: msg });
-        apiError(res, 502, msg, "server_error");
-        return;
-      }
-      const now = Date.now();
-      log.info("warm", { model, backend: slot.name,
-                         waitedMs: (startedAt || now) - queuedAt, ranMs: now - (startedAt || now) });
-      json(res, 200, {
-        model, backend: slot.name, warmed: true,
-        waitedMs: (startedAt || now) - queuedAt,
-        ranMs: now - (startedAt || now),
-        note: "best effort: the next request for another model will evict it",
-      });
-      return;
-    }
-
-    if (path === "/v1/models") {
-      const modelsPeer = peerCaller(req);
-      if (localCaller(req) === null && modelsPeer === null) {
-        apiError(res, 401, "unauthorized", "authentication_error");
-        return;
-      }
-      try {
-        // The union, so a client sees every model this node can serve rather
-        // than only whatever the first backend happens to list. Freshened first
-        // so a model added since startup shows up.
-        await Promise.all(pool.all().map((b) => b.state.ensureFresh()));
-        // Carry warm state, the way llama-swap does on this route. Pointing an
-        // app at us instead of its backend is supposed to change nothing it can
-        // see, and a client that loses this field loses any idea of which model
-        // answers now and which one costs a load first.
-        const warm = new Set(pool.loaded());
-        const upstream: { data?: { id: string; status?: { value: string }; context_length?: number }[] } = {
-          data: pool.catalog().map((id) => {
-            // A backend that cannot report warm state must not be flattened
-            // into cold. "We cannot see" and "nothing is loaded" are different
-            // claims and only one of them would be honest, so such a model
-            // carries no status at all rather than a made-up one.
-            // Same principle for context_length: absent when unknown, not null,
-            // because we cannot see is not the same claim as a value.
-            const entry: { id: string; status?: { value: string }; context_length?: number } = { id };
-            if (pool.for(id).cfg.kind === "none") return entry;
-            entry.status = { value: warm.has(id) ? "loaded" : "unloaded" };
-            const ctx = pool.contextLength(id);
-            if (ctx !== null) entry.context_length = ctx;
-            return entry;
-          }),
-        };
-        // A peer only sees what it may use. This used to hand the whole backend
-        // catalogue to anyone with a peer token. Unusable, since every other
-        // route enforces the share list, but a full inventory of what someone
-        // runs isn't theirs to have. Model names alone can be personal.
-        // The context_length field travels with the entry, so a peer can size
-        // its own client limit from the shared subset.
-        if (modelsPeer !== null) {
-          json(res, 200, {
-            ...upstream,
-            data: (upstream.data ?? []).filter((m) => shared().includes(m.id)),
-          });
-          return;
-        }
-        json(res, 200, upstream);
-      } catch (e) {
-        apiError(res, 502, `backend unreachable: ${String(e)}`, "server_error");
-      }
-      return;
-    }
-
-    if (path === "/v1/chat/completions" && req.method === "POST") {
-      // A peer's request gets served here and never routed onward. Two nodes
-      // that each prefer the other would otherwise bounce a request back and
-      // forth until something gave out.
-      const fromPeer = peerCaller(req);
-      const caller = fromPeer ?? localCaller(req);
-      if (caller === null) {
-        apiError(res, 401, "unauthorized", "authentication_error");
-        return;
-      }
-      if (fromPeer !== null && peerOverLimit(fromPeer)) {
-        apiError(res, 429, "rate capped", "rate_limit_error");
-        return;
-      }
-
-      let payload: Record<string, unknown>;
-      try {
-        payload = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
-      } catch (e) {
-        if (e instanceof BodyTooLargeError) {
-          res.setHeader("Connection", "close");
-          apiError(res, 413, e.message, "invalid_request_error");
-          return;
-        }
-        apiError(res, 400, `body was not JSON: ${String(e)}`);
-        return;
-      }
-
-      const model = typeof payload.model === "string" ? payload.model : "";
-      if (model === "") {
-        apiError(res, 400, "model is required");
-        return;
-      }
-      if (fromPeer !== null && !shared().includes(model)) {
-        // Lending is opt-in per model, so a peer can't reach anything you
-        // didn't deliberately offer.
-        apiError(res, 403, `${cfg.name} does not share "${model}"`, "permission_error");
-        return;
-      }
-      if (fromPeer !== null) {
-        // A borrower who ignored our advertised stats, or whose estimate came
-        // in low, gets the same answer the local path gives — before the work
-        // is queued and before it evicts anything. 4xx on purpose: their
-        // request is wrong, and PeerStatusError.isRefusal means they hand that
-        // verdict to their caller instead of retrying it at us.
-        const why = unfit(pool.statsFor(model), needsOf(payload));
-        if (why !== null) {
-          apiError(res, 400, `${model} ${why}`, "invalid_request_error");
-          return;
-        }
-      }
-
-      // Peers don't choose our lane, see cfg.peerLane. Local callers can, with
-      // a non-standard `lane` field, which we strip before forwarding so it
-      // never reaches an OpenAI backend that would reject it.
-      const lane =
-        fromPeer !== null
-          ? cfg.peerLane
-          : typeof payload.lane === "string" && payload.lane in cfg.scheduler.lanes
-            ? payload.lane
-            : Object.keys(cfg.scheduler.lanes)[0]!;
-      delete payload.lane;
-
-      const ctrl = new AbortController();
-      res.on("close", () => {
-        if (!res.writableEnded) ctrl.abort();
-      });
-
-      try {
-        if (fromPeer !== null) {
-          const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
-          const serving = pool.for(model);
-          // As on the local path: what we relayed to the borrower, so lent
-          // capacity that failed is not filed as lent capacity that worked.
-          let lentStatus = 0;
-          try {
-            await serving.scheduler.submit(
-              // peerMaxConcurrent rather than maxPerCaller. A peer is always a
-              // caller we can tell apart, so it gets capped whether or not
-              // apiKeys are set. Otherwise a borrower is bounded only by an
-              // hourly rate no serialized GPU could ever retire, and their retry
-              // loop parks in front of the host's own work.
-              //
-              // Capped per backend, so a borrower filling the GPU queue does not
-              // also lock itself out of the embedder.
-              { lane, model, caller, maxPerCaller: cfg.peerMaxConcurrent, signal: ctrl.signal },
-              async () => {
-                t.startedAt = Date.now();
-                await serving.state.ensureFresh();
-                // A peer asked in OUR vocabulary, so the same rewrite and the same
-                // stamped params apply on the way to the backend as for a local
-                // caller. (Before, a lent `as` model reached the backend under
-                // the advertised id and 404'd.)
-                const up = await send(`${serving.cfg.url}/v1/chat/completions`, {
-                  json: pool.outboundBody(model, payload),
-                  signal: ctrl.signal,
-                });
-                lentStatus = await pipeThrough(up, res);
-              },
-            );
-          } catch (e) {
-            // Both halves, same as the local path. This logged successes only,
-            // so a refused borrower or a failed lent generation left nothing at
-            // info. That's the one kind of traffic you most want to account for
-            // afterwards.
-            logRequest(t, { model, lane, target: "local", forPeer: fromPeer }, false, e);
-            throw e;
-          }
-          // Lent capacity is the thing you most want a record of.
-          logRequest(
-            t,
-            { model, lane, target: "local", forPeer: fromPeer,
-              ...(lentStatus >= 400 ? { status: lentStatus } : {}) },
-            lentStatus < 400,
-            lentStatus >= 400 ? `backend answered ${lentStatus}` : undefined,
-          );
-        } else {
-          await dispatch(payload, model, lane, caller, res, ctrl.signal);
-        }
-      } catch (e) {
-        if (res.headersSent) {
-          res.end();
-          return;
-        }
-        if (e instanceof QueueFullError) {
-          apiError(res, 429, e.message, "rate_limit_error");
-          return;
-        }
-        // A peer's REFUSAL is passed through with its own status. 502 would say
-        // "the far side broke", which is a different fact and provokes the
-        // opposite client behaviour: 5xx is retryable and 4xx is not, so
-        // laundering their 429 into our 502 is what turns their rate limit into
-        // our retry storm. Their 5xx still becomes our 502 — that genuinely is
-        // an upstream failure from where our caller sits.
-        if (e instanceof PeerStatusError && e.isRefusal) {
-          apiError(
-            res,
-            e.status,
-            e.message,
-            e.status === 429 ? "rate_limit_error" : "invalid_request_error",
-          );
-          return;
-        }
         apiError(res, 502, e instanceof Error ? e.message : String(e), "server_error");
       }
       return;
     }
 
-    if (path === "/ui" || path === "/ui/" || path === "/ui/data" || path === "/ui/events") {
-      // On the MAIN port the page stays loopback-only. Reaching it from
-      // elsewhere is what uiListen is for, and that is a separate socket.
-      if (!isLoopback(req)) {
-        apiError(res, 403, "the status page is loopback-only", "permission_error");
-        return;
-      }
-      // Same gate, same data, different transport. EventSource cannot send an
-      // Authorization header, which is exactly why the page's sockets are
-      // decided by ADDRESS and not by credential — so the stream needs no
-      // separate story about auth, and gets none.
-      if (path === "/ui/events") {
-        await serveUiEvents(req, res, true);
-        return;
-      }
-      await serveUi(path, res, true);
+    const slot = slotFor;
+    const wire = pool.outboundId(model);
+    // Only an evicting backend has anything to do. A `single` backend holds
+    // its model resident forever, and saying "warmed" there would claim work
+    // that did not happen.
+    if (slot.cfg.kind !== "llama-swap") {
+      json(res, 200, {
+        model, backend: slot.name, warmed: false,
+        note: `${slot.name} keeps its models resident, so there is nothing to warm`,
+      });
+      return;
+    }
+    if (slot.state.isWarm(wire)) {
+      json(res, 200, {
+        model, backend: slot.name, warmed: false, note: "already resident",
+      });
       return;
     }
 
+    const ctrl = new AbortController();
+    res.on("close", () => { if (!res.writableEnded) ctrl.abort(); });
+    const queuedAt = Date.now();
+    let startedAt = 0;
+    try {
+      await slot.scheduler.submit(
+        {
+          lane: WARM_LANE, model, caller,
+          ...(cfg.scheduler.maxPerCaller > 0 ? { maxPerCaller: cfg.scheduler.maxPerCaller } : {}),
+          signal: ctrl.signal,
+        },
+        async () => {
+          startedAt = Date.now();
+          // A health probe on the model's own upstream. llama-swap starts the
+          // server to answer it, which loads the model without generating a
+          // token — cheaper and more honest than a one-token completion.
+          // Bounded by the same deadline every other backend call uses: a
+          // warm that hangs holds this backend's slot and wedges everything
+          // queued behind it.
+          const up = await send(`${slot.cfg.url}/upstream/${encodeURIComponent(wire)}/health`, {
+            method: "GET",
+            signal: ctrl.signal,
+            ...backendDeadline(),
+          });
+          if (!up.ok) throw new Error(`backend returned ${up.status} warming ${wire}`);
+          await up.text().catch(() => "");
+          // So the very next /ui/data or /network sees it, rather than waiting
+          // out the poll interval and looking like the warm did nothing.
+          await slot.state.refresh().catch(() => {});
+        },
+      );
+    } catch (e) {
+      // A full lane is the caller's cue to back off, not a broken server.
+      // Reported as 502 it looks like the backend failed, and a client that
+      // retries on 429 but not 502 would give up on a queue that just needed
+      // a moment.
+      if (e instanceof QueueFullError) {
+        apiError(res, 429, e.message, "rate_limit_error");
+        return;
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      log.warn("warm.failed", { model, backend: slot.name, error: msg });
+      apiError(res, 502, msg, "server_error");
+      return;
+    }
+    const now = Date.now();
+    log.info("warm", { model, backend: slot.name,
+                       waitedMs: (startedAt || now) - queuedAt, ranMs: now - (startedAt || now) });
+    json(res, 200, {
+      model, backend: slot.name, warmed: true,
+      waitedMs: (startedAt || now) - queuedAt,
+      ranMs: now - (startedAt || now),
+      note: "best effort: the next request for another model will evict it",
+    });
+    return;
+  }
+
+  async function routeModels(c: Call): Promise<void> {
+    const { res } = c;
+    const modelsPeer = c.peer;
+    try {
+      // The union, so a client sees every model this node can serve rather
+      // than only whatever the first backend happens to list. Freshened first
+      // so a model added since startup shows up.
+      await Promise.all(pool.all().map((b) => b.state.ensureFresh()));
+      // Carry warm state, the way llama-swap does on this route. Pointing an
+      // app at us instead of its backend is supposed to change nothing it can
+      // see, and a client that loses this field loses any idea of which model
+      // answers now and which one costs a load first.
+      const warm = new Set(pool.loaded());
+      const upstream: { data?: { id: string; status?: { value: string }; context_length?: number }[] } = {
+        data: pool.catalog().map((id) => {
+          // A backend that cannot report warm state must not be flattened
+          // into cold. "We cannot see" and "nothing is loaded" are different
+          // claims and only one of them would be honest, so such a model
+          // carries no status at all rather than a made-up one.
+          // Same principle for context_length: absent when unknown, not null,
+          // because we cannot see is not the same claim as a value.
+          const entry: { id: string; status?: { value: string }; context_length?: number } = { id };
+          if (pool.for(id).cfg.kind === "none") return entry;
+          entry.status = { value: warm.has(id) ? "loaded" : "unloaded" };
+          const ctx = pool.contextLength(id);
+          if (ctx !== null) entry.context_length = ctx;
+          return entry;
+        }),
+      };
+      // A peer only sees what it may use. This used to hand the whole backend
+      // catalogue to anyone with a peer token. Unusable, since every other
+      // route enforces the share list, but a full inventory of what someone
+      // runs isn't theirs to have. Model names alone can be personal.
+      // The context_length field travels with the entry, so a peer can size
+      // its own client limit from the shared subset.
+      if (modelsPeer !== null) {
+        json(res, 200, {
+          ...upstream,
+          data: (upstream.data ?? []).filter((m) => shared().includes(m.id)),
+        });
+        return;
+      }
+      json(res, 200, upstream);
+    } catch (e) {
+      apiError(res, 502, `backend unreachable: ${String(e)}`, "server_error");
+    }
+    return;
+  }
+
+  async function routeChat(c: Call): Promise<void> {
+    const { req, res } = c;
+    // A peer's request gets served here and never routed onward. Two nodes
+    // that each prefer the other would otherwise bounce a request back and
+    // forth until something gave out.
+    const fromPeer = c.peer;
+    const caller = c.caller;
+    if (fromPeer !== null && peerOverLimit(fromPeer)) {
+      apiError(res, 429, "rate capped", "rate_limit_error");
+      return;
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
+    } catch (e) {
+      if (e instanceof BodyTooLargeError) {
+        res.setHeader("Connection", "close");
+        apiError(res, 413, e.message, "invalid_request_error");
+        return;
+      }
+      apiError(res, 400, `body was not JSON: ${String(e)}`);
+      return;
+    }
+
+    const model = typeof payload.model === "string" ? payload.model : "";
+    if (model === "") {
+      apiError(res, 400, "model is required");
+      return;
+    }
+    if (fromPeer !== null && !shared().includes(model)) {
+      // Lending is opt-in per model, so a peer can't reach anything you
+      // didn't deliberately offer.
+      apiError(res, 403, `${cfg.name} does not share "${model}"`, "permission_error");
+      return;
+    }
+    // Refused before it is queued, and only where it cannot be wrong. An id
+    // nothing serves used to fall through to the first backend, wait its
+    // turn, possibly evict whatever was resident, and then 404 — so a typo
+    // cost a slot on the GPU. It still routes to a peer if one maps it, even
+    // a peer that is currently down: that is a routing question, and the
+    // policies below already answer it.
+    if (pool.certainlyUnknown(model)
+        && !peers.all().some((p) => peers.theirModelId(p.name, model) !== undefined)) {
+      apiError(
+        res, 404,
+        `no backend here serves "${model}" (${pool.catalog().join(", ") || "nothing"})`,
+        "invalid_request_error",
+      );
+      return;
+    }
+    if (fromPeer !== null) {
+      // A borrower who ignored our advertised stats, or whose estimate came
+      // in low, gets the same answer the local path gives — before the work
+      // is queued and before it evicts anything. 4xx on purpose: their
+      // request is wrong, and PeerStatusError.isRefusal means they hand that
+      // verdict to their caller instead of retrying it at us.
+      const why = unfit(pool.statsFor(model), needsOf(payload));
+      if (why !== null) {
+        apiError(res, 400, `${model} ${why}`, "invalid_request_error");
+        return;
+      }
+    }
+
+    // Peers don't choose our lane, see cfg.peerLane. Local callers can, with
+    // a non-standard `lane` field, which we strip before forwarding so it
+    // never reaches an OpenAI backend that would reject it.
+    const lane =
+      fromPeer !== null
+        ? cfg.peerLane
+        : typeof payload.lane === "string" && payload.lane in cfg.scheduler.lanes
+          ? payload.lane
+          : Object.keys(cfg.scheduler.lanes)[0]!;
+    delete payload.lane;
+
+    const ctrl = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) ctrl.abort();
+    });
+
+    try {
+      if (fromPeer !== null) {
+        const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
+        const serving = pool.for(model);
+        // As on the local path: what we relayed to the borrower, so lent
+        // capacity that failed is not filed as lent capacity that worked.
+        let lentStatus = 0;
+        try {
+          await serving.scheduler.submit(
+            // peerMaxConcurrent rather than maxPerCaller. A peer is always a
+            // caller we can tell apart, so it gets capped whether or not
+            // apiKeys are set. Otherwise a borrower is bounded only by an
+            // hourly rate no serialized GPU could ever retire, and their retry
+            // loop parks in front of the host's own work.
+            //
+            // Capped per backend, so a borrower filling the GPU queue does not
+            // also lock itself out of the embedder.
+            { lane, model, caller, maxPerCaller: cfg.peerMaxConcurrent, signal: ctrl.signal },
+            async () => {
+              t.startedAt = Date.now();
+              await serving.state.ensureFresh();
+              // A peer asked in OUR vocabulary, so the same rewrite and the same
+              // stamped params apply on the way to the backend as for a local
+              // caller. (Before, a lent `as` model reached the backend under
+              // the advertised id and 404'd.)
+              const up = await send(`${serving.cfg.url}/v1/chat/completions`, {
+                json: pool.outboundBody(model, payload),
+                signal: ctrl.signal,
+                ...backendDeadline(),
+              });
+              lentStatus = await pipeThrough(up, res);
+            },
+          );
+        } catch (e) {
+          // Both halves, same as the local path. This logged successes only,
+          // so a refused borrower or a failed lent generation left nothing at
+          // info. That's the one kind of traffic you most want to account for
+          // afterwards.
+          logRequest(t, { model, lane, target: "local", forPeer: fromPeer }, false, e);
+          throw e;
+        }
+        // Lent capacity is the thing you most want a record of.
+        logRequest(
+          t,
+          { model, lane, target: "local", forPeer: fromPeer,
+            ...(lentStatus >= 400 ? { status: lentStatus } : {}) },
+          lentStatus < 400,
+          lentStatus >= 400 ? `backend answered ${lentStatus}` : undefined,
+        );
+      } else {
+        await dispatch(payload, model, lane, caller, res, ctrl.signal);
+      }
+    } catch (e) {
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      if (e instanceof QueueFullError) {
+        apiError(res, 429, e.message, "rate_limit_error");
+        return;
+      }
+      // A peer's REFUSAL is passed through with its own status. 502 would say
+      // "the far side broke", which is a different fact and provokes the
+      // opposite client behaviour: 5xx is retryable and 4xx is not, so
+      // laundering their 429 into our 502 is what turns their rate limit into
+      // our retry storm. Their 5xx still becomes our 502 — that genuinely is
+      // an upstream failure from where our caller sits.
+      if (e instanceof PeerStatusError && e.isRefusal) {
+        apiError(
+          res,
+          e.status,
+          e.message,
+          e.status === 429 ? "rate_limit_error" : "invalid_request_error",
+        );
+        return;
+      }
+      apiError(res, 502, e instanceof Error ? e.message : String(e), "server_error");
+    }
+    return;
+  }
+
+  async function routeUi(c: Call): Promise<void> {
+    const { req, res, path } = c;
+    // Same gate, same data, different transport. EventSource cannot send an
+    // Authorization header, which is exactly why the page's sockets are
+    // decided by ADDRESS and not by credential — so the stream needs no
+    // separate story about auth, and gets none.
+    if (path === "/ui/events") {
+      await serveUiEvents(req, res, true);
+      return;
+    }
+    await serveUi(path, res, true);
+    return;
+  }
+
+  /** Everything not claimed above, proxied to a backend as-is. */
+  async function routePassthrough(c: Call): Promise<void> {
+    const { req, res, url, path } = c;
     // ---- everything else: straight through, unqueued ----
     //
     // A real backend is more than /v1. llama-swap alone serves /unload,
@@ -1495,11 +1659,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // path. That resolves the objection rather than ignoring it: a named path
     // IS identified, and naming it is a statement that hearth is the admission
     // control for it — which also means whatever used to queue it must stop.
-    const who = localCaller(req);
-    if (who === null) {
-      apiError(res, 401, "unauthorized", "authentication_error");
-      return;
-    }
+    // Resolved by the table rather than re-derived here.
+    const who = c.caller;
     let body: Buffer | undefined;
     try {
       body =
@@ -1602,6 +1763,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         // still forwarded untouched.
         headers: stripOurKey(req) as Record<string, string>,
         signal: ctrl.signal,
+        ...backendDeadline(),
       });
       log.debug("passthrough", { path, status: up.status });
       await pipeThrough(up, res);
@@ -1671,6 +1833,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     }
   }
 
+
   /** The page and its data. The only two things either listener will serve. */
   /**
    * `canWarm` says whether POST /v1/warm is reachable FROM THIS PAGE.
@@ -1698,6 +1861,18 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    * our own node runs with apiKeys empty.
    */
   const writeMode = (): "open" | "key" => (cfg.apiKeys.length === 0 ? "open" : "key");
+
+  /**
+   * The first-byte deadline for a call to a local backend.
+   *
+   * A helper rather than a literal at each call site, because the failure it
+   * guards against is invisible until it happens and the cost of forgetting it
+   * at one site is the whole node: a backend that accepts the connection and
+   * never answers holds a scheduler slot for as long as the process lives, and
+   * with `resources` declared it holds the card too.
+   */
+  const backendDeadline = (): { headersTimeoutMs?: number } =>
+    cfg.backendFirstByteMs > 0 ? { headersTimeoutMs: cfg.backendFirstByteMs } : {};
 
   /**
    * Everything the page draws, in one object.
@@ -1748,12 +1923,19 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // can tell the two apart because it also has the catalog, so both are
       // sent as they are.
       aliases: aliasView(),
+      // Where a request for each id is allowed to go, and what happens when it
+      // cannot go there. This is the decision hearth exists to make, so the
+      // console has to be able to state it: a mapping alone only says a request
+      // MAY leave, and the policy beside it says whether it will.
+      routing: routingView(),
       overrides: overrideView(),
       net: networkView(),
       q: {
         jobs: pool.jobs(),
         capacity: pool.loadedAggregate(),
-        backends: pool.all().map((b) => ({ name: b.name, ...pool.loadedCapacity(b) })),
+        // Per-backend capacity is not repeated here: `net.nodes[self].backends`
+        // already carries it along with everything else about a backend, and
+        // this frame is diffed and pushed on every change.
       },
       hist: history.all(),
       // Every call that ran here in the same window, so the page can draw the
@@ -1850,11 +2032,42 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
+  /**
+   * The baseline, built at most once at a time.
+   *
+   * `uiPayload` awaits `peers.ensureFresh()`, which can outlast the tick
+   * exactly when a peer is timing out — which is exactly when somebody is
+   * watching. Two overlapping builds both diff against the same `lastSent`,
+   * and whichever finishes LAST wins the baseline: if that is the older
+   * snapshot, the newer one's changes are never sent again, because the next
+   * diff is taken against a payload that already contained them.
+   *
+   * Both producers go through here — the tick and a page connecting — because
+   * they race each other as readily as the tick races itself. A subscriber that
+   * built its own snapshot while a broadcast was building the next one would be
+   * handed a baseline the server then forgot, and every field that differed
+   * between the two would stay wrong on that page until it changed again.
+   *
+   * Callers that find a build already running join it rather than starting a
+   * second. The page's own poll fallback carries the same guard for the same
+   * reason.
+   */
+  let inBuild: Promise<Record<string, unknown>> | null = null;
+
+  function build(): Promise<Record<string, unknown>> {
+    inBuild ??= uiPayload(false)
+      .then((d) => { lastSent = d; return d; })
+      .finally(() => { inBuild = null; });
+    return inBuild;
+  }
+
   async function broadcast(): Promise<void> {
-    if (streams.size === 0) return;
-    const next = await uiPayload(false);
-    const patch = lastSent ? uiDiff(lastSent, next) : null;
-    lastSent = next;
+    // A build already in flight will publish a fresher baseline than this tick
+    // could, and the next tick diffs from it. Skipping costs a second.
+    if (streams.size === 0 || inBuild) return;
+    const prev = lastSent;
+    const next = await build();
+    const patch = prev ? uiDiff(prev, next) : null;
     if (patch) {
       for (const res of streams) writeFrame(res, "patch", patch);
       lastFlushAt = Date.now();
@@ -1877,9 +2090,11 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // failure the drain was added to prevent, arriving by a different door.
     notWork(res);
 
-    lastSent ??= await uiPayload(false);
+    // The same baseline the patches will be diffed against, or this page
+    // applies deltas to a snapshot the server never recorded.
+    const snapshot = lastSent ?? await build();
     writeFrame(res, "snapshot", {
-      ...lastSent,
+      ...snapshot,
       canWarm,
       control: canWarm ? writeMode() : "off",
     });
@@ -1957,11 +2172,29 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   const proxying = new Set<{ id: string; backend: string; model: string | null }>();
 
   const uiWritable = cfg.uiListen?.control === "key";
+  /**
+   * What the standalone listener serves, and nothing else.
+   *
+   * A separate question from the auth table above: that decides who may call a
+   * path, this decides which paths exist on a socket that may be bound wide.
+   * Both are allowlists and they sit together so that adding a route somewhere
+   * else does not quietly appear here — the point of this port is that it is a
+   * status page and a shorter attack surface, not a second front door.
+   */
   const UI_PATHS = new Set(["/ui", "/ui/", "/ui/data", "/ui/events", "/"]);
+  /**
+   * The only writes this port will pass through, and only when `uiListen`
+   * allows writes at all.
+   *
+   * Kept as a named set rather than an inline comparison because it is the
+   * half that gets forgotten: a new control path added to the main table is
+   * NOT reachable here until it is named here too, and that is deliberate.
+   */
+  const UI_WRITE_PATHS = new Set(["/control", "/v1/warm"]);
   const uiServer = cfg.uiListen
     ? createServer((req, res) => {
         const path = new URL(req.url ?? "/", "http://localhost").pathname;
-        const isWrite = uiWritable && req.method === "POST" && (path === "/control" || path === "/v1/warm");
+        const isWrite = uiWritable && req.method === "POST" && UI_WRITE_PATHS.has(path);
         if (!UI_PATHS.has(path) && !isWrite) {
           json(res, 404, { error: "only the status page is served on this port" });
           return;
@@ -2054,6 +2287,29 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       unsaved: savesTo() !== null && overrides.unsaved(controls.shareOverrides()),
       yaml: dirty ? overrides.yaml(shared(), cfg.share) : "",
     };
+  }
+
+  /**
+   * Advertised id -> how it routes.
+   *
+   * Effective, so a runtime link shows the policy it was linked with rather
+   * than the one the file was last written with.
+   */
+  function routingView(): Record<string, {
+    policy: RoutePolicy; peers: string[]; fallbackLocal: boolean; spilloverAt: number;
+  }> {
+    const out: Record<string, {
+      policy: RoutePolicy; peers: string[]; fallbackLocal: boolean; spilloverAt: number;
+    }> = {};
+    for (const [id, m] of Object.entries(cfg.models)) {
+      out[id] = {
+        policy: m.policy,
+        peers: [...m.peers],
+        fallbackLocal: m.fallbackLocal,
+        spilloverAt: m.spilloverAt,
+      };
+    }
+    return out;
   }
 
   /** advertised id -> `as`, for every model that declares one. */

@@ -31,25 +31,21 @@ import Dialog from "@mui/material/Dialog";
 import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
-import IconButton from "@mui/material/IconButton";
-import Menu from "@mui/material/Menu";
-import MenuItem from "@mui/material/MenuItem";
 import TextField from "@mui/material/TextField";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { ThemeProvider } from "@mui/material/styles";
-import { Menu01Icon } from "@hugeicons/core-free-icons";
-import { HugeiconsIcon } from "@hugeicons/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Dot, Row, Spacer, Tag } from "./bits.js";
+import { Identity, Row, Spacer } from "./bits.js";
 import Dashboard from "./dashboard.js";
 import { Graph, type Sel } from "./graph.js";
 import { Inspector, type Ctx } from "./inspect.js";
 import { load, setKeyAsker } from "./lib.js";
 import { History, ModelsTable, QueueTable } from "./tables.js";
 import { makeTheme, MONO } from "./theme.js";
+import { callStats } from "./why.js";
 import type { UiData } from "./types.js";
 
 /* ------------------------------------------------------------------ data */
@@ -181,11 +177,18 @@ function useData(): { data: UiData | null; dead: boolean; live: boolean; refresh
 
 type Drawer = "queue" | "models" | "history" | null;
 
-function DrawerTab({ label, count, hot, open, onClick }: {
-  label: string; count?: React.ReactNode; hot?: boolean; open: boolean; onClick: () => void;
+function DrawerTab({ label, count, tone = "quiet", open, onClick }: {
+  label: string;
+  count?: React.ReactNode;
+  /** The count's colour, and it means what it means everywhere else on the
+   *  page: amber is something to look at, red is something that broke. */
+  tone?: "quiet" | "work" | "fault";
+  open: boolean;
+  onClick: () => void;
 }) {
   return (
-    <Button onClick={onClick} aria-expanded={open} sx={[
+    <Button onClick={onClick} aria-expanded={open}
+            aria-controls={open ? "hearth-drawer" : undefined} sx={[
       {
         borderColor: "transparent", borderRadius: 0, px: 1.5, py: 0.75,
         borderBottom: "2px solid", borderBottomColor: "transparent",
@@ -198,7 +201,10 @@ function DrawerTab({ label, count, hot, open, onClick }: {
     ]}>
       {label}
       {count !== undefined && (
-        <Box component="span" sx={{ ml: 0.75, color: hot ? "warning.main" : "faint" }}>{count}</Box>
+        <Box component="span" sx={{
+          ml: 0.75,
+          color: tone === "fault" ? "error.main" : tone === "work" ? "warning.main" : "faint",
+        }}>{count}</Box>
       )}
     </Button>
   );
@@ -214,15 +220,32 @@ function Console({ d, ctx, dead, live, menu }: {
   const self = d?.net.nodes.find((n) => n.self);
   const queued = d ? Object.values(d.q.capacity.queued).reduce((a, b) => a + b, 0) : 0;
   const running = d ? d.q.jobs.filter((j) => j.state === "running" && !j.offbox).length : 0;
+  const calls = callStats(d?.calls);
 
   const toggle = (which: Exclude<Drawer, null>) =>
     setDrawer((cur) => (cur === which ? null : which));
+
+  // Escape backs out of whatever is open, innermost first. The rail's own
+  // "← everything" link is a small target and the only other way out of a
+  // selection, and a drawer covering half the stage has no way out at all
+  // without finding the tab that opened it again.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // A dialog or a menu is on top of this and owns the key while it is up.
+      if (document.querySelector(".MuiModal-root")) return;
+      if (drawer) setDrawer(null);
+      else if (sel) setSel(null);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [drawer, sel]);
 
   return (
     <Box sx={{
       // Exactly one viewport on a wide screen, so the drawer bar is always
       // reachable without scrolling and the stage takes whatever is left over.
-      minHeight: "100dvh", height: { md: "100dvh" }, overflow: { md: "hidden" },
+      minHeight: "100dvh", height: { lg: "100dvh" }, overflow: { lg: "hidden" },
       display: "flex", flexDirection: "column", bgcolor: "background.default",
     }}>
       {/* Header. Identity and the two facts you would reload the page to check. */}
@@ -232,13 +255,7 @@ function Console({ d, ctx, dead, live, menu }: {
         bgcolor: "background.paper", flexShrink: 0,
       }}>
         {menu}
-        <Typography component="span" sx={{ fontSize: 15, fontWeight: 700, letterSpacing: "-.01em" }}>
-          hea<Box component="span" sx={{ color: "success.main" }}>r</Box>th
-        </Typography>
-        <Tag>{dead ? "unreachable" : self?.name ?? "—"}</Tag>
-        <Typography component="span" sx={{ fontFamily: MONO, fontSize: 10.5, color: dead ? "error.main" : "faint" }}>
-          <Dot color={dead ? "error.main" : "success.main"} />{dead ? "no answer from /ui/data" : "live"}
-        </Typography>
+        <Identity name={self?.name} dead={dead} live={live} size="sm" />
         <Spacer />
         {d && (
           <Row spacing={2} align="baseline" sx={{ fontFamily: MONO, fontSize: 11, color: "text.secondary" }}>
@@ -260,15 +277,22 @@ function Console({ d, ctx, dead, live, menu }: {
       </Box>
 
       {!d ? (
-        <Typography sx={{ color: "faint", p: 4 }}>{dead ? "no answer from /ui/data" : "loading…"}</Typography>
+        <Typography sx={{ color: "faint", p: 4 }}>
+          {dead ? `no answer from ${live ? "/ui/events" : "/ui/data"}` : "loading…"}
+        </Typography>
       ) : (
         <>
           {/* Stage and rail. The rail drops under the stage on a narrow screen
               rather than shrinking into a column of wrapped words. */}
+          {/* The rail only sits beside the stage where both fit: MIN_STAGE for
+              the graph plus the rail's own 340 plus padding. Below that the
+              stage would be narrower than its own floor and scroll sideways
+              with the controls still taking a third of the width, so the rail
+              goes under it instead. */}
           <Box sx={{
             flex: "1 1 auto", minHeight: 0,
             display: "grid",
-            gridTemplateColumns: { xs: "1fr", md: "minmax(0,1fr) 340px" },
+            gridTemplateColumns: { xs: "1fr", lg: "minmax(0,1fr) 340px" },
           }}>
             <Box sx={{ p: 2, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
               <Graph d={d} sel={sel} onSelect={setSel} />
@@ -283,19 +307,29 @@ function Console({ d, ctx, dead, live, menu }: {
             borderTop: "1px solid", borderColor: "line", bgcolor: "background.paper", flexShrink: 0,
           }}>
             <Row spacing={0} align="center" sx={{ px: 1.5, borderBottom: drawer ? "1px solid" : "none", borderColor: "line" }}>
-              <DrawerTab label="queue" count={d.q.jobs.length} hot={queued > 0}
+              <DrawerTab label="queue" count={d.q.jobs.length} tone={queued > 0 ? "work" : "quiet"}
                          open={drawer === "queue"} onClick={() => toggle("queue")} />
               <DrawerTab label="models" count={`${d.net.readyNow.length}/${d.net.available.length}`}
                          open={drawer === "models"} onClick={() => toggle("models")} />
               <DrawerTab label="last 10 minutes"
+                         count={calls.failed ? `${calls.failed} failed` : calls.n}
+                         tone={calls.failed ? "fault" : "quiet"}
                          open={drawer === "history"} onClick={() => toggle("history")} />
               <Spacer />
-              <Typography sx={{ fontFamily: MONO, fontSize: 10, color: "faint", pr: 1.5, display: { xs: "none", sm: "block" } }}>
-                {live ? "live · pushed from /ui/events" : "polls /ui/data every 3s"}
+              <Typography sx={{
+                fontFamily: MONO, fontSize: 10, pr: 1.5,
+                color: dead ? "error.main" : "faint",
+                display: { xs: "none", sm: "block" },
+              }}>
+                {/* Never claims to be live while nothing is arriving: the
+                    header and this line describe the same connection. */}
+                {dead ? "stale · nothing arriving"
+                  : live ? "live · pushed from /ui/events" : "polls /ui/data every 3s"}
               </Typography>
             </Row>
             {drawer && (
-              <Box sx={{ p: 2, maxHeight: "45dvh", overflowY: "auto" }}>
+              <Box id="hearth-drawer" role="region" aria-label={drawer}
+                   sx={{ p: 2, maxHeight: "45dvh", overflowY: "auto" }}>
                 {drawer === "queue" && <QueueTable d={d} />}
                 {drawer === "models" && <ModelsTable d={d} ctx={ctx} onSelect={setSel} />}
                 {drawer === "history" && <History d={d} />}
@@ -381,20 +415,26 @@ function KeyDialog() {
 /**
  * Which view is showing, remembered per browser.
  *
- * The graph is the default — it is what a visit is usually for. An operator who
- * prefers the dashboard's every-number-at-once read should not re-pick it every
- * reload, so the choice is stored. localStorage can throw (private mode, storage
- * disabled), and a page that refuses to render because it could not remember a
- * preference is worse than one that forgets it, so both sides are guarded and
- * fall back to the graph.
+ * The graph is the default where there is room for it — it is what a visit is
+ * usually for. The stage has a floor of MIN_STAGE px and a rail beside it, so
+ * on a phone the graph is a diagram you scroll sideways with its controls
+ * pushed below the fold; the dashboard is the same facts in a column, which is
+ * what a narrow screen wants. So the FALLBACK follows the viewport and an
+ * explicit choice always wins over it, in either direction.
+ *
+ * localStorage can throw (private mode, storage disabled), and a page that
+ * refuses to render because it could not remember a preference is worse than
+ * one that forgets it, so both sides are guarded.
  */
 type View = "graph" | "dashboard";
 const VIEW_KEY = "hearth.view";
 
-function useView(): [View, (v: View) => void] {
+function useView(fallback: View): [View, (v: View) => void] {
   const [view, setView] = useState<View>(() => {
-    try { return localStorage.getItem(VIEW_KEY) === "dashboard" ? "dashboard" : "graph"; }
-    catch { return "graph"; }
+    try {
+      const stored = localStorage.getItem(VIEW_KEY);
+      return stored === "dashboard" || stored === "graph" ? stored : fallback;
+    } catch { return fallback; }
   });
   const choose = useCallback((v: View) => {
     setView(v);
@@ -403,29 +443,33 @@ function useView(): [View, (v: View) => void] {
   return [view, choose];
 }
 
-/** The view switcher: both views folded behind one menu in the header. */
+/**
+ * The view switcher.
+ *
+ * Two mutually exclusive destinations, drawn as two controls that both say
+ * where they go and which one you are on. A menu would hide half of that
+ * behind a click and read as "there is navigation here", which there is not —
+ * there are two views.
+ */
 function ViewMenu({ view, onView }: { view: View; onView: (v: View) => void }) {
-  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
-  const pick = (v: View) => { onView(v); setAnchor(null); };
+  const item = (v: View, label: string) => (
+    <Button
+      key={v}
+      onClick={() => onView(v)}
+      aria-current={view === v ? "page" : undefined}
+      sx={[
+        { border: "none", px: 0.75, py: 0.25, color: "faint",
+          "&:hover": { border: "none", color: "text.primary", background: "none" } },
+        view === v && { color: "text.primary", textDecoration: "underline",
+                        textUnderlineOffset: 4, textDecorationColor: "success.main" },
+      ]}
+    >{label}</Button>
+  );
   return (
-    <>
-      <IconButton
-        aria-label="switch view" aria-haspopup="menu" aria-expanded={Boolean(anchor)}
-        onClick={(e) => setAnchor(e.currentTarget)}
-        sx={{ borderRadius: 1.5, p: 0.5, color: "text.secondary", "&:hover": { color: "text.primary" } }}
-      >
-        <HugeiconsIcon icon={Menu01Icon} size={18} color="currentColor" strokeWidth={2}
-                       aria-hidden style={{ display: "block" }} />
-      </IconButton>
-      <Menu
-        anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)}
-        anchorOrigin={{ vertical: "bottom", horizontal: "left" }}
-        transformOrigin={{ vertical: "top", horizontal: "left" }}
-      >
-        <MenuItem selected={view === "graph"} onClick={() => pick("graph")}>Graph</MenuItem>
-        <MenuItem selected={view === "dashboard"} onClick={() => pick("dashboard")}>Dashboard</MenuItem>
-      </Menu>
-    </>
+    <Row spacing={0} align="center" component="span" sx={{ display: "inline-flex", mr: 0.5 }}>
+      {item("graph", "graph")}
+      {item("dashboard", "dashboard")}
+    </Row>
   );
 }
 
@@ -435,7 +479,9 @@ export default function App() {
   const { data, dead, live, refresh } = useData();
   const prefersDark = useMediaQuery("(prefers-color-scheme: dark)");
   const theme = useMemo(() => makeTheme(prefersDark ? "dark" : "light"), [prefersDark]);
-  const [view, setView] = useView();
+  // Matches the breakpoint the stage-and-rail layout itself uses.
+  const roomy = useMediaQuery("(min-width: 1200px)");
+  const [view, setView] = useView(roomy ? "graph" : "dashboard");
   const ctx: Ctx = {
     canWarm: data?.canWarm ?? false,
     control: data?.control ?? "off",

@@ -127,4 +127,64 @@ function deadWeightClient(): Promise<void> {
 await node.close();
 backend.closeAllConnections();
 backend.close();
+// --- a backend that accepts and never answers must not wedge the queue -----
+//
+// The other way a slot is held forever, and the one nothing else unblocks: the
+// backend takes the connection and then goes quiet. No error fires, the socket
+// stays up, and `send()` has no deadline of its own — so at the default
+// concurrency of 1 the first such request takes the backend's whole queue with
+// it until the process restarts. A client that gives up frees the slot, but
+// only because IT had a timeout; one without waits exactly as long as we do.
+{
+  // Accepts, reads the request, and never writes a byte.
+  const blackhole = createServer(() => {});
+  await new Promise<void>((r) => blackhole.listen(0, "127.0.0.1", () => r()));
+  const hurl = `http://127.0.0.1:${(blackhole.address() as AddressInfo).port}`;
+
+  const hung = createNode(
+    parseConfig({
+      name: "hung",
+      backend: { url: hurl },
+      // Short enough to assert against; the production default is 15 minutes,
+      // which is about a cold load and not about a hang.
+      backendFirstByteMs: 300,
+    }),
+    silentLogger,
+  );
+  hung.start();
+  const hbase = await new Promise<string>((ready) =>
+    hung.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(hung.server.address() as AddressInfo).port}`)),
+  );
+
+  const ask = () => fetch(`${hbase}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "m", messages: [] }),
+  });
+
+  // Raced, not awaited bare: without the deadline this request never settles,
+  // and a test that hangs forever says less than one that fails. The ceiling is
+  // loose because the first request also pays the state refresh's own 3s
+  // timeout against the same dead socket — what is asserted is "bounded", not a
+  // particular number.
+  const first = await Promise.race([
+    ask().then(async (r) => { await r.text(); return r.status; }),
+    new Promise<"HUNG">((r) => setTimeout(() => r("HUNG"), 15_000)),
+  ]);
+  assert.equal(first, 502, "a backend that never answers is an upstream failure, not a hang");
+
+  // The point of the whole test: the slot came back, so the NEXT request is
+  // served rather than queued behind a job that will never end.
+  const second = await Promise.race([
+    ask().then((r) => r.status),
+    new Promise<"WEDGED">((r) => setTimeout(() => r("WEDGED"), 10_000)),
+  ]);
+  assert.notEqual(second, "WEDGED", "one hung request must not hold the queue forever");
+
+  await hung.close();
+  blackhole.closeAllConnections();
+  blackhole.close();
+}
+
 console.log("backpressure.test.ts ok");

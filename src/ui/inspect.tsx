@@ -16,20 +16,21 @@
  */
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
+import MenuItem from "@mui/material/MenuItem";
 import Switch from "@mui/material/Switch";
 import TextField from "@mui/material/TextField";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import { useState } from "react";
 
-import { CopyButton, Pre, Row, Why } from "./bits.js";
+import { CopyButton, Legend, Pre, Row, Vitals, Why } from "./bits.js";
 import { Graph, type Sel } from "./graph.js";
 import { backendIcon, resourceIcon, TypeIcon, type IconKind } from "./icons.js";
 import { clock, ctxLabel, displayId, postWrite, since } from "./lib.js";
 import { MONO } from "./theme.js";
 import { blockers } from "./why.js";
 import { yamlScalar as yq } from "../yamlq.js";
-import type { Backend, Node, UiData } from "./types.js";
+import type { Backend, Node, Routing, UiData } from "./types.js";
 
 export interface Ctx {
   /** Whether the write routes are reachable on the socket that served this page. */
@@ -76,12 +77,15 @@ export function Fact({ label, children, hint }: {
 /**
  * A block of its own, for things that are a LIST rather than a value.
  *
- * Kept apart from Fact deliberately. Everything used to be one shape — an
- * uppercase label with a value stacked under it — so a URL nobody reads had the
- * same weight as what the backend is doing right now, and seven of them in a
- * column read as a form dump rather than a panel.
+ * Kept apart from Fact deliberately: a URL nobody reads must not carry the
+ * same weight as what the backend is doing right now, and a column of one
+ * shape reads as a form dump rather than a panel.
+ *
+ * Named for what it is, and not `Section`, which is the dashboard's bordered
+ * card in bits.tsx. Two components with one name in one page is a wrong import
+ * that typechecks.
  */
-export function Section({ label, count, note, children }: {
+export function FieldGroup({ label, count, note, children }: {
   label: string;
   /** A number, not a sentence — it sits on the heading's own baseline. */
   count?: React.ReactNode;
@@ -156,8 +160,8 @@ export function PanelHead({ icon, tone, name, status, onBack }: {
   );
 }
 
-/** A heading inside the panel. */
-const Head = ({ children }: { children: React.ReactNode }) => (
+/** A heading inside the panel. Not the graph's `Head`, which is a node's name line. */
+const PanelTitle = ({ children }: { children: React.ReactNode }) => (
   <Typography component="h2" sx={{
     fontSize: 10, fontWeight: 700, letterSpacing: ".08em", textTransform: "uppercase",
     color: "text.secondary", pb: 0.75, mb: 1.5, borderBottom: "1px solid", borderColor: "line",
@@ -443,6 +447,44 @@ function mapSnippet(n: Node): string {
 }
 
 /**
+ * How an id routes, in the words the config uses, with the caveat that matters.
+ *
+ * `policy` alone is half an answer: what a request does when the peer is busy
+ * or down is `fallbackLocal`, and the difference is a slow request against a
+ * 404. Both are stated, and never inferred from the mapping — a mapping only
+ * says a request MAY leave.
+ */
+const POLICY_HINT: Record<Routing["policy"], string> = {
+  local: "served here. The mapping exists but nothing routes over it.",
+  peer: "always sent to a peer.",
+  spillover: "served here until the local queue backs up, then sent to a peer.",
+  fastest: "whichever of here and the peer can start it sooner.",
+};
+
+function RouteLine({ r, peer }: { r: Routing | undefined; peer: string }) {
+  if (!r) return null;
+  const named = r.peers.length ? r.peers.includes(peer) : true;
+  const fallback = r.policy === "local" ? null
+    : r.fallbackLocal ? "falls back here" : "no local fallback";
+  return (
+    <Tooltip title={`${POLICY_HINT[r.policy]}${
+      r.policy === "spillover" ? ` The threshold is ${r.spilloverAt} queued.` : ""
+    }${
+      r.policy === "local" ? ""
+        : r.fallbackLocal
+          ? " If no peer can take it, it runs on the local backend."
+          : " If no peer can take it, the request is refused rather than run here."
+    }${named ? "" : ` This mapping is not in the model's peer list, so ${peer} is not a candidate for it.`}`}>
+      <Box component="span" sx={{
+        fontSize: 10, color: named ? "faint" : "warning.main", cursor: "help", whiteSpace: "nowrap",
+      }}>
+        {r.policy}{fallback ? ` · ${fallback}` : ""}{named ? "" : " · not listed"}
+      </Box>
+    </Tooltip>
+  );
+}
+
+/**
  * A peer's model map, and the two edits you can make to it.
  *
  * `peers[].models` IS the allowlist deciding which of your prompts may leave
@@ -451,19 +493,29 @@ function mapSnippet(n: Node): string {
  * and a restart. The edit is live and temporary, and the pending block on the
  * self panel hands you the YAML to make it stick.
  */
-function MapEditor({ n, ctx }: { n: Node; ctx: Ctx }) {
+function MapEditor({ n, d, ctx }: { n: Node; d: UiData; ctx: Ctx }) {
   const pairs = Object.entries(n.map ?? {}).sort((a, b) => a[0].localeCompare(b[0]));
   const unmapped = [...(n.unmapped ?? [])].sort();
   const [names, setNames] = useState<Record<string, string>>({});
+  const routing = d.routing ?? {};
+  // The default the server would pick, restated here so the control opens on
+  // the same answer the button would have given, rather than on a blank that
+  // silently means something.
+  const defaultPolicy = (mine: string): Routing["policy"] =>
+    d.catalog.includes(mine) ? "fastest" : "peer";
+  const [policies, setPolicies] = useState<Record<string, Routing["policy"]>>({});
 
   return (
     <>
-      <Section label="linked" count={pairs.length}>
+      <FieldGroup label="linked" count={pairs.length}>
         {!pairs.length && <Box sx={{ color: "faint" }}>nothing linked — nothing can leave this box for {n.name}</Box>}
         {pairs.map(([mine, theirs]) => (
           <Row key={mine} spacing={1} align="center" sx={{ py: 0.5 }}>
-            <Box sx={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {mine}{mine !== theirs && <Box component="span" sx={{ color: "faint" }}> → {theirs}</Box>}
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Box sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {mine}{mine !== theirs && <Box component="span" sx={{ color: "faint" }}> → {theirs}</Box>}
+              </Box>
+              <RouteLine r={routing[mine]} peer={n.name} />
             </Box>
             {ctx.canWarm && (
               <Action label="unlink" title={`stop sending ${mine} to ${n.name}`} ctx={ctx}
@@ -471,10 +523,10 @@ function MapEditor({ n, ctx }: { n: Node; ctx: Ctx }) {
             )}
           </Row>
         ))}
-      </Section>
+      </FieldGroup>
 
       {unmapped.length > 0 && (
-        <Section label="offered" count={unmapped.length}
+        <FieldGroup label="offered" count={unmapped.length}
                  note="this peer lends these and you have not mapped, so nothing can route to them">
           {unmapped.map((theirs) => (
             <Row key={theirs} spacing={1} align="center" sx={{ py: 0.5 }}>
@@ -489,8 +541,35 @@ function MapEditor({ n, ctx }: { n: Node; ctx: Ctx }) {
                     slotProps={{ htmlInput: { "aria-label": `local name for ${theirs}` } }}
                     sx={{ flex: 1, minWidth: 0 }}
                   />
-                  <Action label="link" title={`route requests for this id to ${n.name}`} ctx={ctx}
-                          body={() => ({ link: { peer: n.name, mine: (names[theirs] ?? theirs).trim() || theirs, theirs } })} />
+                  {/* The policy is chosen HERE rather than accepted and then
+                      corrected in the config file, because it is the decision
+                      the link is actually making: whether your prompts leave
+                      this box, and what happens when the peer cannot take
+                      them. It opens on the same default the server would pick. */}
+                  <TextField
+                    select
+                    value={policies[theirs] ?? defaultPolicy((names[theirs] ?? theirs).trim() || theirs)}
+                    onChange={(e) => setPolicies((s) => ({ ...s, [theirs]: e.target.value as Routing["policy"] }))}
+                    slotProps={{ htmlInput: { "aria-label": `routing policy for ${theirs}` } }}
+                    sx={{ minWidth: 96 }}
+                  >
+                    {(["fastest", "peer", "spillover", "local"] as const).map((v) => (
+                      <MenuItem key={v} value={v} sx={{ fontFamily: MONO, fontSize: 11 }}>
+                        {v}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                  <Action label="link" ctx={ctx}
+                          title={`route requests for this id to ${n.name} — ${
+                            POLICY_HINT[policies[theirs]
+                              ?? defaultPolicy((names[theirs] ?? theirs).trim() || theirs)]}`}
+                          body={() => {
+                            const mine = (names[theirs] ?? theirs).trim() || theirs;
+                            return { link: {
+                              peer: n.name, mine, theirs,
+                              policy: policies[theirs] ?? defaultPolicy(mine),
+                            } };
+                          }} />
                 </>
               ) : (
                 <Box sx={{ color: "warning.main" }}>{theirs}</Box>
@@ -500,9 +579,10 @@ function MapEditor({ n, ctx }: { n: Node; ctx: Ctx }) {
           {ctx.canWarm ? (
             <Why>
               Linking maps the id and routes it, which are two halves of one thing: a mapping on
-              its own only says a request MAY leave. A model you also serve gets policy fastest
-              with a local fallback; one you do not gets policy peer and no fallback, since home
-              is a backend that has never heard of it.
+              its own only says a request MAY leave. The policy beside each one says whether it
+              will. A model you also serve defaults to fastest with a local fallback; one you do
+              not defaults to peer and no fallback, since home is a backend that has never heard
+              of it.
             </Why>
           ) : (
             <>
@@ -510,7 +590,7 @@ function MapEditor({ n, ctx }: { n: Node; ctx: Ctx }) {
               <CopyButton text={mapSnippet(n)} />
             </>
           )}
-        </Section>
+        </FieldGroup>
       )}
     </>
   );
@@ -587,7 +667,7 @@ export function SelfPanel({ d, ctx }: { d: UiData; ctx: Ctx }) {
       </Fact>
       <Fact label="lending">{d.share.length} of {d.catalog.length} models</Fact>
 
-      <Section label="federation">
+      <FieldGroup label="federation">
         <Toggle label="lending" on={d.controls.lending !== false} ctx={ctx}
                 hint="peers may use the models you lend"
                 offHint="peers see a healthy node offering nothing"
@@ -599,15 +679,15 @@ export function SelfPanel({ d, ctx }: { d: UiData; ctx: Ctx }) {
         <Typography sx={{ fontSize: 10.5, color: "faint", mt: 0.5 }}>
           Takes effect immediately, and resets to the config on restart.
         </Typography>
-      </Section>
+      </FieldGroup>
 
-      <Section label="models" count={`${d.share.length} lent`}>
+      <FieldGroup label="models" count={`${d.share.length} lent`}>
         {!d.catalog.length && <Typography sx={{ fontSize: 11, color: "faint" }}>nothing to lend</Typography>}
         {d.catalog.map((m) => (
           <ModelLine key={m} model={m} d={d} ctx={ctx}
                      warm={d.net.readyNow.includes(m)} peer={null} />
         ))}
-      </Section>
+      </FieldGroup>
       <Pending d={d} ctx={ctx} />
     </>
   );
@@ -630,13 +710,13 @@ export function PeerPanel({ n, d, ctx }: { n: Node; d: UiData; ctx: Ctx }) {
           Borrowing is paused, so nothing routes here regardless of what is linked.
         </Typography>
       )}
-      <MapEditor n={n} ctx={ctx} />
+      <MapEditor n={n} d={d} ctx={ctx} />
       {loaded.length > 0 && (
-        <Section label="warm there" count={loaded.length}>
+        <FieldGroup label="warm there" count={loaded.length}>
           {loaded.map((m) => (
             <Typography key={m} sx={{ fontFamily: MONO, fontSize: 11.5, color: "success.main", py: 0.3, pl: `${GUTTER}px` }}>{m}</Typography>
           ))}
-        </Section>
+        </FieldGroup>
       )}
     </>
   );
@@ -701,7 +781,7 @@ export function BackendPanel({ b, d, ctx }: { b: Backend; d: UiData; ctx: Ctx })
       )}
 
       {(b.routes ?? []).length > 0 && (
-        <Section label="paths" count={(b.routes ?? []).length}
+        <FieldGroup label="paths" count={(b.routes ?? []).length}
                  note="reached by POST to this path, not by model id">
           {(b.routes ?? []).map((rt) => (
             <Box key={rt.path} sx={{ py: 0.35, pl: `${GUTTER}px`, fontFamily: MONO, fontSize: 11 }}>
@@ -716,11 +796,11 @@ export function BackendPanel({ b, d, ctx }: { b: Backend; d: UiData; ctx: Ctx })
               </Box>
             </Box>
           ))}
-        </Section>
+        </FieldGroup>
       )}
 
       {serves.length > 0 && (
-        <Section label="models" count={serves.length}>
+        <FieldGroup label="models" count={serves.length}>
           {serves.map((wire) => {
             const m = advertised(wire);
             // What it can take, under the name. Absent until the model has been
@@ -744,7 +824,7 @@ export function BackendPanel({ b, d, ctx }: { b: Backend; d: UiData; ctx: Ctx })
                          warm={loaded.has(wire) || loaded.has(m)} peer={null} />
             );
           })}
-        </Section>
+        </FieldGroup>
       )}
     </>
   );
@@ -780,7 +860,7 @@ export function ResourcePanel({ name, d }: { name: string; d: UiData }) {
         </Fact>
       )}
 
-      <Section label={r.shared ? "using it" : "competing"} count={backends.length}>
+      <FieldGroup label={r.shared ? "using it" : "competing"} count={backends.length}>
         {backends.map((b) => {
           const q = b.queued ?? 0;
           const mine = r.holder === b.name;
@@ -801,10 +881,10 @@ export function ResourcePanel({ name, d }: { name: string; d: UiData }) {
             </Box>
           );
         })}
-      </Section>
+      </FieldGroup>
 
       {evictions.length > 0 && (
-        <Section label="handoffs" count={evictions.length}
+        <FieldGroup label="handoffs" count={evictions.length}
                  note="a backend cleared off this card so another could use it">
           {evictions.map((e) => (
             <Box key={`${e.t}:${e.backend}`} sx={{ py: 0.3, pl: `${GUTTER}px`, fontFamily: MONO, fontSize: 11, color: "text.secondary" }}>
@@ -812,69 +892,27 @@ export function ResourcePanel({ name, d }: { name: string; d: UiData }) {
               {e.backend} → {e.for}
             </Box>
           ))}
-        </Section>
+        </FieldGroup>
       )}
     </>
   );
 }
 
 /** Nothing selected: the vitals, and what to click. */
-function Overview({ d }: { d: UiData }) {
+function Overview({ d, ctx }: { d: UiData; ctx: Ctx }) {
   const self = d.net.nodes.find((n) => n.self);
-  const peers = d.net.nodes.filter((n) => !n.self);
-  const resources = d.net.resources ?? [];
-  const arbitrated = resources.filter((r) => !r.shared);
-  const running = d.q.jobs.filter((j) => j.state === "running" && !j.offbox).length;
-  const queued = Object.values(d.q.capacity.queued).reduce((a, b) => a + b, 0);
-  const stat = (label: string, value: React.ReactNode, hot?: boolean) => (
-    <Box key={label} sx={{
-      p: 1.25, borderRadius: 2, border: "1px solid", borderColor: "line", bgcolor: "background.default",
-    }}>
-      <Typography sx={{ fontFamily: MONO, fontSize: 17, fontWeight: 600, color: hot ? "warning.main" : "text.primary" }}>
-        {value}
-      </Typography>
-      <Typography sx={{ fontSize: 9.5, letterSpacing: ".05em", textTransform: "uppercase", color: "faint" }}>
-        {label}
-      </Typography>
-    </Box>
-  );
   return (
     <>
-      <Head>{self?.name ?? "this node"}</Head>
-      <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, mb: 2 }}>
-        {stat("running", running, running > 0)}
-        {stat("queued", queued, queued > 0)}
-        {/* Only hardware that is actually arbitrated. A shared resource can never
-            have a holder, so counting it here would grow the denominator and
-            report a box as less busy the more CPU sidecars it declares. */}
-        {arbitrated.length > 0 && stat("cards busy", `${arbitrated.filter((r) => r.holder).length}/${arbitrated.length}`,
-          arbitrated.some((r) => r.holder))}
-        {stat("warm", d.net.readyNow.length)}
-        {peers.length > 0 && stat("peers", `${peers.filter((n) => n.up).length}/${peers.length}`,
-          peers.some((n) => !n.up))}
-        {d.q.capacity.offbox ? stat("off-box", d.q.capacity.offbox, true) : null}
+      <PanelTitle>{self?.name ?? "this node"}</PanelTitle>
+      <Box sx={{ mb: 2 }}>
+        <Vitals d={d} size="sm" columns="1fr 1fr" />
       </Box>
-      <Typography sx={{ fontSize: 11, color: "faint", lineHeight: 1.7, mb: 1.5 }}>
-        <Box component="span" sx={{ color: "success.main" }}>Green</Box> is work hearth
-        scheduled: it took a slot and waited its turn.{" "}
-        <Box component="span" sx={{ color: "warning.main" }}>Amber</Box> is work hearth is only
-        forwarding — image generation arrives on a path it passes straight through, so it runs
-        without a slot and the card arbiter cannot see it. Busy either way; managed only when green.{" "}
-        <Box component="span" sx={{ color: "cold.main" }}>Violet</Box> is weights not on the card.
-        Breathing, it is a model being read in — tens of seconds for a large one, and nothing else
-        can have the card until it lands. Steady, it is a model whose weights did not FIT: part of
-        it is assigned to the host and computed on the CPU, so every token pays for it, not just
-        the first. Where that part actually comes from depends on whether the model fits in host
-        RAM; one that does not is read off the disk on every generation. A trade rather than a
-        fault — it is what lets a model too big for the card run at all — but worth knowing which
-        of your models is paying it.
-      </Typography>
       <Typography sx={{ fontSize: 11, color: "faint", lineHeight: 1.7 }}>
         Click anything above to act on it. The self node holds the federation switches
         and any unsaved runtime changes; a peer holds its model links; a backend holds
         its models and what it is loaded with; a card says who is standing on it.
       </Typography>
-      <Pending d={d} ctx={{ canWarm: false, control: "off", refresh: () => {} }} />
+      <Pending d={d} ctx={ctx} />
     </>
   );
 }
@@ -958,17 +996,20 @@ export function Inspector({ d, sel, ctx, onSelect }: {
     : peer ? <PeerPanel n={peer} d={d} ctx={ctx} />
     : backend ? <BackendPanel b={backend} d={d} ctx={ctx} />
     : card ? <ResourcePanel name={card.name} d={d} />
-    : <Overview d={d} />;
+    : <Overview d={d} ctx={ctx} />;
 
   return (
     <Box sx={{
-      borderLeft: { md: "1px solid" }, borderTop: { xs: "1px solid", md: "none" },
+      borderLeft: { lg: "1px solid" }, borderTop: { xs: "1px solid", lg: "none" },
       borderColor: "line",
       bgcolor: "background.paper",
       p: 2, overflowY: "auto", minWidth: 0,
     }}>
       <PanelHeadFor d={d} sel={sel} onBack={() => onSelect(null)} />
       {body}
+      <Box sx={{ mt: 2.5, pt: 1.5, borderTop: "1px solid", borderColor: "divider" }}>
+        <Legend />
+      </Box>
       {!ctx.canWarm && (
         <Typography sx={{ mt: 2.5, fontSize: 10.5, color: "faint", lineHeight: 1.6 }}>
           Read-only here — this port serves the status page only. Controls live on the

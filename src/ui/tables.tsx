@@ -27,7 +27,7 @@ import { LoadAction, ShareToggle, type Ctx } from "./inspect.js";
 import { ctxLabel, displayId, since } from "./lib.js";
 import { MONO } from "./theme.js";
 import type { Backend, Node, UiData } from "./types.js";
-import { waitReason } from "./why.js";
+import { callStats, waitReason } from "./why.js";
 
 /** Now, once a second, so "waited" counts up between polls. */
 function useNow(): number {
@@ -379,6 +379,7 @@ export function ModelsTable({ d, ctx, onSelect }: { d: UiData; ctx: Ctx; onSelec
 export function History({ d }: { d: UiData }) {
   const self = d.net.nodes.find((n) => n.self);
   const [numbers, setNumbers] = useState(false);
+  const stats = callStats(d.calls);
   // Which models sit on a backend that actually evicts. Everything else cannot
   // thrash by construction.
   const thrashy = useMemo(() => {
@@ -389,6 +390,37 @@ export function History({ d }: { d: UiData }) {
 
   return (
     <Box>
+      {/* What the window actually cost, before any of the charts. These are the
+          numbers a visit is usually for, and every one of them is arithmetic
+          over `calls`, which the page already has. */}
+      {stats.n > 0 && (
+        <Row align="baseline" spacing={2} wrap sx={{ mb: 2, rowGap: 0.5, fontFamily: MONO, fontSize: 11.5 }}>
+          <Box component="span" sx={{ color: "text.secondary" }}>
+            <Box component="b" sx={{ color: "text.primary" }}>{stats.n}</Box> call{stats.n === 1 ? "" : "s"}
+          </Box>
+          <Tooltip title="run time once the request had a slot, not counting the queue">
+            <Box component="span" sx={{ color: "text.secondary", cursor: "help" }}>
+              median <Box component="b" sx={{ color: "text.primary" }}>{since(stats.medianMs ?? 0)}</Box>
+              {" · p95 "}<Box component="b" sx={{ color: "text.primary" }}>{since(stats.p95Ms ?? 0)}</Box>
+            </Box>
+          </Tooltip>
+          {stats.maxWaitMs > 0 && (
+            <Tooltip title="the longest anything sat in a queue before it started — the scheduler's doing, kept apart from run time because they call for different answers">
+              <Box component="span" sx={{ color: "text.secondary", cursor: "help" }}>
+                worst wait <Box component="b" sx={{ color: "warning.main" }}>{since(stats.maxWaitMs)}</Box>
+              </Box>
+            </Tooltip>
+          )}
+          <Tooltip title={stats.failed
+            ? "requests that ended in an error. The lanes below draw them in red at the moment they failed."
+            : "every request in the window completed"}>
+            <Box component="span" sx={{ cursor: "help", color: stats.failed ? "error.main" : "faint" }}>
+              <Dot color={stats.failed ? "error.main" : "success.main"} />
+              {stats.failed ? `${stats.failed} failed` : "none failed"}
+            </Box>
+          </Tooltip>
+        </Row>
+      )}
       <Box sx={{ mb: 2.5 }}>
         <Typography sx={{ fontSize: 11.5, mb: 0.75 }}>Jobs waiting for the local backend</Typography>
         <Depth hist={d.hist} aliases={d.aliases} available={d.net.available} />

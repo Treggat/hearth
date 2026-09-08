@@ -1,14 +1,15 @@
 /**
- * Why a job is waiting, and who is standing on the hardware it needs.
+ * Derivations over the payload that are worth checking without a browser.
  *
  * Its own file, and not part of lib.ts, for one reason: lib.ts touches fetch,
- * window and localStorage, so it only typechecks with the DOM lib. This is
- * pure derivation over the payload and nothing else, which means a node test
- * can import it and assert the ordering directly — and the ordering is the
- * part worth asserting, since getting it wrong reports somebody else's GPU as
- * this backend being busy.
+ * window and localStorage, so it only typechecks with the DOM lib. Everything
+ * here is pure and nothing else, which means a node test can import it and
+ * assert the answers directly — and the answers are the part worth asserting,
+ * since getting the wait order wrong reports somebody else's GPU as this
+ * backend being busy, and getting the percentile wrong reports a healthy box
+ * as a slow one.
  */
-import type { Backend, Job, Resource } from "./types.js";
+import type { Backend, Call, Job, Resource } from "./types.js";
 
 /**
  * The hardware this backend needs that somebody ELSE is standing on.
@@ -62,4 +63,43 @@ export function waitReason(j: Job, b: Backend | undefined, resources: Resource[]
     }
   }
   return { tone: "lane", text: j.position ? `${j.position} ahead in ${j.lane}` : `${j.lane} lane` };
+}
+
+/**
+ * The window's calls as the four numbers worth a line of the page.
+ *
+ * `calls` already carries every finished request, and per-request hover is the
+ * wrong place to keep the only answer to "is this box slow, and is anything
+ * failing" — a failure rate nobody can see until they open two disclosures is
+ * a failure rate nobody sees.
+ *
+ * Nearest-rank percentiles over the run time alone. Queue wait is the
+ * scheduler's doing and is reported beside it rather than folded in, because
+ * they call for different responses: a slow p95 is a model or a card, and a
+ * long wait is a queue.
+ */
+export interface CallStats {
+  n: number;
+  failed: number;
+  /** Run time, milliseconds. Null when there is nothing to take a median of. */
+  medianMs: number | null;
+  p95Ms: number | null;
+  /** The worst queue wait in the window, which is what "the queue was bad" means. */
+  maxWaitMs: number;
+}
+
+export function callStats(calls: Call[] | undefined): CallStats {
+  const n = calls?.length ?? 0;
+  if (!calls || n === 0) return { n: 0, failed: 0, medianMs: null, p95Ms: null, maxWaitMs: 0 };
+  const ran = calls.map((c) => c.ms).sort((a, b) => a - b);
+  // Nearest-rank, so a single call is its own p95 rather than an interpolation
+  // between it and nothing.
+  const at = (q: number): number => ran[Math.min(ran.length - 1, Math.ceil(q * ran.length) - 1)]!;
+  return {
+    n,
+    failed: calls.filter((c) => !c.ok).length,
+    medianMs: at(0.5),
+    p95Ms: at(0.95),
+    maxWaitMs: Math.max(0, ...calls.map((c) => c.waitedMs)),
+  };
 }

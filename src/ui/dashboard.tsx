@@ -18,7 +18,7 @@ import Container from "@mui/material/Container";
 import Typography from "@mui/material/Typography";
 import type { ReactNode } from "react";
 
-import { Dot, Row, Section, Spacer, StatTile, Tag } from "./bits.js";
+import { Identity, Legend, Row, Section, Spacer, Vitals } from "./bits.js";
 import {
   BackendPanel, PanelHeadFor, PeerPanel, ResourcePanel, SelfPanel, type Ctx,
 } from "./inspect.js";
@@ -45,13 +45,6 @@ export default function Dashboard({ d, ctx, dead, live, menu }: {
   const peers = (d?.net.nodes ?? []).filter((n) => !n.self);
   const resources = d?.net.resources ?? [];
   const backends = self?.backends ?? [];
-  const running = d ? d.q.jobs.filter((j) => j.state === "running" && !j.offbox).length : 0;
-  const queued = d ? Object.values(d.q.capacity.queued).reduce((a, b) => a + b, 0) : 0;
-  // Only hardware that is actually arbitrated. A shared resource can never have
-  // a holder, so counting it would grow the denominator and report the box as
-  // less busy the more CPU sidecars it declares.
-  const arbitrated = resources.filter((r) => !r.shared);
-  const cardsBusy = arbitrated.filter((r) => r.holder).length;
 
   return (
     <Container maxWidth={false} sx={{ maxWidth: 960, py: 3, pb: 8, bgcolor: "background.default", minHeight: "100dvh" }}>
@@ -63,13 +56,7 @@ export default function Dashboard({ d, ctx, dead, live, menu }: {
       }}>
         <Row spacing={1.5} align="center" wrap sx={{ mb: d ? 1.75 : 0 }}>
           {menu}
-          <Typography component="span" sx={{ fontSize: 16, fontWeight: 700, letterSpacing: "-.01em" }}>
-            hea<Box component="span" sx={{ color: "success.main" }}>r</Box>th
-          </Typography>
-          <Tag>{dead ? "unreachable" : self?.name ?? "—"}</Tag>
-          <Typography component="span" sx={{ fontFamily: MONO, fontSize: 10.5, color: dead ? "error.main" : "faint" }}>
-            <Dot color={dead ? "error.main" : "success.main"} />{dead ? "no answer from /ui/data" : "live"}
-          </Typography>
+          <Identity name={self?.name} dead={dead} live={live} />
           <Spacer />
           {d?.q.capacity.resident && (
             <Typography component="span" sx={{ fontFamily: MONO, fontSize: 11, color: "text.secondary" }}>
@@ -77,30 +64,13 @@ export default function Dashboard({ d, ctx, dead, live, menu }: {
             </Typography>
           )}
         </Row>
-        {d && (
-          <Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 1 }}>
-            {resources.length > 0 && (
-              <StatTile label="cards busy" value={`${cardsBusy}/${arbitrated.length}`} hot={cardsBusy > 0}
-                        title="hardware with a backend running on it right now" />
-            )}
-            <StatTile label="running" value={running} hot={running > 0} title="jobs in flight on this box" />
-            <StatTile label="queued" value={queued} hot={queued > 0}
-                      title="jobs admitted to a queue and not started — the Queue table says why each waits" />
-            {d.q.capacity.offbox ? (
-              <StatTile label="off-box" value={d.q.capacity.offbox} title="our jobs currently running on a peer" />
-            ) : null}
-            <StatTile label="warm" value={d.net.readyNow.length}
-                      title="models loaded somewhere reachable — here or on a peer" />
-            {peers.length > 0 && (
-              <StatTile label="peers" value={`${peers.filter((n) => n.up).length}/${peers.length}`}
-                        hot={peers.some((n) => !n.up)} title="peers answering their /peer/state probe" />
-            )}
-          </Box>
-        )}
+        {d && <Vitals d={d} columns="repeat(auto-fit, minmax(120px, 1fr))" />}
       </Box>
 
       {!d ? (
-        <Typography sx={{ color: "faint", mt: 4 }}>{dead ? "no answer from /ui/data" : "loading…"}</Typography>
+        <Typography sx={{ color: "faint", mt: 4 }}>
+          {dead ? `no answer from ${live ? "/ui/events" : "/ui/data"}` : "loading…"}
+        </Typography>
       ) : (
         <>
           {/* Hardware first: it decides whether anything below it can run. Each
@@ -165,7 +135,11 @@ export default function Dashboard({ d, ctx, dead, live, menu }: {
         </>
       )}
 
-      <Typography sx={{ mt: 4, pt: 1.5, borderTop: "1px solid", borderColor: "line", color: "faint", fontSize: 11.5 }}>
+      <Box sx={{ mt: 4, pt: 1.5, borderTop: "1px solid", borderColor: "line" }}>
+        <Legend />
+      </Box>
+
+      <Typography sx={{ mt: 1.5, color: "faint", fontSize: 11.5 }}>
         {live ? "Pushed from " : "Polls "}
         <Box component="code" sx={{ fontFamily: MONO, fontSize: 11 }}>{live ? "/ui/events" : "/ui/data"}</Box>
         {live ? " as it changes." : " every 3s."} The same

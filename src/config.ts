@@ -437,16 +437,34 @@ export interface HearthConfig {
   peerPollMs: number;
   peerStaleMs: number;
   /**
-   * How long to wait for a peer to start answering, in ms. 0 waits forever,
-   * which is the right call for a local backend: a cold load is slow, but it's
-   * your machine and it will finish.
+   * How long to wait for a peer to start answering, in ms. 0 waits forever.
    *
-   * Peers are different. One can accept a connection and then never answer, and
-   * you can't walk over and look. With fallbackLocal on, this deadline is what
-   * turns that into a retry at home instead of a hang. Set it above their worst
-   * honest cold load or you'll bounce work home for nothing.
+   * A peer can accept a connection and then never answer, and you can't walk
+   * over and look. With fallbackLocal on, this deadline is what turns that into
+   * a retry at home instead of a hang. Set it above their worst honest cold
+   * load or you'll bounce work home for nothing.
    */
   peerFirstByteMs: number;
+  /**
+   * The same deadline for a LOCAL backend, in ms. 0 waits forever.
+   *
+   * Longer than the peer's, because the trade is different rather than absent.
+   * A local cold load is slow and it is your machine, so the deadline exists
+   * only to catch the case where the backend is not going to answer at all: a
+   * process wedged on a GPU fault, or a port that accepts and then drops. Those
+   * do not fail the connection, so nothing else ever unblocks them.
+   *
+   * It matters more here than for a peer. A request to a peer holds no slot; a
+   * request to a local backend holds one for as long as it runs, so a single
+   * hung call takes the backend's whole queue with it — and if that backend
+   * declared `resources`, the card stays held and every backend sharing it
+   * stops too. The only recovery is a restart.
+   *
+   * A client hanging up releases the slot as well, but that is the client's
+   * timeout doing the work, and one without a timeout of its own waits as long
+   * as we do.
+   */
+  backendFirstByteMs: number;
   /**
    * How long a shutdown waits for requests already in flight, in ms. 0 kills
    * them immediately, which is what this did before it was a number.
@@ -1185,6 +1203,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     // Same family. A negative here quietly disabled the deadline, which looks
     // like working peer failover right up until a peer hangs.
     peerFirstByteMs: atLeast(root.peerFirstByteMs, "peerFirstByteMs", 180_000),
+    backendFirstByteMs: atLeast(root.backendFirstByteMs, "backendFirstByteMs", 900_000),
     coldPenalty: atLeast(root.coldPenalty, "coldPenalty", 2),
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.

@@ -414,3 +414,112 @@ assert.throws(
   }),
   /kind must be gpu, cpu or other/,
 );
+
+// --- a busy backend must not starve the one beside it ----------------------
+//
+// A backend lets go of its hardware every time it goes idle between its own
+// jobs, and the arbiter wakes every waiter at once. Take the card back on the
+// releasing scheduler's own wake-up and a backend under sustained load holds it
+// forever: its neighbour is woken, finds it taken again, and waits — for as
+// long as there is work, which under saturation is always.
+//
+// The bound is a turn. Keep the card while there is work to do, so weights stay
+// put and a queue drains at full speed, and yield once the turn is up and
+// somebody has actually been waiting.
+{
+  const order: string[] = [];
+  /** Feed A continuously; B asks once, early, and then just waits. */
+  const race = async (maxHoldMs: number): Promise<string[]> => {
+    order.length = 0;
+    const arbiter = new ResourceArbiter({ maxHoldMs });
+    const A = new Scheduler({ lanes, concurrency: 1, resources: ["gpu0"], arbiter });
+    const B = new Scheduler({ lanes, concurrency: 1, resources: ["gpu0"], arbiter });
+    const job = (s: Scheduler, who: string) =>
+      s.submit({ lane: "chat", model: "m", caller: who }, async () => {
+        await new Promise((r) => setTimeout(r, 4));
+        order.push(who);
+      });
+    const all = [job(A, "A"), job(B, "B")];
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 3));
+      all.push(job(A, "A"));
+    }
+    await Promise.all(all);
+    return [...order];
+  };
+
+  // A turn short enough to expire under this load: B gets in part way through.
+  const bounded = await race(15);
+  const at = bounded.indexOf("B");
+  assert.ok(at >= 0, "B must run at all");
+  assert.ok(
+    at < bounded.length - 1,
+    `a saturated neighbour must not hold the card until it runs dry (B ran last of ${bounded.length})`,
+  );
+
+  // A turn nothing reaches: the card is never taken away, which is the other
+  // half of the policy. Handing it over per job would cost a cold load each
+  // time — the tax the queue exists to avoid, moved up a level.
+  const sticky = await race(60_000);
+  assert.equal(sticky.indexOf("B"), sticky.length - 1,
+    "with no expiry, A keeps its weights and drains its queue first");
+}
+
+// --- every job of a turn waits for the eviction, not just the first --------
+//
+// Clearing the neighbours off a card belongs to TAKING the card, not to the one
+// job that happened to trigger it. Gate only that job and a backend with room
+// for two dispatches the second straight past the eviction and onto hardware
+// that has not been cleared — which is the exact over-commit `resources` is for.
+{
+  const seen: string[] = [];
+  const arbiter = new ResourceArbiter();
+  const s = new Scheduler({
+    lanes, concurrency: 2, resources: ["gpu0"], arbiter,
+    evict: async () => {
+      seen.push("evict:start");
+      await new Promise((r) => setTimeout(r, 15));
+      seen.push("evict:done");
+    },
+  });
+  const job = () => s.submit({ lane: "chat", model: "m", caller: "t" }, async () => {
+    seen.push("ran");
+    await new Promise((r) => setTimeout(r, 2));
+  });
+  await Promise.all([job(), job()]);
+  assert.deepEqual(seen, ["evict:start", "evict:done", "ran", "ran"],
+    "nothing may reach the backend while the card is still being cleared");
+}
+
+// --- an eviction that fails must not leave us holding the card -------------
+//
+// The hardware was never actually freed, so continuing to act as its owner
+// would put the next job on a card somebody else's weights are still on. The
+// jobs that were waiting on it fail (they never reached the backend) and the
+// hold goes back, so the next attempt re-evicts rather than inheriting a lie.
+{
+  const arbiter = new ResourceArbiter();
+  let attempts = 0;
+  const s = new Scheduler({
+    lanes, concurrency: 1, resources: ["gpu0"], arbiter,
+    evict: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("unload refused");
+    },
+  });
+  await assert.rejects(
+    s.submit({ lane: "chat", model: "m", caller: "t" }, async () => {}),
+    /unload refused/,
+    "a job must fail rather than run on hardware that was not cleared",
+  );
+  await tick();
+  assert.equal(arbiter.available(["gpu0"], {}), true,
+    "and the card goes back, so a neighbour is not blocked by our failure");
+
+  // The next attempt is a fresh turn: it evicts again rather than assuming the
+  // card is still ours from the attempt that failed.
+  let ran = false;
+  await s.submit({ lane: "chat", model: "m", caller: "t" }, async () => { ran = true; });
+  assert.equal(attempts, 2, "the next turn tries the eviction again");
+  assert.equal(ran, true);
+}

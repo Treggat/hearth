@@ -89,6 +89,7 @@ Every key with its default. Only `backend.url` is required.
 | `peerDownMs` | `30000` | how long a failed probe is remembered, so an outage doesn't make every local request pay the timeout |
 | `peerPollMs` / `peerStaleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
 | `peerFirstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
+| `backendFirstByteMs` | `900000` | the same for a local backend. Catches one that accepts the connection and then never answers, which would otherwise hold its slot — and its card — until a restart. `0` waits forever |
 | `coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
 | `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them, which is what it used to do |
 | `peers` | `[]` | nodes you can send work to |
@@ -453,13 +454,29 @@ better off elsewhere. What it adds is that a backend can *wait* for another —
 the one thing "each is its own admission domain" gets wrong when two domains
 are one card.
 
-A backend holds its resources while it has any job running, not per job — its
-`concurrency` already says how much work it may run at once. Before the first
-job goes, hearth unloads any llama-swap backend that overlaps, because winning
-the arbitration only means nobody else is *running* there: a neighbour that
-finished a minute ago still has weights resident, and on a card sized for one
-model that is the same as occupied. Eviction is expensive, so it is logged
-(`pool.evict`) and only happens on the idle-to-busy edge.
+A backend holds its resources while it has work — not per job, and not only
+while something is running. Its `concurrency` already says how much may run at
+once, and dropping the card in the gaps between its own jobs would mean paying
+the handover again for work that was already its.
+
+Before the first job of a turn goes, hearth unloads any llama-swap backend that
+overlaps, because winning the arbitration only means nobody else is *running*
+there: a neighbour that finished a minute ago still has weights resident, and on
+a card sized for one model that is the same as occupied. Every job admitted
+during that turn waits for the eviction, not just the one that triggered it.
+Eviction is expensive, so it is logged (`pool.evict`), happens once per turn,
+and the whole sequence is bounded — a neighbour that will not answer an unload
+does not get to hold the card hostage.
+
+A turn ends when the backend runs out of work, or after 30 seconds if another
+backend has been waiting. Both halves matter. Handing the card over per job
+would be perfectly fair and cost a cold load every time — the load tax the queue
+exists to avoid, moved up a level. Never handing it over starves the neighbour:
+a backend under sustained load would keep the card indefinitely, because it
+releases and re-takes it faster than anyone else can be woken. So a holder keeps
+its weights while it is busy, and yields once it has had its turn and somebody
+is actually waiting. Nothing is ever taken from a backend nobody is competing
+with.
 
 #### Hardware that is not a card
 

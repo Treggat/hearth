@@ -4,7 +4,8 @@
  * These lived in App.tsx while the page was one file. They moved out when the
  * hardware section arrived and needed the same three of them, which is the only
  * reason this file exists — it is not a component library and should not grow
- * into one. Anything used in exactly one place belongs beside that place.
+ * into one. Anything used in exactly one place belongs beside that place;
+ * anything both views draw belongs here, in one copy, so they cannot disagree.
  */
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -15,6 +16,7 @@ import { type SxProps, type Theme } from "@mui/material/styles";
 import { useState } from "react";
 
 import { MONO } from "./theme.js";
+import type { UiData } from "./types.js";
 
 /**
  * A horizontal Stack with the two system props this page uses.
@@ -192,18 +194,26 @@ export function Section({ title, note, right, children, card }: {
  * StatTile replaced Vital (a bare bold number) with a labelled box so each
  * vital is legible on its own, not just by position in a list.
  */
-export function StatTile({ label, value, hot, title }: {
+export function StatTile({ label, value, hot, title, size = "lg" }: {
   label: string;
-  value: React.ReactNode;
+  /**
+   * A string or a number, not any node: this is also the tile's accessible
+   * name, and a tile that reads its own explanation instead of its value is
+   * the one thing it must not do.
+   */
+  value: string | number;
   hot?: boolean;
   title: string;
+  /** "sm" for the rail, which has 340px for two columns of these. */
+  size?: "sm" | "lg";
 }) {
   return (
     <Tooltip title={title}>
       <Box component="span"
+           aria-label={`${label}: ${value}`}
            sx={{
              display: "inline-flex", flexDirection: "column",
-             px: 1.5, py: 0.75,
+             px: size === "sm" ? 1.25 : 1.5, py: 0.75,
              border: "1px solid", borderColor: hot ? "warning.main" : "divider",
              borderRadius: 3,
              background: "background.default",
@@ -211,19 +221,144 @@ export function StatTile({ label, value, hot, title }: {
            }}>
         <Box component="span"
               sx={{
-                fontFamily: MONO, fontSize: 20, fontWeight: 700, lineHeight: 1.1,
+                fontFamily: MONO, fontSize: size === "sm" ? 17 : 20, fontWeight: 700, lineHeight: 1.1,
                 color: hot ? "warning.main" : "text.primary",
               }}>
           {value}
         </Box>
         <Box component="span"
              sx={{
-               fontFamily: MONO, fontSize: 10, color: "faint",
+               fontFamily: MONO, fontSize: size === "sm" ? 9.5 : 10, color: "faint",
                textTransform: "uppercase", letterSpacing: ".03em",
              }}>
           {label}
         </Box>
       </Box>
     </Tooltip>
+  );
+}
+
+/**
+ * The vitals, in one derivation and one set of tiles.
+ *
+ * The same six numbers answer "is this box busy" in the rail and at the top of
+ * the dashboard. Both read them from here, so a tooltip written once is
+ * available in both, and neither can quietly start counting a shared card as a
+ * busy one.
+ */
+export function Vitals({ d, size = "lg", columns }: {
+  d: UiData;
+  size?: "sm" | "lg";
+  /** A CSS grid template. The rail has room for two columns; the band tiles. */
+  columns: string;
+}) {
+  const peers = d.net.nodes.filter((n) => !n.self);
+  // Only hardware that is actually arbitrated. A shared resource can never have
+  // a holder, so counting it would grow the denominator and report the box as
+  // less busy the more CPU sidecars it declares.
+  const arbitrated = (d.net.resources ?? []).filter((r) => !r.shared);
+  const cardsBusy = arbitrated.filter((r) => r.holder).length;
+  const running = d.q.jobs.filter((j) => j.state === "running" && !j.offbox).length;
+  const queued = Object.values(d.q.capacity.queued).reduce((a, b) => a + b, 0);
+
+  return (
+    <Box sx={{ display: "grid", gridTemplateColumns: columns, gap: 1 }}>
+      {arbitrated.length > 0 && (
+        <StatTile size={size} label="cards busy" value={`${cardsBusy}/${arbitrated.length}`}
+                  hot={cardsBusy > 0} title="hardware with a backend running on it right now" />
+      )}
+      <StatTile size={size} label="running" value={running} hot={running > 0}
+                title="jobs in flight on this box" />
+      <StatTile size={size} label="queued" value={queued} hot={queued > 0}
+                title="jobs admitted to a queue and not started — the Queue table says why each waits" />
+      {d.q.capacity.offbox ? (
+        <StatTile size={size} label="off-box" value={d.q.capacity.offbox}
+                  title="our jobs currently running on a peer" />
+      ) : null}
+      <StatTile size={size} label="warm" value={d.net.readyNow.length}
+                title="models loaded somewhere reachable — here or on a peer" />
+      {peers.length > 0 && (
+        <StatTile size={size} label="peers" value={`${peers.filter((n) => n.up).length}/${peers.length}`}
+                  hot={peers.some((n) => !n.up)} title="peers answering their /peer/state probe" />
+      )}
+    </Box>
+  );
+}
+
+/**
+ * What the colours mean, wherever the colours are.
+ *
+ * A key is only a key while it is on screen. This sits at the foot of the rail
+ * and of the dashboard rather than in one panel's empty state, so the page can
+ * always answer what a violet node or an amber edge is claiming. The words are
+ * the glance; the tooltips carry the rest.
+ */
+export function Legend() {
+  const items: [string, string, string][] = [
+    ["success.main", "scheduled",
+     "Work hearth admitted: it took a slot, waited its turn, and the card arbiter can see it."],
+    ["warning.main", "forwarded",
+     "Work hearth passes straight through without scheduling — image generation arrives on a path it forwards verbatim. It holds no slot, waits for nothing, and the card arbiter cannot see it. Busy either way; managed only when green."],
+    ["cold.main", "off-card",
+     "Weights that are not on the card. Breathing, it is a model being read in: tens of seconds for a large one, and nothing else can have the card until it lands. Steady, it is a model whose weights did not FIT — part of it is assigned to the host and computed on the CPU, so every token pays for it, not just the first. Whether that part is served from RAM or read off the disk depends on whether the model fits in host RAM. A trade rather than a fault: it is what lets a model too big for the card run at all."],
+    ["error.main", "not answering",
+     "A peer or a watched backend that has gone quiet on a connection that should be talking."],
+  ];
+  return (
+    <Row spacing={1.5} align="center" wrap sx={{ rowGap: 0.5 }}>
+      {items.map(([color, word, title]) => (
+        <Tooltip key={word} title={title}>
+          <Box component="span" sx={{ fontSize: 10.5, color: "faint", cursor: "help", whiteSpace: "nowrap" }}>
+            <Dot color={color} />{word}
+          </Box>
+        </Tooltip>
+      ))}
+    </Row>
+  );
+}
+
+/**
+ * Who this is and whether the page is still hearing from it.
+ *
+ * Both views open with the same three things — the wordmark, the node's name
+ * and the state of the connection — so they are one component and cannot drift
+ * apart by a font size.
+ *
+ * The name survives a bad connection. Losing contact is a fact about the
+ * socket, not about which box you are looking at, and replacing the name with
+ * "unreachable" takes away the one label that says whose console this is at
+ * exactly the moment somebody is checking. The dot and the word carry the
+ * state; the transport names itself, since a stream that dropped and a poll
+ * that 404s want different things done about them.
+ */
+export function Identity({ name, dead, live, size = "lg" }: {
+  name: string | undefined;
+  dead: boolean;
+  /** On the pushed stream rather than the poll. */
+  live: boolean;
+  size?: "sm" | "lg";
+}) {
+  const source = live ? "/ui/events" : "/ui/data";
+  return (
+    <>
+      <Typography component="span"
+                  sx={{ fontSize: size === "sm" ? 15 : 16, fontWeight: 700, letterSpacing: "-.01em" }}>
+        hea<Box component="span" sx={{ color: "success.main" }}>r</Box>th
+      </Typography>
+      <Tag>{name ?? "—"}</Tag>
+      <Tooltip title={dead
+        ? `Nothing is coming back from ${source}. The page is showing the last thing it heard.`
+        : live
+          ? "Changes are pushed as they happen; an idle box sends nothing at all."
+          : "Polled every 3s, because the event stream did not connect here."}>
+        <Typography component="span" sx={{
+          fontFamily: MONO, fontSize: 10.5, cursor: "help",
+          color: dead ? "error.main" : "faint",
+        }}>
+          <Dot color={dead ? "error.main" : "success.main"} />
+          {dead ? `no answer from ${source}` : live ? "live" : "polling"}
+        </Typography>
+      </Tooltip>
+    </>
   );
 }

@@ -197,6 +197,37 @@ const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   await assert.rejects(send("ftp://example.invalid/x"), /unsupported url/);
 }
 
+// --- a buffered body is bounded -------------------------------------------
+//
+// `text()` is the one place a reply whose size we never agreed on is held in
+// memory. Peer control-plane calls have a deadline but no byte limit, so a peer
+// answering /peer/state with a firehose was bounded only by how much it could
+// push before the clock ran out.
+{
+  const flood = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    // Far more than the cap, written until the socket goes away.
+    const chunk = Buffer.alloc(1 << 16, 0x61);
+    let open = true;
+    res.on("close", () => { open = false; });
+    const pump = (): void => {
+      while (open && res.write(chunk)) { /* until backpressure */ }
+      if (open) res.once("drain", pump);
+    };
+    pump();
+  });
+  await new Promise<void>((r) => flood.listen(0, "127.0.0.1", () => r()));
+  const url = `http://127.0.0.1:${(flood.address() as AddressInfo).port}/`;
+
+  const res = await send(url);
+  const body = await res.text();
+  assert.ok(body.length <= (1 << 20) + (1 << 16),
+    `a buffered body must stop at the cap, got ${body.length} bytes`);
+
+  flood.closeAllConnections();
+  flood.close();
+}
+
 // closeAllConnections, not just close: /hang left a socket open on purpose and
 // close() alone waits for it forever.
 server.closeAllConnections();
