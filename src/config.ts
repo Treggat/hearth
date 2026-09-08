@@ -378,6 +378,11 @@ export interface HearthConfig {
   /** Keys allowed on the OpenAI surface. Empty means no auth, which only makes
    *  sense on loopback. Setting it also means loopback needs a key. */
   apiKeys: string[];
+  /** Operator-chosen names for the keys above, index-aligned with `apiKeys`; an
+   *  empty string means that key has no label. A labeled key is logged and shown
+   *  as `key:<label>` instead of the sha256 prefix, so the console can say `dsh`
+   *  rather than `key:ff2f1c4e`. A label is not a secret and never hashed. */
+  apiKeyLabels: string[];
   /** Tokens peers present to us, by peer name. Kept separate from apiKeys so
    *  peer traffic is attributable and can be capped on its own. */
   peerTokens: Record<string, string>;
@@ -699,6 +704,69 @@ function strList(v: unknown, where: string): string[] {
 }
 
 /**
+ * `apiKeys:` entries, as a bare secret string or `{ key, label }`.
+ *
+ * The bare form is the entire history of this field and is untouched. The
+ * object form only attaches an operator-chosen name, so the log and the console
+ * can read `key:dsh` instead of `key:<hash>`. The label is not a secret — it is
+ * the operator's own word for a caller — so, unlike the key, it is never taken
+ * through `env:` and never hashed. It is also visible wherever caller ids are,
+ * the off-loopback status port included, which is the reason it is opt-in per
+ * key: name only the callers you are content to see named there.
+ */
+function apiKeyList(v: unknown, where: string): { keys: string[]; labels: string[] } {
+  if (v === undefined) return { keys: [], labels: [] };
+  if (!Array.isArray(v)) throw new ConfigError(`${where} must be a list`);
+  const keys: string[] = [];
+  const labels: string[] = [];
+  // Both refuse a duplicate, and neither message ever names the secret.
+  const seenKey = new Map<string, number>();
+  const seenLabel = new Map<string, number>();
+  const take = (key: string, label: string, at: string): void => {
+    // The first match wins in localCaller, so a repeated secret makes every
+    // later entry unreachable — including its label, which would then be a name
+    // the operator sees in the config and never in a log.
+    const dupKey = seenKey.get(key);
+    if (dupKey !== undefined) {
+      throw new ConfigError(
+        `${at}.key repeats ${where}[${dupKey}] -- the first match wins, so this entry can never be the one that authenticates`,
+      );
+    }
+    seenKey.set(key, keys.length);
+    if (label !== "") {
+      // Two keys under one name are one caller: the id is what maxPerCaller
+      // counts against, so they would share a single budget (2 by default once
+      // apiKeys is set) rather than getting one each. Silently merging two
+      // callers is not something to discover from a queue that fills early.
+      const dupLabel = seenLabel.get(label);
+      if (dupLabel !== undefined) {
+        throw new ConfigError(
+          `${at}.label "${label}" is already used by ${where}[${dupLabel}] -- two keys under one name share one caller identity, and with it one maxPerCaller budget`,
+        );
+      }
+      seenLabel.set(label, keys.length);
+    }
+    keys.push(key);
+    labels.push(label);
+  };
+  v.forEach((raw, i) => {
+    const at = `${where}[${i}]`;
+    if (typeof raw === "string") {
+      take(resolveSecret(raw, at), "", at);
+      return;
+    }
+    const entry = asRecord(raw, at);
+    const key = resolveSecret(str(entry.key, `${at}.key`), `${at}.key`);
+    // A blank label is a typo, not "no label" — the string form is how you say
+    // no label — so it is refused rather than silently falling back to the hash.
+    const label = str(entry.label, `${at}.label`).trim();
+    if (label === "") throw new ConfigError(`${at}.label must not be empty`);
+    take(key, label, at);
+  });
+  return { keys, labels };
+}
+
+/**
  * `routes:` entries, as a bare path or an object.
  *
  * The bare form is the common case — one endpoint that does the work — and it
@@ -1004,9 +1072,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     };
   }
 
-  const apiKeys = strList(root.apiKeys, "apiKeys").map((k, i) =>
-    resolveSecret(k, `apiKeys[${i}]`),
-  );
+  const { keys: apiKeys, labels: apiKeyLabels } = apiKeyList(root.apiKeys, "apiKeys");
 
   const peerTokensRaw = asRecord(root.peerTokens ?? {}, "peerTokens");
   const peerTokens: Record<string, string> = {};
@@ -1082,6 +1148,7 @@ export function parseConfig(raw: unknown): HearthConfig {
       maxPerCaller: num(sched.maxPerCaller, "scheduler.maxPerCaller", apiKeys.length > 0 ? 2 : 0),
     },
     apiKeys,
+    apiKeyLabels,
     peerTokens,
     share: strList(root.share, "share"),
     peerRateLimit: count(root.peerRateLimit, "peerRateLimit", 600, 1),

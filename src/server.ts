@@ -305,10 +305,16 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       return LOOPBACK.has(req.socket.remoteAddress ?? "") ? "local" : null;
     }
     if (given === "") return null;
-    // Hash prefix, not the key's own first characters. This id lands in every
-    // request log line and in /queue, and six characters of a live credential
-    // sitting in a log file is six an attacker doesn't have to guess.
-    for (const k of cfg.apiKeys) if (secretEq(given, k)) return "key:" + keyId(k);
+    // A labeled key shows the operator's own name; an unlabeled one keeps the
+    // hash prefix, not the key's own first characters. This id lands in every
+    // request log line and in /queue, and a label is never key material, while
+    // six characters of a live credential is six an attacker doesn't have to
+    // guess — so the fallback stays the hash, never the key.
+    let i = 0;
+    for (const k of cfg.apiKeys) {
+      if (secretEq(given, k)) return "key:" + (cfg.apiKeyLabels[i] || keyId(k));
+      i++;
+    }
     return null;
   }
 
