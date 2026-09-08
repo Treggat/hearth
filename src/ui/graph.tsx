@@ -38,8 +38,8 @@ import { backendIcon, resourceIcon, TypeIcon, type IconKind } from "./icons.js";
 import { MONO } from "./theme.js";
 import { displayId } from "./lib.js";
 import { blockers } from "./why.js";
-import { CELL, GAP, grid, H, MIN_GAP, MIN_STAGE, PAD, STACK, tiers } from "./layout.js";
-import type { Backend, Call, Job, Node, Resource, UiData } from "./types.js";
+import { glyphFor, layout, MIN_STAGE, orderBackends, type Placed } from "./layout.js";
+import type { Call, Job, Resource, UiData } from "./types.js";
 
 /** What the inspector is currently showing. Null is the overview. */
 /** The synthetic card that stands for "not the card".
@@ -58,251 +58,6 @@ export type Sel =
   | null;
 
 /* ----------------------------------------------------------------- layout */
-
-interface Placed {
-  id: string;
-  kind: "self" | "peer" | "backend" | "resource";
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-interface Edge {
-  id: string;
-  from: string;
-  to: string;
-  /** Sibling links leave sideways; parent links leave downwards. */
-  dir: "across" | "down";
-  d: string;
-  /** Where a count sits, and the only point on the path we need in JS. */
-  mid: { x: number; y: number };
-}
-
-interface Scene {
-  nodes: Map<string, Placed>;
-  edges: Edge[];
-  width: number;
-  height: number;
-}
-
-/**
- * The mark's size for a node of this width. Shared, not duplicated.
- *
- * The layout needs it because edges must stop where the node LOOKS like it
- * starts, and NodeBox needs it to draw the thing. Two copies of this drifting
- * apart is edges that end near a node instead of at it.
- */
-export const glyphFor = (w: number): number =>
-  Math.round(Math.max(26, Math.min(36, w * 0.26)));
-
-/**
- * How far inside its own box a node's visible content begins.
- *
- * The box is the click target and it is taller than what it draws: the mark and
- * the text are centred in it, and since the border and fill are gone at rest
- * there is nothing at the boundary to see. An edge drawn to the boundary
- * therefore stops in empty space a good fifteen pixels short of the node, which
- * is exactly what it looks like — six lines converging on nothing above the CPU.
- */
-const inset = (p: Placed): number => Math.max(0, (p.h - glyphFor(p.w)) / 2);
-
-/** B(0.5) of a cubic, which is where a label on it belongs. */
-const midOf = (p0: number, p1: number, p2: number, p3: number): number =>
-  (p0 + 3 * p1 + 3 * p2 + p3) / 8;
-
-/**
- * A cubic with its control points pushed out along the direction of travel.
- *
- * `lift` bows the curve off the straight line between two nodes, which is what
- * lets one pair carry two edges: out and back are different facts about a peer
- * — whether you are leaning on them or they on you — and drawn on one line they
- * are indistinguishable.
- */
-function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
-  d: string; mid: { x: number; y: number };
-} {
-  if (dir === "across") {
-    // Right-to-left when the target is left of the source, so the return leg
-    // starts at the peer and a particle on it travels the way the work does.
-    const back = b.x < a.x;
-    const x1 = back ? a.x : a.x + a.w, y1 = a.y + a.h / 2 + lift * 0.5;
-    const x2 = back ? b.x + b.w : b.x, y2 = b.y + b.h / 2 + lift * 0.5;
-    const k = Math.max(28, Math.abs(x2 - x1) * 0.42) * (back ? -1 : 1);
-    const c1y = y1 + lift, c2y = y2 + lift;
-    return {
-      d: `M ${x1} ${y1} C ${x1 + k} ${c1y} ${x2 - k} ${c2y} ${x2} ${y2}`,
-      mid: { x: midOf(x1, x1 + k, x2 - k, x2), y: midOf(y1, c1y, c2y, y2) },
-    };
-  }
-  // Inset the TARGET only, and this asymmetry is the point. A backend's content
-  // fills its box top to bottom — name, state, sparkline — so a line leaving the
-  // bottom edge leaves the node. A card's content is a mark and two short lines
-  // centred in a taller box, so a line arriving at the top edge stops in empty
-  // space above it. Insetting both ends made edges sprout from the middle of the
-  // backends instead.
-  const x1 = a.x + a.w / 2, y1 = a.y + a.h;
-  const x2 = b.x + b.w / 2, y2 = b.y + inset(b);
-  const k = Math.max(20, (y2 - y1) * 0.55);
-  return {
-    d: `M ${x1} ${y1} C ${x1} ${y1 + k} ${x2} ${y2 - k} ${x2} ${y2}`,
-    mid: { x: midOf(x1, x1, x2, x2), y: midOf(y1, y1 + k, y2 - k, y2) },
-  };
-}
-
-/**
- * Place everything for a given stage width.
- *
- * Deterministic: same payload and same width give the same picture every poll.
- * That is not an aesthetic preference — a node that moves between polls cannot
- * be clicked, and a particle mid-flight would jump.
- */
-function layout(width: number, height: number, peers: Node[],
-                backends: Backend[], resources: Resource[]): Scene {
-  const nodes = new Map<string, Placed>();
-  const inner = width - PAD * 2;
-
-  // How many rows of backends the height can take before the tiers themselves
-  // have nowhere to go. Wrapping trades height for width, and this is the
-  // budget: past it, a wrapped row would push the cards off the stage.
-  const budget = height - PAD * 2 - H.self - H.resource - MIN_GAP * 2 + STACK;
-  const maxRows = Math.max(1, Math.min(4, Math.floor(budget / (H.backend + STACK))));
-  const bPlan = grid(inner, backends.length, CELL.backend, maxRows);
-  const rPlan = grid(inner, resources.length, CELL.resource, 2);
-  const Y = tiers(height, Math.max(1, bPlan.sizes.length), Math.max(1, rPlan.sizes.length));
-
-  // Tier 0. Self anchors the left; peers fill from the right so the gap between
-  // them is the visual span of the link, and one peer sits opposite us.
-  const selfW = Math.min(240, Math.max(190, inner * 0.24));
-  nodes.set("self", { id: "self", kind: "self", x: PAD, y: Y.self, w: selfW, h: H.self });
-  if (peers.length) {
-    // What is left after self has taken its side. Without this a fourth peer
-    // pushed the row off the left edge and drew ON TOP of us, which reads as a
-    // peer that IS us — the one thing this row exists to distinguish.
-    const room = inner - selfW - GAP;
-    const pw = Math.max(
-      100,
-      Math.min(CELL.peer.max, Math.max(CELL.peer.min, (room - (peers.length - 1) * GAP) / peers.length)),
-    );
-    const span = Math.min(room, peers.length * pw + (peers.length - 1) * GAP);
-    const step = peers.length > 1 ? (span - pw) / (peers.length - 1) : 0;
-    const start = PAD + inner - span;
-    peers.forEach((p, i) => nodes.set(`peer:${p.name}`, {
-      id: `peer:${p.name}`, kind: "peer", x: start + i * step, y: Y.self, w: pw, h: H.peer,
-    }));
-  }
-
-  // Tier 1. Backends, over as many rows as it takes to keep a name readable.
-  {
-    let i = 0;
-    bPlan.sizes.forEach((count, row) => {
-      const span = count * bPlan.w + (count - 1) * GAP;
-      const start = PAD + Math.max(0, (inner - span) / 2);
-      for (let c = 0; c < count; c++, i++) {
-        const b = backends[i];
-        if (!b) return;
-        nodes.set(`backend:${b.name}`, {
-          id: `backend:${b.name}`, kind: "backend",
-          x: start + c * (bPlan.w + GAP),
-          y: Y.backends + row * (H.backend + STACK),
-          w: bPlan.w, h: H.backend,
-        });
-      }
-    });
-  }
-
-  // Tier 2. A card sits under the backends that declare it, then siblings are
-  // pushed apart — two cards drawn on top of each other is worse than two cards
-  // slightly away from the backends they belong to, because the edges still say
-  // which is which. Cards wrap on the same rule as backends; the packing then
-  // runs per row, so a card is only pushed off its own backends by a card it
-  // actually shares the row with.
-  {
-    const rw = rPlan.w;
-    const wanted = resources.map((r) => {
-      const members = r.backends
-        .map((b) => nodes.get(`backend:${b}`))
-        .filter((p): p is Placed => !!p);
-      const mid = members.length
-        ? members.reduce((s, p) => s + p.x + p.w / 2, 0) / members.length
-        : PAD + inner / 2;
-      return { r, x: mid - rw / 2 };
-    }).sort((a, b) => a.x - b.x);
-
-    let i = 0;
-    rPlan.sizes.forEach((count, row) => {
-      // Pack in order at the position each card wants...
-      const placed: { r: Resource; x: number }[] = [];
-      let cursor = PAD;
-      for (let c = 0; c < count; c++, i++) {
-        const w = wanted[i];
-        if (!w) break;
-        const x = Math.max(cursor, Math.min(w.x, PAD + inner - rw));
-        placed.push({ r: w.r, x });
-        cursor = x + rw + GAP;
-      }
-      // ...then stretch the row to the full width, keeping the order and the
-      // spacing's proportions. Cards follow the backends above them, and those
-      // cluster: six sidecars sharing one CPU drag it to their average, which
-      // put every card in the left third and left half the stage empty. The
-      // edges are what say which card belongs to which backend — position only
-      // has to agree with them about the ORDER.
-      if (placed.length > 1) {
-        const first = placed[0]!.x;
-        const last = placed[placed.length - 1]!.x;
-        const used = last - first;
-        const room = inner - rw;
-        if (used > 0 && used < room) {
-          const scale = room / used;
-          for (const p of placed) p.x = PAD + (p.x - first) * scale;
-        }
-      } else if (placed.length === 1) {
-        placed[0]!.x = PAD + (inner - rw) / 2;
-      }
-      for (const p of placed) {
-        nodes.set(`resource:${p.r.name}`, {
-          id: `resource:${p.r.name}`, kind: "resource",
-          x: p.x, y: Y.resources + row * (H.resource + STACK), w: rw, h: H.resource,
-        });
-      }
-    });
-  }
-
-  const edges: Edge[] = [];
-  const push = (from: string, to: string, dir: "across" | "down", lift = 0) => {
-    const a = nodes.get(from), b = nodes.get(to);
-    if (!a || !b) return;
-    const { d, mid } = curve(a, b, dir, lift);
-    edges.push({ id: `${from}>${to}`, from, to, dir, d, mid });
-  };
-  // Two arcs per peer, bowed opposite ways: what we send them, and what they
-  // send us. They are separate facts and one line cannot hold both.
-  for (const p of peers) {
-    push("self", `peer:${p.name}`, "across", -14);
-    push(`peer:${p.name}`, "self", "across", 14);
-  }
-  for (const b of backends) push("self", `backend:${b.name}`, "down");
-  for (const r of resources) {
-    // The host's line is drawn to the CARD, not to the backend. A backend
-    // "using" the host is a fact about a process; a model split across a
-    // card and the host is a fact about the hardware, and it is the second
-    // one that explains the speed — the two halves exchange on every token.
-    // The chain still reads end to end: backend, its card, and the other half.
-    if (r.host) continue;
-    for (const b of r.backends) push(`backend:${b}`, `resource:${r.name}`, "down");
-  }
-  const host = resources.find((r) => r.host);
-  if (host) {
-    for (const card of host.host!.cards) {
-      push(`resource:${card}`, `resource:${host.name}`, "across");
-    }
-  }
-
-  // Fill the stage when the content is shorter than it, so there is no strip of
-  // dead page under the cards; grow past it only when even the tight layout
-  // does not fit, which is the one case worth a scrollbar.
-  return { nodes, edges, width, height: Math.max(height, Y.needed) };
-}
 
 /* --------------------------------------------------------------- traffic */
 
@@ -613,7 +368,11 @@ export function Graph({ d, sel, onSelect }: {
   const resources = hostNode ? [...declared, hostNode] : declared;
 
   const scene = useMemo(
-    () => layout(box.w, box.h, peers, backends, resources),
+    // Ordered by the hardware they use rather than by the order they were
+    // declared in, so the wires down to the cards do not have to cross each
+    // other. Only the LAYOUT is reordered — every node is drawn by name from
+    // the scene, so nothing else on the page cares.
+    () => layout(box.w, box.h, peers, orderBackends(backends, resources), resources),
     // The identity of these arrays changes every poll; their SHAPE is what the
     // layout depends on, and re-running it on unchanged shape would recompute
     // the same numbers three times a second for nothing.

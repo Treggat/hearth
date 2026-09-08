@@ -16,7 +16,10 @@
  */
 import assert from "node:assert/strict";
 
-import { CELL, GAP, grid, H, MIN_GAP, PAD, STACK, tiers } from "../src/ui/layout.js";
+import {
+  CELL, countCrossings, GAP, grid, H, layout, MIN_GAP, orderBackends, PAD, STACK, tiers,
+} from "../src/ui/layout.js";
+import type { Backend, Resource } from "../src/ui/types.js";
 
 /** The width a row of `count` cells actually occupies. */
 const span = (count: number, w: number) => count * w + (count - 1) * GAP;
@@ -106,3 +109,78 @@ for (const height of [640, 795, 900, 1100, 1400]) {
 }
 
 console.log("layout.test.ts ok");
+
+// --- wires that do not cross each other ------------------------------------
+//
+// The tiers are a layered graph, so how tangled the picture is comes down to
+// one thing: the order of the backends. That used to be the order they appear
+// in the config file, which knows nothing about which card each one uses — so a
+// config grouped by purpose drew a dozen crossings, and every wire had to be
+// traced rather than followed.
+//
+// Two halves, and both are needed. Ordering puts backends that share a card
+// beside each other; filling the wrapped rows DOWN each column keeps them
+// beside each other once there is more than one row, instead of wrapping the
+// run back to the left edge with its card left behind on the right.
+{
+  const mk = (spec: [string, string[]][]) => {
+    const backends: Backend[] = spec.map(([name, resources]) => ({ name, resources }));
+    const names = [...new Set(spec.flatMap(([, rs]) => rs))].sort();
+    const resources: Resource[] = names.map((name) => ({
+      name,
+      kind: name === "cpu" ? ("cpu" as const) : ("gpu" as const),
+      holder: null,
+      backends: spec.filter(([, rs]) => rs.includes(name)).map(([n]) => n),
+    }));
+    return { backends, resources };
+  };
+
+  // web's own shape: two cards and a shared cpu with six sidecars on it.
+  const real = mk([
+    ["swap", ["b70"]], ["swap-image", ["b60"]], ["video", ["b60"]],
+    ["guard", ["cpu"]], ["judge", ["cpu"]], ["expander", ["cpu"]],
+    ["embed", ["cpu"]], ["classifier", ["cpu"]], ["tts", ["cpu"]],
+  ]);
+
+  // Declared interleaved, which is what grouping a config by purpose looks
+  // like, plus one backend spanning two cards.
+  const interleaved = mk([
+    ["guard", ["cpu"]], ["swap", ["b70"]], ["judge", ["cpu"]], ["swap-image", ["b60"]],
+    ["embed", ["cpu"]], ["video", ["b60"]], ["tts", ["cpu"]], ["deep", ["b60", "b70"]],
+    ["classifier", ["cpu"]],
+  ]);
+
+  for (const [label, { backends, resources }] of [["real", real], ["interleaved", interleaved]] as const) {
+    for (const [w, h] of [[1900, 1150], [1500, 900], [1200, 900], [900, 800]] as const) {
+      const scene = layout(w, h, [], orderBackends(backends, resources), resources);
+      assert.equal(countCrossings(scene), 0,
+        `${label} at ${w}x${h} should draw no crossed wires`);
+    }
+  }
+
+  // The ordering is what does it, not the fill alone: the interleaved config
+  // still crosses if the backends are left in the order they were declared.
+  const asDeclared = layout(1500, 900, [], interleaved.backends, interleaved.resources);
+  assert.ok(countCrossings(asDeclared) > 0,
+    "the fixture must actually be tangled without ordering, or it proves nothing");
+
+  // A backend spanning two cards belongs BETWEEN them, which is what the
+  // average of its cards means and the reason it is an average at all.
+  const order = orderBackends(interleaved.backends, interleaved.resources).map((b) => b.name);
+  assert.ok(order.indexOf("deep") > order.indexOf("swap-image")
+            && order.indexOf("deep") < order.indexOf("swap"),
+    `a backend on b60+b70 sits between them (got ${order.join(" ")})`);
+
+  // Backends with no hardware draw no wire, so they sort out of the way rather
+  // than splitting a run of backends that do.
+  const withBare = mk([["a", ["b60"]], ["b", ["b70"]]]);
+  withBare.backends.splice(1, 0, { name: "bare" });
+  const bareOrder = orderBackends(withBare.backends, withBare.resources).map((b) => b.name);
+  assert.equal(bareOrder[bareOrder.length - 1], "bare",
+    "a backend that competes for nothing goes last, not through the middle");
+
+  // Stable: the same payload gives the same picture every poll, or a node moves
+  // out from under the pointer between refreshes.
+  const twice = orderBackends(real.backends, real.resources).map((b) => b.name);
+  assert.deepEqual(orderBackends(real.backends, real.resources).map((b) => b.name), twice);
+}
