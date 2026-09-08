@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 
 import {
   CELL, countCrossings, countNodeHits, GAP, grid, H, layout, MIN_GAP, orderBackends,
-  PAD, STACK, tiers,
+  PAD, polyLength, STACK, stitch, tiers,
 } from "../src/ui/layout.js";
 import type { Backend, Node, Resource } from "../src/ui/types.js";
 
@@ -265,4 +265,41 @@ console.log("layout.test.ts ok");
   // out from under the pointer between refreshes.
   const twice = orderBackends(real.backends, real.resources).map((b) => b.name);
   assert.deepEqual(orderBackends(real.backends, real.resources).map((b) => b.name), twice);
+}
+
+// --- one dot, the whole journey --------------------------------------------
+//
+// A request does not stop when it reaches the backend; that is where it starts
+// costing something, and the card under it is busy for as long as it runs. The
+// dot rides both legs as one path, so the legs have to join into a single shape
+// rather than a set of subpaths — `M` on the second leg would make offsetPath
+// jump rather than carry on.
+{
+  const { backends, resources } = (() => {
+    const spec: [string, string[]][] = [["swap", ["b70"]], ["side", ["cpu"]]];
+    return {
+      backends: spec.map(([name, rs]) => ({ name, resources: rs })) as Backend[],
+      resources: ["b70", "cpu"].map((name) => ({
+        name, kind: name === "cpu" ? ("cpu" as const) : ("gpu" as const),
+        holder: null, backends: spec.filter(([, rs]) => rs.includes(name)).map(([n]) => n),
+      })) as Resource[],
+    };
+  })();
+
+  const scene = layout(1400, 900, [], orderBackends(backends, resources), resources);
+  const first = scene.edges.find((e) => e.id === "self>backend:swap")!;
+  const second = scene.edges.find((e) => e.id === "backend:swap>resource:b70")!;
+  const { d, len } = stitch([first, second]);
+
+  assert.equal((d.match(/M/g) ?? []).length, 1,
+    "a stitched run opens once; a second M would break it into subpaths");
+  assert.ok(d.startsWith("M"), "and it opens at the beginning");
+  assert.ok(len > polyLength(first.poly) && len > polyLength(second.poly),
+    "the length covers both legs, which is what paces the dot");
+  assert.equal(Math.round(len),
+    Math.round(polyLength(first.poly) + polyLength(second.poly)));
+
+  // One leg on its own is untouched — a backend that competes for nothing has
+  // no card to carry on to.
+  assert.equal(stitch([first]).d, first.d);
 }

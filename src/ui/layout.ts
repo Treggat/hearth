@@ -720,3 +720,35 @@ function polyHitsBox(poly: Pt[], p: Placed): boolean {
   }
   return false;
 }
+
+/** How long the drawn shape is, for pacing anything that travels along it. */
+export function polyLength(poly: Pt[]): number {
+  let n = 0;
+  for (let i = 0; i + 1 < poly.length; i++) {
+    n += Math.hypot(poly[i + 1]!.x - poly[i]!.x, poly[i + 1]!.y - poly[i]!.y);
+  }
+  return n;
+}
+
+/**
+ * Several legs of a journey as ONE path, so a single dot can ride the lot.
+ *
+ * A request does not stop when it reaches the backend — that is where it starts
+ * costing something, and the card underneath is busy for as long as it runs. So
+ * the legs are joined rather than animated separately: two dots on two edges
+ * read as two requests, and one dot that carries on reads as what happened.
+ *
+ * The legs do not meet. A wire into a backend stops at the top of its mark and
+ * the wire out leaves from the bottom or the side, so the join is a straight
+ * run through the node — which is the right picture, the dot passing behind the
+ * thing that is handling it.
+ */
+export function stitch(edges: Edge[]): { d: string; len: number } {
+  return {
+    // Only the first leg may open the path. `L` on the rest keeps it one shape
+    // rather than a set of disconnected subpaths, which is what `M` would make
+    // and what offsetPath would then jump between.
+    d: edges.map((e, i) => (i === 0 ? e.d : e.d.replace(/^M/, "L"))).join(" "),
+    len: edges.reduce((a, e) => a + polyLength(e.poly), 0),
+  };
+}

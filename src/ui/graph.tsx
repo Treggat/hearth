@@ -38,7 +38,9 @@ import { backendIcon, resourceIcon, TypeIcon, type IconKind } from "./icons.js";
 import { MONO } from "./theme.js";
 import { displayId } from "./lib.js";
 import { blockers } from "./why.js";
-import { glyphFor, layout, MIN_STAGE, orderBackends, type Placed } from "./layout.js";
+import {
+  glyphFor, layout, MIN_STAGE, orderBackends, polyLength, stitch, type Placed,
+} from "./layout.js";
 import type { Call, Job, Resource, UiData } from "./types.js";
 
 /** What the inspector is currently showing. Null is the overview. */
@@ -83,10 +85,26 @@ function edgesOf(j: Job, peerNames: Set<string>): string[] {
   return out;
 }
 
+/**
+ * How long a dot takes to cover a path, at one speed everywhere.
+ *
+ * A fixed duration per edge made the dot's SPEED a function of how long the
+ * edge happened to be, so the same request looked hurried on a short hop and
+ * becalmed on a long one — and once a journey is stitched out of two legs, a
+ * fixed duration would have it sprint the whole way rather than carry on at the
+ * pace it was going.
+ *
+ * Bounded at both ends: a very short hop still takes long enough to see, and a
+ * very long one does not become a crawl.
+ */
+const PX_PER_MS = 1 / 3;
+const pace = (len: number): number =>
+  Math.round(Math.min(4200, Math.max(1200, len / PX_PER_MS)));
+
 const laneColor = (lane: string): string =>
   lane === "chat" ? "success.main" : lane === "image" || lane === "edit" ? "warning.main" : "text.secondary";
 
-interface Spark { key: string; edge: string; color: string }
+interface Spark { key: string; backend: string; color: string }
 
 /**
  * One-shot sparks for requests that finished since the last poll.
@@ -114,7 +132,7 @@ function useSparks(calls: Call[] | undefined): Spark[] {
     // the same message: that backend is working.
     const add = fresh.slice(-6).map((c) => ({
       key: `${key(c)}:${Math.random().toString(36).slice(2, 7)}`,
-      edge: `self>backend:${c.backend}`,
+      backend: c.backend,
       color: c.ok ? "success.main" : "error.main",
     }));
     setSparks((s) => [...s, ...add]);
@@ -436,7 +454,17 @@ export function Graph({ d, sel, onSelect }: {
       }
     }
 
-    for (const sp of sparks) if (!m.has(sp.edge)) m.set(sp.edge, 0);
+    // A spark lights the whole run it travels, card leg included — the edge it
+    // is moving along must not be the one edge still drawn as idle.
+    for (const sp of sparks) {
+      const first = `self>backend:${sp.backend}`;
+      if (!m.has(first)) m.set(first, 0);
+      const b = backends.find((x) => x.name === sp.backend);
+      for (const r of b?.resources ?? []) {
+        const toCard = `backend:${sp.backend}>resource:${r}`;
+        if (!m.has(toCard)) m.set(toCard, 0);
+      }
+    }
     return { count: m, loose };
   }, [jobs, sparks, resources, backends, peerNames]);
 
@@ -454,7 +482,39 @@ export function Graph({ d, sel, onSelect }: {
   }, [hover, scene]);
   const dimmed = (id: string) => !!near && !near.has(id);
 
-  const path = (id: string) => scene.edges.find((e) => e.id === id)?.d;
+  /**
+   * The whole journey a request makes, as one path.
+   *
+   * A job on a local backend does not stop when it reaches the backend — that
+   * is where it starts costing something. It holds a slot, and it holds the
+   * card underneath. Drawing the dot only as far as the backend said the
+   * request arrived and then nothing, while the card below it sat lit with no
+   * traffic on it.
+   *
+   * So the legs are stitched into a single path and one dot rides the lot,
+   * disappearing behind the backend's own box on the way through. A backend
+   * spanning two cards gets one dot per card: they sit exactly on top of each
+   * other down the shared leg and separate where the work does.
+   */
+  /** One edge on its own, paced the same way. */
+  const one = (id: string): { d: string; ms: number }[] => {
+    const e = scene.edges.find((x) => x.id === id);
+    return e ? [{ d: e.d, ms: pace(polyLength(e.poly)) }] : [];
+  };
+
+
+  const runs = (backend: string): { d: string; ms: number }[] => {
+    const first = scene.edges.find((e) => e.id === `self>backend:${backend}`);
+    if (!first) return [];
+    const cards = scene.edges.filter(
+      (e) => e.from === `backend:${backend}` && e.to.startsWith("resource:"),
+    );
+    const legs = cards.length ? cards.map((c) => [first, c]) : [[first]];
+    return legs.map((set) => {
+      const joined = stitch(set);
+      return { d: joined.d, ms: pace(joined.len) };
+    });
+  };
   const queuedFor = (backend: string) =>
     d.q.jobs.filter((j) => j.state === "queued" && !j.offbox && j.backend === backend).length;
 
@@ -523,48 +583,60 @@ export function Graph({ d, sel, onSelect }: {
           {/* The moving half, in its own layer so a job that ends does not
               re-render every edge under it. */}
           <Box aria-hidden sx={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-            {jobs.map((j, i) => {
-              const p = path(edgeOf(j, peerNames) ?? "");
-              if (!p) return null;
-              return (
-                <Box key={j.id} sx={{
+            {jobs.flatMap((j, i) => {
+              // Off-box work runs on somebody else's hardware, so its dot ends
+              // at the peer: there is no card of ours under it to carry on to.
+              // Work we accepted FROM a peer travels twice over, and honestly
+              // so: it came in over the return leg, and it is running down here
+              // on our own card.
+              const legs = j.offbox
+                ? one(edgeOf(j, peerNames) ?? "")
+                : [
+                    ...(peerNames.has(j.caller) ? one(`peer:${j.caller}>self`) : []),
+                    ...(j.backend ? runs(j.backend) : []),
+                  ];
+              return legs.map((leg, k) => (
+                <Box key={`${j.id}:${k}`} sx={{
                   position: "absolute", width: 7, height: 7, borderRadius: "50%",
                   bgcolor: laneColor(j.lane),
                   boxShadow: "0 0 6px currentColor", color: laneColor(j.lane),
-                  offsetPath: `path("${p}")`, offsetRotate: "0deg",
+                  offsetPath: `path("${leg.d}")`, offsetRotate: "0deg",
                   // Staggered so two jobs on one edge read as two things, not
                   // one brighter thing.
-                  animation: `hearth-flow 1800ms linear infinite ${i * -260}ms`,
+                  animation: `hearth-flow ${leg.ms}ms linear infinite ${i * -260}ms`,
                 }} />
-              );
+              ));
             })}
-            {backends.flatMap((b) => (b.proxying ?? []).map((x, i) => {
-              const p = path(`self>backend:${b.name}`);
-              if (!p) return null;
-              return (
-                <Box key={x.id} sx={{
+            {backends.flatMap((b) => (b.proxying ?? []).flatMap((x, i) =>
+              // Forwarded work reaches the card as surely as scheduled work
+              // does — the whole point of drawing it is that the GPU is busy
+              // with something hearth is not managing.
+              runs(b.name).map((leg, k) => (
+                <Box key={`${x.id}:${k}`} sx={{
                   position: "absolute", width: 7, height: 7, borderRadius: "50%",
                   // Hollow, so an unqueued request is not mistaken for a job the
                   // scheduler is managing. It is moving and it is real; nothing
                   // is holding a slot for it.
                   bgcolor: "transparent", border: "1.5px solid", borderColor: "warning.main",
-                  offsetPath: `path("${p}")`, offsetRotate: "0deg",
-                  animation: `hearth-flow 1800ms linear infinite ${i * -300}ms`,
+                  offsetPath: `path("${leg.d}")`, offsetRotate: "0deg",
+                  animation: `hearth-flow ${leg.ms}ms linear infinite ${i * -300}ms`,
                 }} />
-              );
-            }))}
-            {sparks.map((s) => {
-              const p = path(s.edge);
-              if (!p) return null;
-              return (
-                <Box key={s.key} sx={{
+              )),
+            ))}
+            {sparks.flatMap((s) =>
+              // The same journey a running job makes, once, quickly. At a
+              // homelab's duty cycle most requests begin and end between two
+              // readings, so these are what the graph actually shows moving —
+              // stopping them at the backend hid the half that costs the card.
+              runs(s.backend).map((leg, k) => (
+                <Box key={`${s.key}:${k}`} sx={{
                   position: "absolute", width: 5, height: 5, borderRadius: "50%",
                   bgcolor: s.color, opacity: 0.85,
-                  offsetPath: `path("${p}")`, offsetRotate: "0deg",
-                  animation: "hearth-flow 1000ms cubic-bezier(.4,0,.5,1) 1 both",
+                  offsetPath: `path("${leg.d}")`, offsetRotate: "0deg",
+                  animation: `hearth-flow ${Math.round(leg.ms * 0.55)}ms cubic-bezier(.4,0,.5,1) 1 both`,
                 }} />
-              );
-            })}
+              )),
+            )}
           </Box>
 
           {/* Self */}
