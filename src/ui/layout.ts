@@ -171,8 +171,8 @@ export interface Edge {
   id: string;
   from: string;
   to: string;
-  /** The cubic's four control points, so the drawn shape can be measured. */
-  pts: Pt[];
+  /** The drawn shape, flattened, so it can be measured whatever it is. */
+  poly: Pt[];
   /** Sibling links leave sideways; parent links leave downwards. */
   dir: "across" | "down";
   d: string;
@@ -221,7 +221,7 @@ const midOf = (p0: number, p1: number, p2: number, p3: number): number =>
  * are indistinguishable.
  */
 function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
-  d: string; mid: { x: number; y: number }; pts: Pt[];
+  d: string; mid: { x: number; y: number }; poly: Pt[];
 } {
   if (dir === "across") {
     // Right-to-left when the target is left of the source, so the return leg
@@ -234,7 +234,7 @@ function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
     return {
       d: `M ${x1} ${y1} C ${x1 + k} ${c1y} ${x2 - k} ${c2y} ${x2} ${y2}`,
       mid: { x: midOf(x1, x1 + k, x2 - k, x2), y: midOf(y1, c1y, c2y, y2) },
-      pts: [{ x: x1, y: y1 }, { x: x1 + k, y: c1y }, { x: x2 - k, y: c2y }, { x: x2, y: y2 }],
+      poly: flatten([{ x: x1, y: y1 }, { x: x1 + k, y: c1y }, { x: x2 - k, y: c2y }, { x: x2, y: y2 }]),
     };
   }
   // Inset the TARGET only, and this asymmetry is the point. A backend's content
@@ -245,26 +245,78 @@ function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
   // backends instead.
   const x1 = a.x + a.w / 2, y1 = a.y + a.h;
   const x2 = b.x + b.w / 2, y2 = b.y + inset(b);
-  // A straight run, and it has to be straight.
-  //
-  // Wires into one card converge on one point, so straight ones cannot swap
-  // sides on the way there however the tier wraps — six sidecars on a shared
-  // CPU fan in cleanly whether they sit in one row or two. Any bow at all
-  // reintroduces crossings, and a bow that leaves VERTICALLY is the worst of
-  // them: the wire loiters above the backend in the row below, then sweeps
-  // across that backend's own wire to reach the card they share. Measured, not
-  // assumed — see countCrossings and test/layout.test.ts.
-  //
-  // Kept as a cubic rather than a line so the shape stays one type: the
-  // particles ride it with offsetPath and the flattening below reads it the
-  // same as the bowed peer arcs.
-  const dx = x2 - x1, dy = y2 - y1;
-  const c1x = x1 + dx / 3, c1y = y1 + dy / 3;
-  const c2x = x2 - dx / 3, c2y = y2 - dy / 3;
+  // The fan from self down to the backends. Every one of these leaves the SAME
+  // point, so no two can cross whatever shape they are — they keep the sweep.
+  // Wires down to a CARD converge instead of fanning, and those are routed as
+  // elbows by `wireTo` rather than drawn here.
+  const k = Math.max(20, (y2 - y1) * 0.55);
+  const c1x = x1, c1y = y1 + k;
+  const c2x = x2, c2y = y2 - k;
   return {
     d: `M ${x1} ${y1} C ${c1x} ${c1y} ${c2x} ${c2y} ${x2} ${y2}`,
     mid: { x: midOf(x1, c1x, c2x, x2), y: midOf(y1, c1y, c2y, y2) },
-    pts: [{ x: x1, y: y1 }, { x: c1x, y: c1y }, { x: c2x, y: c2y }, { x: x2, y: y2 }],
+    poly: flatten([{ x: x1, y: y1 }, { x: c1x, y: c1y }, { x: c2x, y: c2y }, { x: x2, y: y2 }]),
+  };
+}
+
+/**
+ * A backend's wire down to the card it uses, routed as an elbow.
+ *
+ * Down out of the backend, across a channel, down into the card — right angles
+ * with the corners rounded off, which is how wiring between two rows of things
+ * is normally drawn and the only shape here that reads as deliberate rather
+ * than as a line that happens to join two points.
+ *
+ * Every wire to one card shares that card's channel, so a group of sidecars on
+ * a shared CPU merges into one trunk and arrives together. That is the relation
+ * worth seeing, and it means the six of them occupy one line rather than six.
+ *
+ * Channels are ordered so nothing has to cross anything: a card further to the
+ * right gets a SHALLOWER channel, so its long horizontal run sits above the
+ * drops of every card to its left, and those drops turn down before they ever
+ * reach it. Verified with countCrossings rather than reasoned about and hoped
+ * for — see test/layout.test.ts.
+ */
+function elbow(a: Placed, card: Placed, channelY: number): {
+  d: string; mid: { x: number; y: number }; poly: Pt[];
+} {
+  const x1 = a.x + a.w / 2, y1 = a.y + a.h;
+  const x2 = card.x + card.w / 2, y2 = card.y + inset(card);
+
+  // Straight down when there is nothing to go around. An elbow with no sideways
+  // run is two corners drawn on top of each other.
+  if (Math.abs(x2 - x1) < 1) {
+    return {
+      d: `M ${x1} ${y1} L ${x2} ${y2}`,
+      mid: { x: x1, y: (y1 + y2) / 2 },
+      poly: [{ x: x1, y: y1 }, { x: x2, y: y2 }],
+    };
+  }
+
+  const dir = x2 > x1 ? 1 : -1;
+  // A stage short enough to squeeze the band flat would otherwise put the
+  // channel above the backend it leaves, and the wire would set off upwards.
+  const cy = Math.min(Math.max(channelY, y1 + 4), y2 - 4);
+  // Corners stay inside all three legs, so a short one rounds off rather than
+  // overshooting into the leg beside it.
+  const r = Math.max(2, Math.min(10, Math.abs(x2 - x1) / 2, channelY - y1, y2 - channelY));
+  const d = [
+    `M ${x1} ${y1}`,
+    `L ${x1} ${cy - r}`,
+    `Q ${x1} ${cy} ${x1 + dir * r} ${cy}`,
+    `L ${x2 - dir * r} ${cy}`,
+    `Q ${x2} ${cy} ${x2} ${cy + r}`,
+    `L ${x2} ${y2}`,
+  ].join(" ");
+  return {
+    d,
+    // On the horizontal run, which is the leg with room for a number on it.
+    mid: { x: (x1 + x2) / 2, y: cy },
+    poly: [
+      { x: x1, y: y1 }, { x: x1, y: cy - r },
+      { x: x1 + dir * r, y: cy }, { x: x2 - dir * r, y: cy },
+      { x: x2, y: cy + r }, { x: x2, y: y2 },
+    ],
   };
 }
 
@@ -404,8 +456,8 @@ export function layout(width: number, height: number, peers: Node[],
   const push = (from: string, to: string, dir: "across" | "down", lift = 0) => {
     const a = nodes.get(from), b = nodes.get(to);
     if (!a || !b) return;
-    const { d, mid, pts } = curve(a, b, dir, lift);
-    edges.push({ id: `${from}>${to}`, from, to, dir, d, mid, pts });
+    const { d, mid, poly } = curve(a, b, dir, lift);
+    edges.push({ id: `${from}>${to}`, from, to, dir, d, mid, poly });
   };
   // Two arcs per peer, bowed opposite ways: what we send them, and what they
   // send us. They are separate facts and one line cannot hold both.
@@ -414,14 +466,48 @@ export function layout(width: number, height: number, peers: Node[],
     push(`peer:${p.name}`, "self", "across", 14);
   }
   for (const b of backends) push("self", `backend:${b.name}`, "down");
-  for (const r of resources) {
-    // The host's line is drawn to the CARD, not to the backend. A backend
-    // "using" the host is a fact about a process; a model split across a
-    // card and the host is a fact about the hardware, and it is the second
-    // one that explains the speed — the two halves exchange on every token.
-    // The chain still reads end to end: backend, its card, and the other half.
-    if (r.host) continue;
-    for (const b of r.backends) push(`backend:${b}`, `resource:${r.name}`, "down");
+  // Backend -> card, as elbows sharing one channel per card.
+  //
+  // The host is skipped here and drawn from the CARD instead. A backend "using"
+  // the host is a fact about a process; a model split across a card and the
+  // host is a fact about the hardware, and it is the second one that explains
+  // the speed — the two halves exchange on every token. The chain still reads
+  // end to end: backend, its card, and the other half.
+  //
+  // Channels are allotted right to left: the rightmost card's run sits highest,
+  // just under the backends, and each card further left runs lower. A card's
+  // own drop then turns down BEFORE it reaches any channel belonging to a card
+  // to its right, and the drops of the cards to its left are further left than
+  // its run ever goes — so no leg meets another. Reversing this order tangles
+  // it, which is what the test pins.
+  {
+    const cards = resources
+      .filter((r) => !r.host)
+      .map((r) => ({ r, p: nodes.get(`resource:${r.name}`) }))
+      .filter((x): x is { r: Resource; p: Placed } => !!x.p)
+      .sort((m, n) => (n.p.x + n.p.w / 2) - (m.p.x + m.p.w / 2));
+
+    // The band between the two tiers, kept off both of them so a channel never
+    // runs through a node or along its edge.
+    const bRows = Math.max(1, bPlan.sizes.length);
+    const top = Y.backends + (bRows - 1) * (H.backend + STACK) + H.backend;
+    const bottom = Y.resources;
+    const band = Math.max(0, bottom - top);
+    cards.forEach(({ r, p }, i) => {
+      // Evenly through the middle of the band, so the outermost channels still
+      // have room to turn into and out of.
+      const at = (i + 1) / (cards.length + 1);
+      const channelY = top + band * (0.25 + 0.5 * at);
+      for (const b of r.backends) {
+        const a = nodes.get(`backend:${b}`);
+        if (!a) continue;
+        const { d, mid, poly } = elbow(a, p, channelY);
+        edges.push({
+          id: `backend:${b}>resource:${r.name}`,
+          from: `backend:${b}`, to: `resource:${r.name}`, dir: "down", d, mid, poly,
+        });
+      }
+    });
   }
   const host = resources.find((r) => r.host);
   if (host) {
@@ -439,7 +525,7 @@ export function layout(width: number, height: number, peers: Node[],
 /* -------------------------------------------------------- crossings */
 
 /** A cubic, flattened to a polyline. Enough segments that a bow is not a chord. */
-function flatten(pts: Pt[], steps = 32): Pt[] {
+export function flatten(pts: Pt[], steps = 32): Pt[] {
   const [p0, p1, p2, p3] = pts as [Pt, Pt, Pt, Pt];
   const out: Pt[] = [];
   for (let i = 0; i <= steps; i++) {
@@ -484,7 +570,7 @@ const MERGE = 40;
 export function countCrossings(scene: Scene): number {
   const wires = scene.edges
     .filter((e) => e.from.startsWith("backend:") && e.to.startsWith("resource:"))
-    .map((e) => ({ to: e.to, line: flatten(e.pts) }));
+    .map((e) => ({ to: e.to, line: e.poly }));
 
   let n = 0;
   for (let i = 0; i < wires.length; i++) {

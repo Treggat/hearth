@@ -180,6 +180,46 @@ console.log("layout.test.ts ok");
   }
   assert.ok(checked > 500, `the sweep must actually run (${checked} layouts)`);
 
+  // The shape itself, not just its outcome: right angles with rounded corners,
+  // and one shared channel per card so a group of sidecars arrives as one trunk
+  // rather than as six lines converging on a point.
+  {
+    const scene = layout(963, 620, [], orderBackends(real.backends, real.resources), real.resources);
+    const wires = scene.edges.filter((e) => e.from.startsWith("backend:")
+                                         && e.to.startsWith("resource:"));
+    assert.ok(wires.every((e) => e.d.includes(" Q ")),
+      "a backend's wire turns corners rather than sweeping");
+
+    const channels = new Map<string, Set<number>>();
+    for (const e of wires) {
+      if (!channels.has(e.to)) channels.set(e.to, new Set());
+      channels.get(e.to)!.add(Math.round(e.mid.y));
+    }
+    for (const [card, ys] of channels) {
+      assert.equal(ys.size, 1, `${card}'s wires must share one channel, got ${ys.size}`);
+    }
+
+    // Right to left: the rightmost card runs highest. Reversing this is what
+    // makes a card's drop cut through the run of the card beside it.
+    const byCard = [...channels].map(([card, ys]) => ({
+      x: scene.nodes.get(card)!.x, y: [...ys][0]!,
+    })).sort((a, b) => b.x - a.x);
+    for (let i = 1; i < byCard.length; i++) {
+      assert.ok(byCard[i]!.y > byCard[i - 1]!.y,
+        "a card further left must run in a lower channel than one to its right");
+    }
+
+    // The band belongs to the wires: no channel may run through a tier.
+    const rows = [...scene.nodes.values()].filter((n) => n.kind === "backend");
+    const lowestBackend = Math.max(...rows.map((n) => n.y + n.h));
+    const highestCard = Math.min(...[...scene.nodes.values()]
+      .filter((n) => n.kind === "resource").map((n) => n.y));
+    for (const e of wires) {
+      assert.ok(e.mid.y > lowestBackend && e.mid.y < highestCard,
+        `a channel at ${e.mid.y} must sit between the tiers, not across one`);
+    }
+  }
+
   // The ordering is what does it, not the fill alone: the interleaved config
   // still crosses if the backends are left in the order they were declared.
   const asDeclared = layout(1500, 900, [], interleaved.backends, interleaved.resources);
