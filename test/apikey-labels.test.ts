@@ -58,6 +58,18 @@ bad(`apiKeys: [{ key: k, label: "" }]`, /label must not be empty/,
   "a blank label is a typo, not a way to say no-label");
 bad(`apiKeys: [{ label: dsh }]`, /\.key is required/,
   "the object form still needs a key");
+// A caller id is an identity, not a decoration: maxPerCaller counts against it,
+// so two keys under one name quietly share a single budget. And a repeated
+// secret makes every later entry unreachable, label included — a name the
+// operator sees in the config and never in a log.
+bad(`apiKeys: [{ key: a, label: dsh }, { key: b, label: dsh }]`,
+  /label "dsh" is already used by apiKeys\[0\]/,
+  "two keys cannot share one name");
+bad(`apiKeys: [{ key: same, label: one }, { key: same, label: two }]`,
+  /key repeats apiKeys\[0\]/,
+  "a repeated secret makes the later entry unreachable");
+bad(`apiKeys: [same, same]`, /key repeats apiKeys\[0\]/,
+  "bare keys too — the first match wins there as well");
 
 /* ------------------------------------------- caller in the log */
 

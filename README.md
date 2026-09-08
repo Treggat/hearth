@@ -112,6 +112,12 @@ apiKeys:
   - { key: env:NOVA_KEY, label: nova }
 ```
 
+Two keys cannot share a label, and the same secret cannot appear twice: a
+caller id is an identity — `maxPerCaller` counts against it — so two keys under
+one name would quietly share a single budget, and a repeated secret makes every
+later entry unreachable because the first match wins. Both are refused at
+startup.
+
 The label is your word, not a secret, so it is never taken through `env:` and
 never hashed — and it appears wherever caller ids do, a widened `uiListen`
 port included. That is the one thing to weigh: name the keys you are content to

@@ -719,20 +719,49 @@ function apiKeyList(v: unknown, where: string): { keys: string[]; labels: string
   if (!Array.isArray(v)) throw new ConfigError(`${where} must be a list`);
   const keys: string[] = [];
   const labels: string[] = [];
+  // Both refuse a duplicate, and neither message ever names the secret.
+  const seenKey = new Map<string, number>();
+  const seenLabel = new Map<string, number>();
+  const take = (key: string, label: string, at: string): void => {
+    // The first match wins in localCaller, so a repeated secret makes every
+    // later entry unreachable — including its label, which would then be a name
+    // the operator sees in the config and never in a log.
+    const dupKey = seenKey.get(key);
+    if (dupKey !== undefined) {
+      throw new ConfigError(
+        `${at}.key repeats ${where}[${dupKey}] -- the first match wins, so this entry can never be the one that authenticates`,
+      );
+    }
+    seenKey.set(key, keys.length);
+    if (label !== "") {
+      // Two keys under one name are one caller: the id is what maxPerCaller
+      // counts against, so they would share a single budget (2 by default once
+      // apiKeys is set) rather than getting one each. Silently merging two
+      // callers is not something to discover from a queue that fills early.
+      const dupLabel = seenLabel.get(label);
+      if (dupLabel !== undefined) {
+        throw new ConfigError(
+          `${at}.label "${label}" is already used by ${where}[${dupLabel}] -- two keys under one name share one caller identity, and with it one maxPerCaller budget`,
+        );
+      }
+      seenLabel.set(label, keys.length);
+    }
+    keys.push(key);
+    labels.push(label);
+  };
   v.forEach((raw, i) => {
     const at = `${where}[${i}]`;
     if (typeof raw === "string") {
-      keys.push(resolveSecret(raw, at));
-      labels.push("");
+      take(resolveSecret(raw, at), "", at);
       return;
     }
     const entry = asRecord(raw, at);
-    keys.push(resolveSecret(str(entry.key, `${at}.key`), `${at}.key`));
+    const key = resolveSecret(str(entry.key, `${at}.key`), `${at}.key`);
     // A blank label is a typo, not "no label" — the string form is how you say
     // no label — so it is refused rather than silently falling back to the hash.
     const label = str(entry.label, `${at}.label`).trim();
     if (label === "") throw new ConfigError(`${at}.label must not be empty`);
-    labels.push(label);
+    take(key, label, at);
   });
   return { keys, labels };
 }
