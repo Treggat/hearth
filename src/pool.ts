@@ -314,8 +314,32 @@ export class BackendPool {
     const pinned = this.cfg.models[model]?.backend;
     if (pinned) {
       const slot = this.byName.get(pinned);
-      // Config validation already proved the name exists; this is belt and braces.
+      // Config validation already proved the name exists, and nothing removes a
+      // backend afterwards — `backends` is fixed for the life of the process,
+      // and the runtime edits in overrides.ts only ever touch `models`. So this
+      // cannot fire today. It is kept because the alternative to belt and
+      // braces here is a silent misroute, and warned-about is better than
+      // that whatever future makes it reachable.
       if (slot) return slot;
+      // Namespaced: `warned` is shared with the by-model warning below, and a
+      // backend and a model may perfectly well have the same name (a `guard`
+      // backend serving a `guard` model is the normal shape) — unprefixed, one
+      // would silence the other.
+      if (!this.warned.has(`pin:${pinned}`)) {
+        this.warned.add(`pin:${pinned}`);
+        this.log.warn("backend.pinned_missing", {
+          model,
+          pinned,
+          available: this.slots.map((s) => s.name),
+          // Deliberately does not promise where it went. The pin is ignored and
+          // the normal resolution runs: `serves`, then the catalogues, and only
+          // then the first backend. A pin naming a typo on a model its backend
+          // declares still lands in the right place, and telling the operator
+          // it fell through to the first backend would send them chasing a
+          // misroute that never happened.
+          hint: `ignoring the pin and resolving ${model} by catalogue — set models.${model}.backend to a real name`,
+        });
+      }
     }
 
     // Past the pin, every comparison is against the BACKEND's vocabulary. An

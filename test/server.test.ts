@@ -215,6 +215,25 @@ step("nodes up");
   assert.equal(mine.seen.length, before + 1);
   // Falling back means asking my backend for MY id, not theirs.
   assert.equal(mine.seen.at(-1)?.model, "big");
+
+  // And it is recorded as a use of the backend that actually ran it.
+  //
+  // `target: "local"` is what enrols a call in the history ring, and the
+  // fallback set it without ever passing `backend` — so every fallen-back
+  // request landed in the ring under an empty backend name, where the per-
+  // backend sparklines and failure rates could not see it. The ring is the
+  // only record of a request that starts and finishes between two 5s samples,
+  // which is most of them.
+  {
+    const d = (await (await fetch(`${myUrl}/ui/data`)).json()) as {
+      calls?: { model: string; backend: string; ok: boolean }[];
+    };
+    const last = (d.calls ?? []).at(-1);
+    assert.ok(last, "a fallback that ran locally is a local use, and is recorded");
+    assert.equal(last.model, "big");
+    assert.notEqual(last.backend, "", "recorded against a backend, not against nothing");
+    assert.equal(last.ok, true);
+  }
   theirs.setMode("ok");
 }
 
