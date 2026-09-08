@@ -183,6 +183,24 @@ backend.close();
   assert.notEqual(second, "WEDGED", "one hung request must not hold the queue forever");
 
   await hung.close();
+
+  // A backend may set its own deadline, because "how long before a first byte
+  // is plausible" is a fact about what is behind the port. A sidecar that
+  // renders a clip before it answers at all legitimately takes tens of minutes,
+  // and the node-wide number is sized for a chat server — so the per-backend
+  // one has to win, or the deadline meant to catch a hang cuts off real work.
+  const perBackend = createNode(
+    parseConfig({
+      name: "per-backend",
+      backendFirstByteMs: 300,
+      backends: [{ name: "slow", url: hurl, serves: ["m"], firstByteMs: 30_000 }],
+    }),
+    silentLogger,
+  );
+  assert.equal(perBackend.pool.get("slow")!.cfg.firstByteMs, 30_000,
+    "a backend's own deadline overrides the node's");
+  await perBackend.close();
+
   blackhole.closeAllConnections();
   blackhole.close();
 }

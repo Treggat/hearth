@@ -183,6 +183,23 @@ export interface BackendConfig {
    */
   concurrency: number;
   /**
+   * How long to wait for THIS backend to start answering, in ms. 0 waits
+   * forever. Defaults to the node's `backendFirstByteMs`.
+   *
+   * Per backend because "how long before a first byte is plausible" is a fact
+   * about what is behind the port, and a node-wide number cannot be right for
+   * every one of them. A chat server answers in seconds; a sidecar that renders
+   * a video before it replies with anything at all can legitimately take tens
+   * of minutes, and a deadline sized for the first would kill the second's
+   * honest work.
+   *
+   * It is still worth setting rather than disabling. The deadline is not there
+   * to bound how long real work may take, it is there so that a backend which
+   * has stopped answering ALTOGETHER eventually gives its slot — and its card —
+   * back, instead of holding both until the process restarts.
+   */
+  firstByteMs: number | null;
+  /**
    * Hardware this backend consumes, so backends sharing it take turns.
    *
    * A backend is its own admission domain, which is right up until two of them
@@ -894,6 +911,9 @@ export function parseConfig(raw: unknown): HearthConfig {
         kind: warmSource(entry, `backends[${i}]`),
         serves: strList(entry.serves, `backends[${i}].serves`),
         concurrency: count(entry.concurrency, `backends[${i}].concurrency`, defaultConcurrency, 1),
+        firstByteMs: entry.firstByteMs === undefined
+          ? null
+          : atLeast(entry.firstByteMs, `backends[${i}].firstByteMs`, 0),
         resources: strList(entry.resources, `backends[${i}].resources`),
         routes: routeList(entry.routes, `backends[${i}].routes`),
       });
@@ -930,6 +950,9 @@ export function parseConfig(raw: unknown): HearthConfig {
       kind: warmSource(backend, "backend"),
       serves: strList(backend.serves, "backend.serves"),
       concurrency: count(backend.concurrency, "backend.concurrency", defaultConcurrency, 1),
+      firstByteMs: backend.firstByteMs === undefined
+        ? null
+        : atLeast(backend.firstByteMs, "backend.firstByteMs", 0),
       resources: strList(backend.resources, "backend.resources"),
       routes: routeList(backend.routes, "backend.routes"),
     });

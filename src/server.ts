@@ -16,7 +16,10 @@ import { pipeline } from "node:stream/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { accessSync, constants as fsConstants } from "node:fs";
 
-import { ConfigError, WARM_LANE, type HearthConfig, type RoutePolicy } from "./config.js";
+import {
+  ConfigError, WARM_LANE,
+  type BackendConfig, type HearthConfig, type RoutePolicy,
+} from "./config.js";
 import { Controls } from "./controls.js";
 import { Overrides, readState, writeState } from "./overrides.js";
 import type { Logger } from "./log.js";
@@ -445,7 +448,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       const up = await send(`${local.cfg.url}/v1/chat/completions`, {
         json: pool.outboundBody(model, payload),
         signal,
-        ...backendDeadline(),
+        ...backendDeadline(local.cfg),
       });
       localStatus = await pipeThrough(up, res);
     };
@@ -1379,7 +1382,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           const up = await send(`${slot.cfg.url}/upstream/${encodeURIComponent(wire)}/health`, {
             method: "GET",
             signal: ctrl.signal,
-            ...backendDeadline(),
+            ...backendDeadline(slot.cfg),
           });
           if (!up.ok) throw new Error(`backend returned ${up.status} warming ${wire}`);
           await up.text().catch(() => "");
@@ -1571,7 +1574,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
               const up = await send(`${serving.cfg.url}/v1/chat/completions`, {
                 json: pool.outboundBody(model, payload),
                 signal: ctrl.signal,
-                ...backendDeadline(),
+                ...backendDeadline(serving.cfg),
               });
               lentStatus = await pipeThrough(up, res);
             },
@@ -1763,7 +1766,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         // still forwarded untouched.
         headers: stripOurKey(req) as Record<string, string>,
         signal: ctrl.signal,
-        ...backendDeadline(),
+        ...backendDeadline(target.cfg),
       });
       log.debug("passthrough", { path, status: up.status });
       await pipeThrough(up, res);
@@ -1870,9 +1873,16 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    * at one site is the whole node: a backend that accepts the connection and
    * never answers holds a scheduler slot for as long as the process lives, and
    * with `resources` declared it holds the card too.
+   *
+   * Takes the backend, because the plausible wait is a property of what is
+   * behind the port. A sidecar that renders a clip before it answers at all is
+   * not misbehaving when it takes half an hour, and a node-wide number sized
+   * for a chat server would cut its honest work off mid-render.
    */
-  const backendDeadline = (): { headersTimeoutMs?: number } =>
-    cfg.backendFirstByteMs > 0 ? { headersTimeoutMs: cfg.backendFirstByteMs } : {};
+  const backendDeadline = (b: BackendConfig): { headersTimeoutMs?: number } => {
+    const ms = b.firstByteMs ?? cfg.backendFirstByteMs;
+    return ms > 0 ? { headersTimeoutMs: ms } : {};
+  };
 
   /**
    * Everything the page draws, in one object.

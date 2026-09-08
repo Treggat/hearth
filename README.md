@@ -90,6 +90,7 @@ Every key with its default. Only `backend.url` is required.
 | `peerPollMs` / `peerStaleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
 | `peerFirstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
 | `backendFirstByteMs` | `900000` | the same for a local backend. Catches one that accepts the connection and then never answers, which would otherwise hold its slot — and its card — until a restart. `0` waits forever |
+| `backends[].firstByteMs` | node default | per-backend override. A sidecar that renders a clip before it answers at all needs a longer one than a chat server, and a single number cannot be right for both |
 | `coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
 | `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them, which is what it used to do |
 | `peers` | `[]` | nodes you can send work to |
