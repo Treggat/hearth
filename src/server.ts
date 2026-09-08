@@ -29,7 +29,18 @@ import { needsOf, unfit, type ModelStats } from "./stats.js";
 import { UI_HTML } from "./ui.js";
 import { send, type UpstreamResponse } from "./upstream.js";
 
-/** Constant-time compare over digests. No length leak, no throw on mismatch. */
+/**
+ * Constant-time compare over digests. No length leak, no throw on mismatch.
+ *
+ * The digests are the point, and both halves of that sentence are load-bearing.
+ * timingSafeEqual THROWS on unequal lengths, so a raw-byte compare has to guard
+ * with an early `length !==` return — and that return is a length oracle: an
+ * attacker sweeps the length of their own input and watches for the one that
+ * stops returning immediately. Hashing first removes the choice. Both sides
+ * become 32 bytes, so there is nothing to guard against and nothing to learn:
+ * hashing the attacker's input costs time proportional to input they already
+ * know, and hashing the fixed secret costs the same on every request.
+ */
 function secretEq(a: string, b: string): boolean {
   return timingSafeEqual(
     createHash("sha256").update(a).digest(),
@@ -489,6 +500,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
     const peer = peers.config(decision.peer)!;
     let fellBack = false;
+    let lastTarget = "peer" as "peer" | "local";
     log.debug("route.peer", { model, peer: decision.peer, reason: decision.reason });
 
     try {
@@ -538,6 +550,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             error: e instanceof Error ? e.message : String(e),
           });
           fellBack = true;
+          lastTarget = "local";
           // Back through admission control, because this is local GPU work now.
           // Running it inline would inherit the off-box job's exemption from the
           // queue, so a peer that's up but failing would turn every request into
@@ -555,13 +568,21 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     } catch (e) {
       // The local path logged its failures and this one didn't, so a peer
       // failure or a full queue returned 502/429 with nothing at info. On a
-      // service whose one-line-per-request is a selling point.
-      logRequest(t, { model, lane, caller, target: "peer", peer: peer.name }, false, e);
+      // service whose one-line-per-request is a selling point. lastTarget
+      // reflects the *actual* last target, even when a local retry after a
+      // peer failure also failed — the log should not pretend the peer won.
+      //
+      // `target` is not only a label: logRequest gates the call ring on it, so
+      // saying "local" here also enrols a failed fallback as a local use. That
+      // is right — the weights were busy either way — but only with `backend`
+      // alongside it, or the record lands with an empty backend name and is
+      // invisible to everything that groups by one.
+      logRequest(t, { model, lane, caller, backend: local.name, target: lastTarget, peer: peer.name }, false, e);
       throw e;
     }
     logRequest(
       t,
-      { model, lane, caller, target: fellBack ? "local" : "peer", peer: peer.name, offbox: !fellBack,
+      { model, lane, caller, backend: local.name, target: lastTarget, peer: peer.name, offbox: !fellBack,
         ...(fellBack && localStatus >= 400 ? { status: localStatus } : {}) },
       // Only the fallback can have relayed a bad status: a peer's own 4xx threw
       // a PeerStatusError further up and never reached here.
