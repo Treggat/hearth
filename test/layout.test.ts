@@ -17,9 +17,10 @@
 import assert from "node:assert/strict";
 
 import {
-  CELL, countCrossings, GAP, grid, H, layout, MIN_GAP, orderBackends, PAD, STACK, tiers,
+  CELL, countCrossings, countNodeHits, GAP, grid, H, layout, MIN_GAP, orderBackends,
+  PAD, STACK, tiers,
 } from "../src/ui/layout.js";
-import type { Backend, Resource } from "../src/ui/types.js";
+import type { Backend, Node, Resource } from "../src/ui/types.js";
 
 /** The width a row of `count` cells actually occupies. */
 const span = (count: number, w: number) => count * w + (count - 1) * GAP;
@@ -165,20 +166,39 @@ console.log("layout.test.ts ok");
   // Every window a laptop or a monitor might give the stage, not the three that
   // happened to look right: the tier wraps to one, two and three rows across
   // this range, and the wrap is what used to decide whether wires tangled.
+  // With and without peers, because the peer row is drawn with its own arcs and
+  // more than one of them sit side by side.
+  const peerSets: Node[][] = [
+    [],
+    [{ name: "p1", up: true, free: 1, slots: 1, queued: 0 }],
+    [{ name: "p1", up: true, free: 1, slots: 1, queued: 0 },
+     { name: "p2", up: false, free: null, slots: null, queued: null }],
+  ];
+
   let checked = 0;
   for (const [label, { backends, resources }] of
        [["real", real], ["interleaved", interleaved],
         ["manyCpu", manyCpu], ["split", split]] as const) {
     const ordered = orderBackends(backends, resources);
-    for (let w = 660; w <= 2000; w += 40) {
-      for (const h of [600, 800, 1000, 1200]) {
-        assert.equal(countCrossings(layout(w, h, [], ordered, resources)), 0,
-          `${label} at ${w}x${h} should draw no crossed wires`);
-        checked++;
+    for (const peers of peerSets) {
+      for (let w = 660; w <= 2000; w += 40) {
+        for (const h of [600, 800, 1000, 1200]) {
+          const scene = layout(w, h, peers, ordered, resources);
+          assert.equal(countCrossings(scene), 0,
+            `${label} at ${w}x${h} with ${peers.length} peer(s) crosses its own wires`);
+          // The measure that "wires from one point cannot cross each other"
+          // says nothing about: a fan is provably clean by crossings alone
+          // while every one of its wires is drawn through a box in the row
+          // above its target. Columns line up exactly whenever the rows hold
+          // the same number of backends, which is what makes this bite.
+          assert.equal(countNodeHits(scene), 0,
+            `${label} at ${w}x${h} with ${peers.length} peer(s) runs a wire through a node`);
+          checked++;
+        }
       }
     }
   }
-  assert.ok(checked > 500, `the sweep must actually run (${checked} layouts)`);
+  assert.ok(checked > 1500, `the sweep must actually run (${checked} layouts)`);
 
   // The shape itself, not just its outcome: right angles with rounded corners,
   // and one shared channel per card so a group of sidecars arrives as one trunk

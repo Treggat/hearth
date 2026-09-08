@@ -277,46 +277,86 @@ function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
  * reach it. Verified with countCrossings rather than reasoned about and hoped
  * for — see test/layout.test.ts.
  */
-function elbow(a: Placed, card: Placed, channelY: number): {
-  d: string; mid: { x: number; y: number }; poly: Pt[];
-} {
-  const x1 = a.x + a.w / 2, y1 = a.y + a.h;
-  const x2 = card.x + card.w / 2, y2 = card.y + inset(card);
+/**
+ * A clear vertical corridor beside a column, for a wire that cannot go straight.
+ *
+ * Descending at a node's own centre is the shape you want, and it only works
+ * while nothing else in that column is in the way. Rows are usually staggered —
+ * a wrapped row is centred on its own count, so its cells sit in the gaps of the
+ * row above — but when every row holds the SAME number the columns line up
+ * exactly, and a wire to the second row would be drawn straight through the box
+ * in the first.
+ *
+ * So when the straight descent is blocked, the wire drops through the gap beside
+ * the column instead and turns into the node's side. The gap is empty by
+ * construction, which is what makes this safe rather than lucky.
+ */
+const corridorFor = (p: Placed): number => Math.max(2, p.x - GAP / 2);
+
+/** Is anything in this column between `p` and the tier it is reaching for? */
+function blocked(p: Placed, others: Placed[], above: boolean): boolean {
+  const x = p.x + p.w / 2;
+  return others.some((n) => n !== p && n.x <= x && x <= n.x + n.w
+    && (above ? n.y + n.h <= p.y : n.y >= p.y + p.h));
+}
+
+function elbow(a: Placed, b: Placed, channelY: number, opts: {
+  /** Leave `a` sideways into this corridor — something is stacked below it. */
+  exit?: number;
+  /** Descend this corridor and enter `b` sideways — something is above it. */
+  enter?: number;
+} = {}): { d: string; mid: { x: number; y: number }; poly: Pt[] } {
+  const sx = opts.exit ?? a.x + a.w / 2;
+  const sy = opts.exit === undefined ? a.y + a.h : a.y + a.h / 2;
+  const tx = opts.enter ?? b.x + b.w / 2;
+  const ty = opts.enter === undefined ? b.y + inset(b) : b.y + b.h / 2;
+
+  const poly: Pt[] = [];
+  const parts: string[] = [];
+  // The stub out of a's side, when it cannot leave through its own bottom.
+  if (opts.exit !== undefined) {
+    poly.push({ x: a.x, y: sy });
+    parts.push(`M ${a.x} ${sy}`, `L ${sx} ${sy}`);
+  } else {
+    parts.push(`M ${sx} ${sy}`);
+  }
+  poly.push({ x: sx, y: sy });
 
   // Straight down when there is nothing to go around. An elbow with no sideways
   // run is two corners drawn on top of each other.
-  if (Math.abs(x2 - x1) < 1) {
-    return {
-      d: `M ${x1} ${y1} L ${x2} ${y2}`,
-      mid: { x: x1, y: (y1 + y2) / 2 },
-      poly: [{ x: x1, y: y1 }, { x: x2, y: y2 }],
-    };
+  if (Math.abs(tx - sx) < 1) {
+    parts.push(`L ${tx} ${ty}`);
+    poly.push({ x: tx, y: ty });
+  } else {
+    const dir = tx > sx ? 1 : -1;
+    // A stage short enough to squeeze the band flat would otherwise put the
+    // channel above the node it leaves, and the wire would set off upwards.
+    const cy = Math.min(Math.max(channelY, sy + 4), ty - 4);
+    // Corners stay inside all three legs, so a short one rounds off rather than
+    // overshooting into the leg beside it.
+    const r = Math.max(2, Math.min(10, Math.abs(tx - sx) / 2, cy - sy, ty - cy));
+    parts.push(
+      `L ${sx} ${cy - r}`,
+      `Q ${sx} ${cy} ${sx + dir * r} ${cy}`,
+      `L ${tx - dir * r} ${cy}`,
+      `Q ${tx} ${cy} ${tx} ${cy + r}`,
+      `L ${tx} ${ty}`,
+    );
+    poly.push({ x: sx, y: cy - r }, { x: sx + dir * r, y: cy },
+              { x: tx - dir * r, y: cy }, { x: tx, y: cy + r }, { x: tx, y: ty });
   }
 
-  const dir = x2 > x1 ? 1 : -1;
-  // A stage short enough to squeeze the band flat would otherwise put the
-  // channel above the backend it leaves, and the wire would set off upwards.
-  const cy = Math.min(Math.max(channelY, y1 + 4), y2 - 4);
-  // Corners stay inside all three legs, so a short one rounds off rather than
-  // overshooting into the leg beside it.
-  const r = Math.max(2, Math.min(10, Math.abs(x2 - x1) / 2, channelY - y1, y2 - channelY));
-  const d = [
-    `M ${x1} ${y1}`,
-    `L ${x1} ${cy - r}`,
-    `Q ${x1} ${cy} ${x1 + dir * r} ${cy}`,
-    `L ${x2 - dir * r} ${cy}`,
-    `Q ${x2} ${cy} ${x2} ${cy + r}`,
-    `L ${x2} ${y2}`,
-  ].join(" ");
+  // The stub into b's side.
+  if (opts.enter !== undefined) {
+    parts.push(`L ${b.x} ${ty}`);
+    poly.push({ x: b.x, y: ty });
+  }
+
   return {
-    d,
+    d: parts.join(" "),
     // On the horizontal run, which is the leg with room for a number on it.
-    mid: { x: (x1 + x2) / 2, y: cy },
-    poly: [
-      { x: x1, y: y1 }, { x: x1, y: cy - r },
-      { x: x1 + dir * r, y: cy }, { x: x2 - dir * r, y: cy },
-      { x: x2, y: cy + r }, { x: x2, y: y2 },
-    ],
+    mid: { x: (sx + tx) / 2, y: Math.min(Math.max(channelY, sy + 4), ty - 4) },
+    poly,
   };
 }
 
@@ -461,11 +501,47 @@ export function layout(width: number, height: number, peers: Node[],
   };
   // Two arcs per peer, bowed opposite ways: what we send them, and what they
   // send us. They are separate facts and one line cannot hold both.
+  //
+  // The bow grows with the number of peers, because with more than one they sit
+  // in a row and an arc to the far one would otherwise be drawn straight
+  // through the near one. Past a single peer it has to clear a whole node, so
+  // the pair opens up enough to pass above and below the row rather than
+  // through it.
+  const lift = peers.length > 1 ? H.peer / 2 + 18 : 14;
   for (const p of peers) {
-    push("self", `peer:${p.name}`, "across", -14);
-    push(`peer:${p.name}`, "self", "across", 14);
+    push("self", `peer:${p.name}`, "across", -lift);
+    push(`peer:${p.name}`, "self", "across", lift);
   }
-  for (const b of backends) push("self", `backend:${b.name}`, "down");
+  // Self -> backends, on one channel, for the same reason the tier below uses
+  // them: a fan of curves cannot cross ITSELF, which is what made it look safe,
+  // but every wire to the lower row was drawn straight through a node in the
+  // upper one on its way down. An elbow drops between them instead.
+  //
+  // It works because the rows are staggered: a wrapped row is centred on its
+  // own count, so its cells sit in the GAPS of the row above and a wire coming
+  // down to one has somewhere to pass. That offset is load-bearing, not
+  // cosmetic — countNodeHits is what says so.
+  {
+    const from = nodes.get("self");
+    if (from) {
+      const channelY = Y.self + H.self + (Y.backends - (Y.self + H.self)) * 0.45;
+      const all = backends
+        .map((x) => nodes.get(`backend:${x.name}`))
+        .filter((p): p is Placed => !!p);
+      for (const b of backends) {
+        const to = nodes.get(`backend:${b.name}`);
+        if (!to) continue;
+        // Straight onto its top where the column above it is clear, down the
+        // gap beside it and in through the side where it is not.
+        const enter = blocked(to, all, true) ? corridorFor(to) : undefined;
+        const { d, mid, poly } = elbow(from, to, channelY, { enter });
+        edges.push({
+          id: `self>backend:${b.name}`,
+          from: "self", to: `backend:${b.name}`, dir: "down", d, mid, poly,
+        });
+      }
+    }
+  }
   // Backend -> card, as elbows sharing one channel per card.
   //
   // The host is skipped here and drawn from the CARD instead. A backend "using"
@@ -489,6 +565,9 @@ export function layout(width: number, height: number, peers: Node[],
 
     // The band between the two tiers, kept off both of them so a channel never
     // runs through a node or along its edge.
+    const allBackends = backends
+      .map((x) => nodes.get(`backend:${x.name}`))
+      .filter((q): q is Placed => !!q);
     const bRows = Math.max(1, bPlan.sizes.length);
     const top = Y.backends + (bRows - 1) * (H.backend + STACK) + H.backend;
     const bottom = Y.resources;
@@ -501,7 +580,10 @@ export function layout(width: number, height: number, peers: Node[],
       for (const b of r.backends) {
         const a = nodes.get(`backend:${b}`);
         if (!a) continue;
-        const { d, mid, poly } = elbow(a, p, channelY);
+        // Out through the side where its own column continues below it, so the
+        // descent goes down the gap rather than through its neighbours.
+        const exit = blocked(a, allBackends, false) ? corridorFor(a) : undefined;
+        const { d, mid, poly } = elbow(a, p, channelY, { exit });
         edges.push({
           id: `backend:${b}>resource:${r.name}`,
           from: `backend:${b}`, to: `resource:${r.name}`, dir: "down", d, mid, poly,
@@ -593,6 +675,48 @@ function crosses(a: Pt[], b: Pt[], shared: Pt | null): boolean {
       if (shared && Math.hypot(p.x1 - shared.x, p.y1 - shared.y) < MERGE) continue;
       return true;
     }
+  }
+  return false;
+}
+
+/**
+ * How many times a wire runs across a node it is not attached to.
+ *
+ * The other half of "does this look tangled", and the half that is easy to
+ * miss: wires leaving one point cannot cross EACH OTHER whatever shape they
+ * are, so a fan looks provably clean by that measure while every one of its
+ * wires is drawn straight through the boxes in the row above its target.
+ * Counting crossings alone says nothing about it.
+ *
+ * A wire is allowed to touch the two nodes it joins. Everything else it passes
+ * through is a hit.
+ */
+export function countNodeHits(scene: Scene): number {
+  let n = 0;
+  for (const e of scene.edges) {
+    for (const [id, p] of scene.nodes) {
+      if (id === e.from || id === e.to) continue;
+      if (polyHitsBox(e.poly, p)) n++;
+    }
+  }
+  return n;
+}
+
+function polyHitsBox(poly: Pt[], p: Placed): boolean {
+  // The visible mark, not the click target: the box is deliberately taller than
+  // what it draws, so a wire clipping the empty band above a node's glyph is
+  // not something anybody can see.
+  const pad = inset(p);
+  const l = p.x, r = p.x + p.w, t = p.y + pad, b = p.y + p.h - pad;
+  for (let i = 0; i + 1 < poly.length; i++) {
+    const a = poly[i]!, c = poly[i + 1]!;
+    if (a.x >= l && a.x <= r && a.y >= t && a.y <= b) return true;
+    const seg: Seg = { x1: a.x, y1: a.y, x2: c.x, y2: c.y };
+    const edges: Seg[] = [
+      { x1: l, y1: t, x2: r, y2: t }, { x1: r, y1: t, x2: r, y2: b },
+      { x1: r, y1: b, x2: l, y2: b }, { x1: l, y1: b, x2: l, y2: t },
+    ];
+    for (const q of edges) if (segmentsCross(seg, q)) return true;
   }
   return false;
 }
