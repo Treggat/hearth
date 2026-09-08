@@ -205,5 +205,105 @@ peers:
   }
 }
 
+// --- the auth matrix, route by route ---------------------------------------
+//
+// Every path this node answers, against every kind of caller. The routes differ
+// on purpose — one is open, one is decided by address, three take a peer's
+// token OR a local key, the rest are local only — and the way that goes wrong
+// is a new route copying the wrong neighbour. Asserted as a table because it IS
+// one now, and a table nobody checks is a comment.
+//
+// The refusal SHAPE is asserted too. A client parses it: the /v1 surface must
+// answer in OpenAI's envelope and the control surface in the plain one, and
+// swapping them silently breaks whoever was reading the field that vanished.
+{
+  const dir = mkdtempSync(join(tmpdir(), "hearth-authz-"));
+  const cfgFile = join(dir, "hearth.yaml");
+  writeFileSync(cfgFile, [
+    "name: authz",
+    `backend: { url: ${yq(beUrl)}, serves: [m] }`,
+    "apiKeys: [local-key]",
+    "share: [m]",
+    "peerTokens: { friend: peer-token }",
+  ].join("\n"));
+  const n = createNode(loadConfig(cfgFile), silentLogger);
+  n.start();
+  const base = await new Promise<string>((ready) =>
+    n.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(n.server.address() as AddressInfo).port}`)),
+  );
+
+  const call = async (path: string, token: string | null, method = "GET") => {
+    const r = await fetch(`${base}${path}`, {
+      method,
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(method === "POST" ? { body: "{}" } : {}),
+    });
+    const text = await r.text();
+    let body: Record<string, unknown> = {};
+    try { body = JSON.parse(text) as Record<string, unknown>; } catch { /* not json */ }
+    return { status: r.status, body };
+  };
+
+  const LOCAL = "local-key";
+  const PEER = "peer-token";
+
+  // [path, method, who may in, envelope]
+  const matrix: [string, string, ("none" | "local" | "peer")[], "plain" | "openai"][] = [
+    ["/healthz", "GET", ["none", "local", "peer"], "plain"],
+    ["/peer/state", "GET", ["peer"], "plain"],
+    ["/network", "GET", ["local"], "plain"],
+    ["/control", "GET", ["local"], "plain"],
+    ["/queue", "GET", ["local"], "plain"],
+    ["/v1/models", "GET", ["local", "peer"], "openai"],
+    ["/v1/warm", "POST", ["local", "peer"], "openai"],
+    ["/v1/chat/completions", "POST", ["local", "peer"], "openai"],
+  ];
+
+  for (const [path, method, allowed, envelope] of matrix) {
+    for (const [who, token] of [["none", null], ["local", LOCAL], ["peer", PEER]] as const) {
+      const { status, body } = await call(path, token, method);
+      if (allowed.includes(who)) {
+        assert.notEqual(status, 401, `${who} must reach ${path}`);
+        assert.notEqual(status, 403, `${who} must not be forbidden from ${path}`);
+      } else {
+        assert.equal(status, 401, `${who} must NOT reach ${path} (got ${status})`);
+        // The envelope, which is the half a client actually reads.
+        if (envelope === "openai") {
+          assert.equal(typeof (body.error as { message?: string })?.message, "string",
+            `${path} must refuse in OpenAI's envelope`);
+        } else {
+          assert.equal(typeof body.error, "string", `${path} must refuse in the plain envelope`);
+        }
+      }
+    }
+  }
+
+  // A peer's token is not a local credential, and this is the one that matters:
+  // /control is the only route that CHANGES anything, so a peer reaching it
+  // could switch our lending off — or back on after we paused it.
+  assert.equal((await call("/control", PEER, "POST")).status, 401,
+    "a peer must never reach /control");
+
+  // The page is decided by ADDRESS, not by credential, so a valid api key does
+  // not open it from off-box and loopback needs none. Both halves are reached
+  // over loopback here, so it opens either way — what is asserted is that the
+  // credential is not what decided it.
+  assert.equal((await call("/ui/data", null)).status, 200, "loopback opens the page with no key");
+  assert.equal((await call("/ui/data", PEER)).status, 200,
+    "and a peer token neither helps nor hinders — address decides");
+
+  // A method the route does not claim falls through to the passthrough rather
+  // than 405ing, which is how a GET to a /v1 path has always reached the
+  // backend untouched. Still local-only on the way through.
+  assert.equal((await call("/v1/chat/completions", null, "GET")).status, 401,
+    "the fall-through is still gated");
+
+  await n.close();
+}
+
 await new Promise<void>((r) => backend.close(() => r()));
 console.log("security.test.ts ok");

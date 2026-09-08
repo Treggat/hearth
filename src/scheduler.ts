@@ -230,6 +230,24 @@ export class Scheduler {
   private readonly queued: Job[] = [];
   private readonly running = new Set<Job>();
   private readonly offbox = new Set<Job>();
+  /**
+   * Whether we are currently holding our declared hardware.
+   *
+   * Kept ACROSS the gaps between our own jobs. Releasing on every idle moment
+   * and re-taking it on the next job is what let a busy backend re-acquire
+   * before a waiting neighbour was ever considered, and it also meant paying
+   * the eviction dance again for work that was already ours.
+   */
+  private holding = false;
+  /**
+   * The eviction for the turn we are in, or null when there is nothing to wait
+   * for.
+   *
+   * One promise per HOLD rather than per job. Clearing the neighbours off a
+   * card is a property of taking the card, and every job admitted during that
+   * turn has to wait for it — not just the one that happened to trigger it.
+   */
+  private preparing: Promise<void> | null = null;
 
   constructor(opts: SchedulerOptions) {
     this.lanes = opts.lanes;
@@ -350,7 +368,53 @@ export class Scheduler {
    * we hold ourselves does not block us — that is what `concurrency` is for.
    */
   private hardwareFree(): boolean {
-    return !this.arbiter || this.arbiter.available(this.resources, this);
+    if (!this.arbiter) return true;
+    // Already ours: our own concurrency governs how much runs on it, not the
+    // arbiter — except once our turn is up and a neighbour is waiting, when we
+    // stop admitting so the jobs in flight can finish and hand the card over.
+    // Without that a saturated backend never reaches an idle moment and never
+    // yields, which is the starvation this policy exists to bound.
+    if (this.holding) return !this.arbiter.owed(this.resources, this);
+    return this.arbiter.mayTake(this.resources, this);
+  }
+
+  /**
+   * Publish what we are blocked on, so the arbiter can order the waiters.
+   *
+   * The claim is our oldest queued job's enqueue time, which is the same clock
+   * the aging in `score` uses. Cleared the moment we hold the hardware or have
+   * nothing waiting for it, so a claim can never outlive the work behind it.
+   */
+  private updateClaim(): void {
+    if (!this.arbiter) return;
+    if (this.holding || this.queued.length === 0) {
+      this.arbiter.claim(this, this.resources, null);
+      return;
+    }
+    let oldest = Infinity;
+    for (const j of this.queued) if (j.enqueuedAt < oldest) oldest = j.enqueuedAt;
+    this.arbiter.claim(this, this.resources, oldest);
+  }
+
+  /** Let the hardware go, and forget the eviction that belonged to that turn. */
+  private dropHold(): void {
+    if (!this.holding) return;
+    this.holding = false;
+    this.preparing = null;
+    this.arbiter?.release(this);
+  }
+
+  /**
+   * Nothing is running here any more. Keep the card, or hand it on?
+   *
+   * Keeping it while we still have work is the whole of the locality: the next
+   * job goes onto hardware already cleared for us, with our weights still on
+   * it. We give it up when we have nothing left to run, or when our turn is up
+   * and somebody has been waiting.
+   */
+  private settleHold(): void {
+    if (!this.arbiter || !this.holding) return;
+    if (this.queued.length === 0 || this.arbiter.owed(this.resources, this)) this.dropHold();
   }
 
   private canAdmit(job: Job): boolean {
@@ -464,9 +528,15 @@ export class Scheduler {
    * against its own caller for a microtask. Invisible over a network, very
    * visible in a test.
    */
-  private execute(job: Job, release: () => void, prepare?: () => Promise<void>): void {
+  private execute(job: Job, release: () => void): void {
+    // The eviction for the turn this job was admitted into, captured here
+    // while we are still synchronous with `pump`. Every job of a turn takes
+    // the same promise, so one admitted alongside the job that triggered the
+    // eviction waits for it too — and reading the field later would miss it,
+    // since a failed eviction clears it on the very next microtask.
+    const prepared = this.preparing;
     void Promise.resolve()
-      .then(() => prepare?.())
+      .then(() => prepared ?? undefined)
       .then(() => job.run())
       .then(
         (v) => {
@@ -485,6 +555,10 @@ export class Scheduler {
   }
 
   private pump(): void {
+    // File our claim BEFORE asking whether we may start, or the arbiter reads
+    // us as having only just turned up and hands the hardware to whoever
+    // claimed first — including on the tick where we are the longest waiter.
+    this.updateClaim();
     while (this.queued.length > 0) {
       const now = Date.now();
       const resident = this.resident();
@@ -506,25 +580,64 @@ export class Scheduler {
       this.remove(job);
       job.state = "running";
       job.startedAt = Date.now();
-      // Taking the hardware and evicting off it happen on the idle->busy edge
-      // only. A backend already running holds its resources, and its
-      // neighbours were already cleared off them.
-      const takingHold = this.arbiter !== undefined && this.running.size === 0;
+      // Taking the hardware and clearing the neighbours off it happen once per
+      // TURN, not once per job: a backend that already holds its resources had
+      // them cleared when it took them.
+      if (this.arbiter !== undefined && !this.holding) {
+        // Checked, not assumed. `canAdmit` proved the hardware was ours to take
+        // and nothing awaits between there and here, so this cannot be false
+        // today — but a false means we would be running on hardware somebody
+        // else holds, which is the one outcome `resources` exists to prevent.
+        // Better to leave the job queued and try again on the next release.
+        if (!this.arbiter.acquire(this.resources, this)) {
+          // Put it back exactly as it was. It has not been added to `running`
+          // yet, so restoring the queue and the two fields is the whole undo.
+          this.queued.unshift(job);
+          job.state = "queued";
+          job.startedAt = null;
+          break;
+        }
+        this.holding = true;
+        this.beginPrepare();
+      }
       this.running.add(job);
-      if (takingHold) this.arbiter?.acquire(this.resources, this);
-      this.execute(
-        job,
-        () => {
-          this.running.delete(job);
-          // Last one out. Releasing while a sibling still runs would let a
-          // competing backend load on top of it.
-          if (this.running.size === 0) this.arbiter?.release(this);
-          this.sync();
-        },
-        takingHold ? this.evict : undefined,
-      );
+      this.execute(job, () => {
+        this.running.delete(job);
+        // Last one out. Letting go while a sibling still runs would let a
+        // competing backend load on top of live work.
+        if (this.running.size === 0) this.settleHold();
+        this.sync();
+      });
     }
+    this.updateClaim();
     this.sync();
+  }
+
+  /**
+   * Clear the neighbours off the hardware we have just taken.
+   *
+   * Winning the arbitration means nobody else is RUNNING on it; it does not
+   * mean the hardware is free, because whatever ran last still has its weights
+   * there. The promise is stored rather than awaited here so `pump` stays
+   * synchronous — every job dispatched during this turn awaits it in
+   * `execute`.
+   *
+   * A failure means the card was never actually cleared, so the hold is given
+   * up rather than kept: the jobs that awaited this promise fail (they never
+   * reached the backend), and the next attempt starts a fresh turn and tries
+   * the eviction again.
+   */
+  private beginPrepare(): void {
+    if (!this.evict) {
+      this.preparing = null;
+      return;
+    }
+    const p = this.evict();
+    this.preparing = p;
+    p.catch(() => {
+      if (this.preparing !== p) return;
+      this.dropHold();
+    });
   }
 
   /**
@@ -564,6 +677,11 @@ export class Scheduler {
           this.remove(job as Job);
           job.detach?.();
           reject(new AbortedError());
+          // The queue may have just emptied, and a hold is kept only for work
+          // we still have. Without this, cancelling the last waiting job leaves
+          // the card ours until the next one arrives.
+          this.updateClaim();
+          if (this.running.size === 0) this.settleHold();
           this.sync();
         };
         spec.signal.addEventListener("abort", onAbort, { once: true });

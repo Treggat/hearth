@@ -20,10 +20,28 @@ export interface UpstreamResponse {
   headers: Record<string, string | string[] | undefined>;
   /** Raw body chunks. Async-iterable: `for await (const chunk of body)`. */
   body: IncomingMessage;
-  /** Drain the whole body to a string. Error path only, where there's nothing
-   *  worth streaming and you just want to see what upstream complained about. */
-  text: () => Promise<string>;
+  /**
+   * Drain the whole body to a string, up to `maxBytes`.
+   *
+   * Error path and control plane only, where there's nothing worth streaming
+   * and you just want to see what upstream said. Capped because this is the one
+   * place a reply we did not ask the size of is held in memory: a peer is
+   * another machine somebody else administers, and "it will be small" is a
+   * hope, not a limit.
+   */
+  text: (maxBytes?: number) => Promise<string>;
 }
+
+/**
+ * The most of a buffered body we will hold.
+ *
+ * Every caller of `text()` wants either a small JSON control-plane reply or the
+ * first couple of hundred characters of an error, and both are orders of
+ * magnitude under this. It exists so that a peer answering `/peer/state` with
+ * a firehose costs us a bounded amount of memory rather than however much it
+ * can push inside the deadline.
+ */
+const MAX_TEXT_BYTES = 1 << 20;
 
 export class UpstreamError extends Error {
   constructor(
@@ -108,15 +126,34 @@ export function send(url: string, opts: RequestOptions = {}): Promise<UpstreamRe
         status,
         headers: res.headers,
         body: res,
-        text: () =>
+        text: (maxBytes = MAX_TEXT_BYTES) =>
           new Promise<string>((done) => {
             const chunks: Buffer[] = [];
-            res.on("data", (c: Buffer) => chunks.push(c));
-            res.on("end", () => done(Buffer.concat(chunks).toString()));
+            let size = 0;
+            let stopped = false;
+            const finish = () => {
+              if (stopped) return;
+              stopped = true;
+              done(Buffer.concat(chunks).toString());
+            };
+            res.on("data", (c: Buffer) => {
+              if (stopped) return;
+              size += c.length;
+              if (size > maxBytes) {
+                // Whatever we have is enough to report with, and reading the
+                // rest only costs memory. Destroying the socket rather than
+                // pausing: nobody is going to read this body afterwards.
+                res.destroy();
+                finish();
+                return;
+              }
+              chunks.push(c);
+            });
+            res.on("end", finish);
             // Resolve, don't reject. We're already on the error path and the
             // caller wants whatever detail we managed to read, not a second
             // failure on top.
-            res.on("error", () => done(Buffer.concat(chunks).toString()));
+            res.on("error", finish);
           }),
       });
     });

@@ -58,7 +58,17 @@ declare module "@mui/material/styles" {
  *   error   (fault/down/not answering) = fault red
  *
  * Dark: charcoal surfaces, warm ink, subtle contrast between surfaces.
- * Light: warm paper, ink from the dark palette, hairline dividers.
+ * Light: warm paper, its own ink, hairline dividers.
+ *
+ * The two schemes share ROLES, not hues. A hue is picked for the ground it
+ * lands on, so the same role is a phosphor green on charcoal and a deeper
+ * green on paper — mirroring one scheme into the other puts a colour at 1.5:1
+ * and loses the state it was carrying.
+ *
+ * Every colour here clears 4.5:1 against BOTH surfaces it can land on
+ * (background.default and background.paper). All of them are used as text
+ * somewhere, and most at 10-11px, so the small-text threshold is the one that
+ * applies. `line` and `hair` are the exception: they are rules, not text.
  */
 const swatches = {
   dark: {
@@ -69,7 +79,7 @@ const swatches = {
     hair: "#2f2e3c",       // hairline between rows
     ink: "#DDD1C7",        // primary text
     dim: "#a7abae",        // secondary text
-    faint: "#6f7573",      // tertiary / labels
+    faint: "#8b9190",      // tertiary / labels
     live: "#8DB580",       // success
     work: "#f59e0b",       // warning
     fault: "#f87171",      // error
@@ -77,19 +87,19 @@ const swatches = {
     cold: "#a78bfa",       // a model coming off the disk — not green, amber or red
   },
   light: {
-    bg: "#DDD1C7",
-    raise: "#f2ece5",
-    raise2: "#faf5ef",
-    line: "#cfc6ba",
-    hair: "#eae2d8",
-    ink: "#4B4A67",
-    dim: "#7E8987",
-    faint: "#a8a6b0",
-    live: "#8DB580",
-    work: "#b45309",
-    fault: "#dc2626",
-    peer: "#2F6690",
-    cold: "#6d28d9",
+    bg: "#EFE8DF",
+    raise: "#FAF6F1",
+    raise2: "#FFFDFA",
+    line: "#C7BAA9",
+    hair: "#E4DACE",
+    ink: "#3B3A52",
+    dim: "#565E5C",
+    faint: "#666272",
+    live: "#2F6B3C",
+    work: "#9A4A07",
+    fault: "#C11D1D",
+    peer: "#28597F",
+    cold: "#5B21B6",
   },
 } as const;
 

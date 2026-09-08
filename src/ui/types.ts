@@ -262,6 +262,24 @@ export interface Overrides {
   yaml: string;
 }
 
+/**
+ * Where a request for one id may go, and what happens when it cannot.
+ *
+ * A peer mapping says a request MAY leave this box; this says whether it will,
+ * and whether home is still an option if the peer cannot take it. The two are
+ * separate settings and the difference between them is the difference between
+ * a slow request and a 404.
+ */
+export interface Routing {
+  policy: "local" | "peer" | "spillover" | "fastest";
+  /** Who may serve it, in preference order. Empty means anyone that maps it. */
+  peers: string[];
+  /** Fall back to the local backend when no peer can take it. */
+  fallbackLocal: boolean;
+  /** `spillover` only: go remote once this many jobs are queued here. */
+  spilloverAt: number;
+}
+
 export interface Controls {
   lending: boolean;
   borrowing: boolean;
@@ -294,6 +312,8 @@ export interface UiData {
    * variant — those rows stand alone.
    */
   aliases?: Record<string, string>;
+  /** Advertised id -> how it routes. Absent for a node that declares no models. */
+  routing?: Record<string, Routing>;
   /**
    * Every request that ran on a local backend and ended inside the same
    * 10-minute window as the samples, oldest first.

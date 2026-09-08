@@ -57,10 +57,6 @@ export type Sel =
   | { kind: "resource"; id: string }
   | null;
 
-export const selEq = (a: Sel, b: Sel): boolean =>
-  a === b || (!!a && !!b && a.kind === b.kind
-    && (a.kind === "self" || b.kind === "self" || a.id === (b as { id: string }).id));
-
 /* ----------------------------------------------------------------- layout */
 
 interface Placed {
@@ -161,7 +157,7 @@ function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
  * That is not an aesthetic preference — a node that moves between polls cannot
  * be clicked, and a particle mid-flight would jump.
  */
-function layout(width: number, height: number, self: Node | undefined, peers: Node[],
+function layout(width: number, height: number, peers: Node[],
                 backends: Backend[], resources: Resource[]): Scene {
   const nodes = new Map<string, Placed>();
   const inner = width - PAD * 2;
@@ -302,7 +298,6 @@ function layout(width: number, height: number, self: Node | undefined, peers: No
     }
   }
 
-  void self;
   // Fill the stage when the content is shorter than it, so there is no strip of
   // dead page under the cards; grow past it only when even the tight layout
   // does not fit, which is the one case worth a scrollbar.
@@ -385,11 +380,21 @@ function useSparks(calls: Call[] | undefined): Spark[] {
 /* ----------------------------------------------------------------- nodes */
 
 /** The shell every node shares: the click target, the selected ring, the tone. */
-function NodeBox({ p, tone, icon, selected, peer, dim, onSelect, onHover, title, children }: {
+function NodeBox({ p, tone, icon, selected, peer, dim, onSelect, onHover, title, label, children }: {
   p: Placed;
   tone: "live" | "work" | "fault" | "cold" | "idle";
   icon: IconKind;
   selected: boolean;
+  /**
+   * What this node IS, in a few words, for anyone not reading the picture.
+   *
+   * Stated rather than derived from the tooltip: a tooltip on a MUI control
+   * becomes the control's accessible NAME unless something else claims it, so
+   * without this every node announces itself as its own paragraph of
+   * explanation and never says which node it is. The paragraph is still
+   * carried, as the description.
+   */
+  label: string;
   /** A peer machine: a live peer takes the peer hue, self takes the success green. */
   peer?: boolean;
   /** Something else is hovered and this is not connected to it. */
@@ -409,10 +414,11 @@ function NodeBox({ p, tone, icon, selected, peer, dim, onSelect, onHover, title,
   // enough that nine backends fit a laptop without the stage scrolling.
   const glyph = glyphFor(p.w);
   return (
-    <Tooltip title={title}>
+    <Tooltip title={title} describeChild>
       <Box
         role="button"
         tabIndex={0}
+        aria-label={label}
         aria-pressed={selected}
         onClick={onSelect}
         onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(); } }}
@@ -454,8 +460,7 @@ function NodeBox({ p, tone, icon, selected, peer, dim, onSelect, onHover, title,
 }
 
 /** The node's name line: a status dot, the name, and a number on the right. */
-function Head({ tone, name, right }: { tone: string; name: string; right?: React.ReactNode }) {
-  void tone; // the mark carries it now
+function Head({ name, right }: { name: string; right?: React.ReactNode }) {
   return (
     <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, minWidth: 0 }}>
       <Typography component="span" sx={{
@@ -608,7 +613,7 @@ export function Graph({ d, sel, onSelect }: {
   const resources = hostNode ? [...declared, hostNode] : declared;
 
   const scene = useMemo(
-    () => layout(box.w, box.h, self, peers, backends, resources),
+    () => layout(box.w, box.h, peers, backends, resources),
     // The identity of these arrays changes every poll; their SHAPE is what the
     // layout depends on, and re-running it on unchanged shape would recompute
     // the same numbers three times a second for nothing.
@@ -810,11 +815,12 @@ export function Graph({ d, sel, onSelect }: {
             const queued = Object.values(d.q.capacity.queued).reduce((a, b) => a + b, 0);
             return (
               <NodeBox p={p} tone={queued ? "work" : "live"} icon="self"
+                       label={`${self?.name ?? "this node"}, this node, ${running} running, ${queued} queued`}
                        selected={sel?.kind === "self"}
                        dim={dimmed("self")} onHover={(on) => setHover(on ? "self" : null)}
                        onSelect={() => onSelect({ kind: "self" })}
                        title="this node — click for federation switches and unsaved runtime changes">
-                <Head tone={queued ? "warning.main" : "success.main"} name={self?.name ?? "this node"}
+                <Head name={self?.name ?? "this node"}
                       right={<Typography component="span" sx={{ fontFamily: MONO, fontSize: 10, color: "faint" }}>self</Typography>} />
                 <Sub>{running} running · {queued} queued{d.q.capacity.offbox ? ` · ${d.q.capacity.offbox} off-box` : ""}</Sub>
                 <Sub color={d.controls.lending === false || d.controls.borrowing === false ? "warning.main" : "faint"}>
@@ -836,6 +842,7 @@ export function Graph({ d, sel, onSelect }: {
             return (
               <NodeBox key={n.name} p={p} peer tone={!n.up ? "fault" : n.free === 0 ? "work" : "live"}
                        icon="peer"
+                       label={`${n.name}, peer, ${n.up ? `${busy} of ${n.slots ?? "unknown"} busy` : "not answering"}`}
                        selected={sel?.kind === "peer" && sel.id === n.name}
                        dim={dimmed(`peer:${n.name}`)}
                        onHover={(on) => setHover(on ? `peer:${n.name}` : null)}
@@ -843,7 +850,7 @@ export function Graph({ d, sel, onSelect }: {
                        title={n.up
                          ? `${n.name} is answering — click to link or unlink its models`
                          : `${n.name} is not answering${n.lastError ? `: ${n.lastError}` : ""}`}>
-                <Head tone={!n.up ? "error.main" : "success.main"} name={n.name}
+                <Head name={n.name}
                       right={<Pips used={Math.max(0, busy)} slots={n.slots ?? 0} />} />
                 <Sub color={n.up ? "faint" : "error.main"}>
                   {n.up ? `${busy}/${n.slots ?? "?"} busy · ${n.queued ?? 0} queued` : "down"}
@@ -877,20 +884,34 @@ export function Graph({ d, sel, onSelect }: {
             const loading = (b.loading ?? []).map((m) => displayId(m, d.aliases, d.net.available));
             const split = (b.offload ?? []).filter((o) => o.cpuLayers !== null || o.cpuExpertsAll);
             const proxied = b.proxying ?? [];
+            // Silence from a backend we are actually watching. Only ever
+            // `false` for the backends whose event stream we hold open, so it
+            // is a reading rather than an absence of one — and it outranks
+            // everything below, because every other state here describes work
+            // that this backend may no longer be doing.
+            const mute = b.answering === false;
             // A load outranks a running job for the node's own colour: the job IS
             // the load, and "running" is the least useful of the two things to
             // say about a backend that will be busy for another minute.
-            const tone = loading.length ? "cold"
+            const tone = mute ? "fault"
+              : loading.length ? "cold"
               : stalled ? "work"
               : used > 0 || proxied.length ? "live" : q > 0 ? "work" : "idle";
             return (
               <NodeBox key={b.name} p={p} tone={tone}
                        icon={backendIcon(b.kind, (b.routes ?? []).length > 0)}
+                       label={`${b.name}, backend, ${mute ? "no answer in a minute"
+                         : loading.length ? `loading ${loading.join(", ")}`
+                         : stalled ? "blocked"
+                         : used > 0 ? `${used} running`
+                         : proxied.length ? `${proxied.length} forwarded` : "idle"}`}
                        selected={sel?.kind === "backend" && sel.id === b.name}
                        dim={dimmed(`backend:${b.name}`)}
                        onHover={(on) => setHover(on ? `backend:${b.name}` : null)}
                        onSelect={() => onSelect({ kind: "backend", id: b.name })}
-                       title={loading.length
+                       title={mute
+                         ? `Nothing has come back from ${b.name} in a minute. hearth holds an event stream to it, so this is silence on a connection that should be talking — not merely a quiet backend. Anything below is the last thing it said.`
+                         : loading.length
                          ? `${b.name} is loading ${loading.join(", ")} from disk. Nothing else can start on its card until that finishes, and a cold load of a large model is tens of seconds — the request waiting on it is not stuck.`
                          : stalled
                          ? `${q} waiting on hardware someone else holds — ${held.map((r) => `${r.holder} has ${r.name}`).join(", ")}`
@@ -899,20 +920,19 @@ export function Graph({ d, sel, onSelect }: {
                          : proxied.length
                            ? `${proxied.length} request(s) are being forwarded straight through to ${b.name}. hearth is not scheduling them: they hold no slot, wait for nothing, and the card arbiter cannot see them.`
                            : `${b.name}${b.url ? ` · ${b.url}` : ""} — click for its models`}>
-                <Head tone={loading.length ? "cold.main"
-                            : stalled ? "warning.main"
-                            : used > 0 || proxied.length ? "success.main" : "faint"} name={b.name}
-                      right={<Pips used={Math.max(0, used)} slots={slots} />} />
+                <Head name={b.name} right={<Pips used={Math.max(0, used)} slots={slots} />} />
                 {/* A load outranks everything else this line could say. While it
                     runs the backend has nothing loaded and a job running, and
                     both of those readings are true and useless — the fact that
                     matters is that a file is coming off a disk and the wait is
                     expected. It breathes because it is the one state here that
                     ends on its own. */}
-                <Sub color={loading.length ? "cold.main"
+                <Sub color={mute ? "error.main"
+                  : loading.length ? "cold.main"
                   : stalled ? "warning.main" : loaded.length ? "success.main" : "faint"}
-                     sx={loading.length ? { animation: "hearth-breathe 1.8s ease-in-out infinite" } : undefined}>
-                  {loading.length ? `loading ${loading.join(", ")}`
+                     sx={loading.length && !mute ? { animation: "hearth-breathe 1.8s ease-in-out infinite" } : undefined}>
+                  {mute ? "no answer in a minute"
+                    : loading.length ? `loading ${loading.join(", ")}`
                     : stalled ? `blocked · ${held.map((r) => r.name).join(", ")}`
                     : loaded.length ? loaded.join(", ")
                     : held.length ? `${held.map((r) => r.name).join(", ")} busy`
@@ -974,6 +994,12 @@ export function Graph({ d, sel, onSelect }: {
                          : r.holder ? "live" : unqueued.length ? "work"
                          : r.shared && inUse.length ? "live" : "idle"}
                        icon={r.host ? "ram" : resourceIcon(r.kind)}
+                       label={`${r.name}, ${r.host ? "host memory" : "hardware"}, ${
+                         r.host ? "holding weights that did not fit on a card"
+                           : filling.length ? "loading a model"
+                           : r.shared ? `shared, ${inUse.length} working`
+                           : r.holder ? `${r.holder} holding`
+                           : unqueued.length ? "in use, unscheduled" : "free"}`}
                        selected={sel?.kind === "resource" && sel.id === r.name}
                        dim={dimmed(`resource:${r.name}`)}
                        onHover={(on) => setHover(on ? `resource:${r.name}` : null)}
@@ -989,8 +1015,7 @@ export function Graph({ d, sel, onSelect }: {
                          : unqueued.length
                            ? `${r.name} is busy: ${unqueued.map((b) => b.name).join(", ")} is working on it. But hearth is not scheduling that work — it was forwarded straight through — so hearth cannot make anything else wait for this card while it runs.`
                            : `${r.name} is free — free and still loaded is the normal resting state`}>
-                <Head tone={r.host || filling.length ? "cold.main"
-                  : r.holder ? "success.main" : unqueued.length ? "warning.main" : "faint"} name={r.name} />
+                <Head name={r.name} />
                 <Sub color={r.host || filling.length ? "cold.main"
                   : r.holder || (r.shared && inUse.length) ? "success.main"
                   : unqueued.length ? "warning.main" : "faint"}

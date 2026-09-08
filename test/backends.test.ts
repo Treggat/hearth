@@ -18,6 +18,7 @@ import type { AddressInfo } from "node:net";
 
 import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
+import { BackendPool } from "../src/pool.js";
 import { createNode } from "../src/server.js";
 
 /** A backend that can be told to hold a generation open. */
@@ -440,6 +441,58 @@ side.close();
   });
   assert.equal(many.backends[0]!.concurrency, 2, "inherits the scheduler default");
   assert.equal(many.backends[1]!.concurrency, 9, "and can be overridden");
+}
+
+// --- an id nothing serves is refused, not queued ---------------------------
+//
+// Resolution falls back to the first backend, which is right for a backend that
+// cannot enumerate its models and wrong for a typo: it waits its turn, can
+// evict whatever is resident on the way in, and 404s from the backend having
+// spent a slot. Refused up front, but ONLY where every backend declared what it
+// serves — a backend that discovers its models is unknowable while it is down,
+// and answering for it would turn a restart into "no such model".
+{
+  // Its own backend: the ones above are already closed by this point.
+  const only = fake("only", ["real"]);
+  await only.listen();
+  const declared = createNode(
+    parseConfig({
+      name: "declared",
+      backends: [{ name: "gpu", url: only.url(), serves: ["real"] }],
+    }),
+    silentLogger,
+  );
+  declared.start();
+  const dbase = await new Promise<string>((ready) =>
+    declared.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(declared.server.address() as AddressInfo).port}`)),
+  );
+  const ask = (model: string) => fetch(`${dbase}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, messages: [] }),
+  });
+
+  const bogus = await ask("nope");
+  assert.equal(bogus.status, 404, "an id no declared backend serves is refused up front");
+  assert.match(JSON.stringify(await bogus.json()), /real/,
+    "and the refusal says what there is, so a typo is obvious");
+
+  const good = await ask("real");
+  assert.notEqual(good.status, 404, "a declared model still routes");
+  await good.text();
+  assert.equal(declared.pool.jobs().length, 0, "the refusal never took a slot");
+  await declared.close();
+
+  // The control: a backend that did NOT declare its models keeps the old
+  // fallback, because nothing here can prove the id is wrong.
+  const discovering = new BackendPool(parseConfig({
+    name: "discovering",
+    backends: [{ name: "a", url: only.url() }],
+  }), silentLogger);
+  assert.equal(discovering.certainlyUnknown("anything"), false,
+    "an undeclared backend could serve anything, so nothing is certain");
+  only.close();
 }
 
 console.log("backends.test.ts ok");

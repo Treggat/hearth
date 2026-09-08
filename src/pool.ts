@@ -24,6 +24,15 @@ import { mergeStats, type ModelStats } from "./stats.js";
 import { ResourceArbiter } from "./resources.js";
 import { Scheduler } from "./scheduler.js";
 
+/**
+ * How long the whole clear-the-card sequence may take.
+ *
+ * One unload caps its own wait at 30s, so a card with several neighbours could
+ * otherwise be held for a multiple of that while everything queued for it
+ * waits. Generous against a healthy unload, which is a fraction of a second.
+ */
+const EVICT_BUDGET_MS = 45_000;
+
 /** One backend, with the queue that fronts it. */
 export interface BackendSlot {
   name: string;
@@ -221,6 +230,13 @@ export class BackendPool {
    * loading, and the point is to be sure the card is free before we put
    * something on it. In practice it is one or two calls that are usually
    * no-ops.
+   *
+   * `unload()` never throws and caps its own wait, so this cannot fail — but it
+   * CAN be slow, and everything queued for this card is waiting behind it. The
+   * whole sequence is therefore bounded as well as each call in it: past the
+   * deadline we stop asking and let the job proceed, because a neighbour that
+   * will not answer an unload is not going to start answering, and holding the
+   * card hostage to it helps nobody.
    */
   private async evictFor(b: BackendConfig): Promise<void> {
     // Shared hardware never causes an eviction: that is the whole hazard this
@@ -229,8 +245,15 @@ export class BackendPool {
     const overlap = this.slots.filter(
       (s) => s.name !== b.name && this.arbitrated(s.cfg.resources).some((r) => mine.includes(r)),
     );
+    const deadline = Date.now() + EVICT_BUDGET_MS;
     for (const s of overlap) {
       if (!s.state.resident()) continue;
+      if (Date.now() >= deadline) {
+        this.log.warn("pool.evict_budget", {
+          for: b.name, resources: mine, skipped: s.name, budgetMs: EVICT_BUDGET_MS,
+        });
+        break;
+      }
       this.log.info("pool.evict", { backend: s.name, for: b.name, resources: mine });
       this.evicted.push({ t: Date.now(), backend: s.name, for: b.name, resources: [...mine] });
       while (this.evicted.length > 20) this.evicted.shift();
@@ -370,6 +393,34 @@ export class BackendPool {
       return claiming[0]!;
     }
     return this.first();
+  }
+
+  /**
+   * Is it CERTAIN that no backend here can serve this id?
+   *
+   * `for()` sends an unrecognised id to the first backend, which is the right
+   * fallback for resolution — a backend that cannot enumerate its models may
+   * well serve it. It is the wrong thing to queue: a typo then waits its turn,
+   * can evict a resident model on the way in, and 404s from the backend having
+   * cost a slot on the GPU.
+   *
+   * So this answers the narrower question, and only says yes when it cannot be
+   * wrong: every backend has DECLARED what it serves, so the catalogue is a
+   * fact from the config rather than a discovery, and none of them names this
+   * id. A backend that discovers its models is unknowable while it is down, and
+   * refusing on its behalf would turn a restart into "no such model".
+   */
+  certainlyUnknown(model: string): boolean {
+    // Named in `models:` — the operator said this id means something, and
+    // `backend`/`as` may point it somewhere this check cannot see.
+    if (this.cfg.models[model]) return false;
+    const wire = this.outboundId(model);
+    for (const s of this.slots) {
+      if (s.cfg.serves.length === 0) return false;
+      if (s.cfg.serves.includes(wire) || s.cfg.serves.includes(model)) return false;
+      for (const r of s.cfg.routes) if (r.model === wire || r.model === model) return false;
+    }
+    return true;
   }
 
   /** Everything any backend could serve, deduped. A backend that declared its

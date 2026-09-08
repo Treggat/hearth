@@ -22,7 +22,7 @@ import { History } from "../src/history.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 import { UI_HTML } from "../src/ui.js";
-import { blockers, waitReason } from "../src/ui/why.js";
+import { blockers, callStats, waitReason } from "../src/ui/why.js";
 
 // --- the shell must actually carry the console -----------------------------
 // The class of bug this replaces is gone rather than tested for: the page was a
@@ -208,13 +208,14 @@ const base = await new Promise<string>((ready) =>
     "and the record of what is not in the file");
   assert.ok(!html.includes("secret-key"), "no credential may appear in the page");
 
-  // Two views behind one menu, the choice remembered per browser. Pinned as
-  // strings, like the operator copy above: the labels are what a person clicks,
-  // and losing the second view is the regression to catch. The dashboard draws
-  // itself from the same tables and panels as the graph, so a rename that keeps
-  // these words keeps the view — there is no second copy to drift.
-  assert.match(html, /Dashboard/, "the view menu offers the dashboard view");
-  assert.match(html, /Graph/, "and the graph view");
+  // Two views, both offered at once, the choice remembered per browser. Pinned
+  // as strings, like the operator copy above: the labels are what a person
+  // clicks, and losing the second view is the regression to catch. The
+  // dashboard draws itself from the same tables and panels as the graph, so a
+  // rename that keeps these words keeps the view — there is no second copy to
+  // drift.
+  assert.match(html, /"dashboard"/, "the switcher offers the dashboard view");
+  assert.match(html, /"graph"/, "and the graph view");
   assert.ok(html.includes("hearth.view"), "the chosen view is remembered across reloads");
 }
 
@@ -591,6 +592,45 @@ const base = await new Promise<string>((ready) =>
   await aliased.close();
 }
 
+// --- where each id is allowed to go ----------------------------------------
+//
+// A peer mapping only says a request MAY leave this box. The policy says
+// whether it will, and `fallbackLocal` says what happens when the peer cannot
+// take it -- the difference between a slow request and a 404. Neither can be
+// read off the mapping, so the console can only state them if the server
+// sends them.
+{
+  const routed = createNode(
+    parseConfig({
+      name: "routing",
+      backend: { url: backendUrl, kind: "llama-swap" },
+      peers: [{ name: "friend", url: "http://127.0.0.1:1", token: "t", models: { shared: "shared", theirs: "theirs" } }],
+      models: {
+        shared: { policy: "fastest", fallbackLocal: true },
+        theirs: { policy: "peer", peers: ["friend"], fallbackLocal: false },
+      },
+    }),
+    silentLogger,
+  );
+  routed.start();
+  const rbase = await new Promise<string>((ready) =>
+    routed.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(routed.server.address() as AddressInfo).port}`)),
+  );
+  const rd = (await (await fetch(`${rbase}/ui/data`)).json()) as {
+    routing: Record<string, { policy: string; peers: string[]; fallbackLocal: boolean }>;
+  };
+  assert.equal(rd.routing.shared?.policy, "fastest");
+  assert.equal(rd.routing.shared?.fallbackLocal, true,
+    "a model we also serve keeps home as an option");
+  assert.equal(rd.routing.theirs?.policy, "peer");
+  assert.equal(rd.routing.theirs?.fallbackLocal, false,
+    "no local fallback is its own fact, not implied by the policy");
+  assert.deepEqual(rd.routing.theirs?.peers, ["friend"],
+    "the preference list goes with it, so the page can say when a mapping is not a candidate");
+  await routed.close();
+}
+
 await node.close();
 backend.closeAllConnections();
 backend.close();
@@ -709,4 +749,29 @@ console.log("ui.test.ts ok");
     /must be false or/,
     "there is deliberately no `trusted` mode; an unknown value is refused",
   );
+}
+
+// callStats: the numbers the history header reports.
+{
+  const c = (ms: number, waitedMs = 0, ok = true) =>
+    ({ t: 0, model: "m", backend: "b", ms, waitedMs, ok });
+
+  const empty = callStats([]);
+  assert.equal(empty.n, 0);
+  assert.equal(empty.medianMs, null, "no calls means no median, not a zero");
+  assert.equal(callStats(undefined).n, 0, "an absent calls array is not a crash");
+
+  const one = callStats([c(400)]);
+  assert.equal(one.medianMs, 400);
+  assert.equal(one.p95Ms, 400, "nearest-rank: a single call is its own p95");
+
+  // Ten calls, 100..1000. Nearest-rank p50 is the 5th, p95 the 10th.
+  const ten = callStats(Array.from({ length: 10 }, (_, i) => c((i + 1) * 100)));
+  assert.equal(ten.medianMs, 500);
+  assert.equal(ten.p95Ms, 1000);
+
+  const mixed = callStats([c(100, 5_000), c(200, 0, false), c(300, 0, false)]);
+  assert.equal(mixed.failed, 2, "failures are counted, not folded into the timings");
+  assert.equal(mixed.maxWaitMs, 5_000, "the worst wait is reported, not the average");
+  assert.equal(mixed.medianMs, 200, "queue wait never moves the run-time median");
 }

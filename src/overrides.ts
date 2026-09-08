@@ -25,7 +25,10 @@
  * second read path to keep in step. The price is that `cfg` no longer tells you
  * what the file said, which is why the baseline below is cloned first.
  */
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 import { parseDocument } from "yaml";
@@ -142,7 +145,15 @@ export function writeState(path: string, state: SavedState): void {
   }
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  // Same staging discipline as the config write: flushed before the rename, so
+  // the name never points at bytes that are not on disk yet.
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tmp, path);
 }
 
@@ -407,7 +418,18 @@ export class Overrides {
       // 0600 came out world-readable, silently, the first time anyone pressed
       // Save. This file holds peer tokens and api keys whenever they are
       // written literally rather than as `env:` references.
-      writeFileSync(tmp, out, { mode: mode & 0o7777 });
+      // Written, flushed to the platter, and only then renamed. writeFileSync
+      // returns once the data is in the page cache, so a rename straight after
+      // it can be durable while the bytes it points at are not — which on a
+      // power loss leaves a zero-length config and a node that will not start.
+      // The whole point of staging is to make that impossible.
+      const fd = openSync(tmp, "w", mode & 0o7777);
+      try {
+        writeFileSync(fd, out);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
       staged = true;
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
