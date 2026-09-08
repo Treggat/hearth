@@ -169,6 +169,20 @@ const post = (p: string, body: unknown = {}, signal?: AbortSignal) =>
     ...(signal ? { signal } : {}),
   });
 
+// Wait for a condition instead of guessing a delay. The fixed 80ms this
+// replaces was enough for the first render to reach the backend on CI and not
+// on a loaded machine, where the request had simply not arrived yet and
+// inflight read 0. Polling removes the guess without weakening the check: the
+// race-free over-commit guard is b.peak() at the end of the block, which no
+// snapshot can beat.
+const until = async (cond: () => boolean, what: string, ms = 5_000): Promise<void> => {
+  const deadline = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+};
+
 // --- a declared route is queued -------------------------------------------
 // The backend's concurrency is 1, so if this is queued the second request
 // cannot reach it while the first is in flight. Unqueued, both arrive at once,
@@ -176,7 +190,7 @@ const post = (p: string, body: unknown = {}, signal?: AbortSignal) =>
 {
   const a = post("/generate", { prompt: "one" });
   const c = post("/generate", { prompt: "two" });
-  await new Promise((r) => setTimeout(r, 80));
+  await until(() => b.inflight() >= 1, "the first render to reach the backend");
   assert.equal(b.inflight(), 1, "only one render reaches the backend at a time");
 
   // --- and an unqueued route answers WHILE it does --------------------------
