@@ -165,10 +165,14 @@ export interface Placed {
   h: number;
 }
 
+export interface Pt { x: number; y: number }
+
 export interface Edge {
   id: string;
   from: string;
   to: string;
+  /** The cubic's four control points, so the drawn shape can be measured. */
+  pts: Pt[];
   /** Sibling links leave sideways; parent links leave downwards. */
   dir: "across" | "down";
   d: string;
@@ -217,7 +221,7 @@ const midOf = (p0: number, p1: number, p2: number, p3: number): number =>
  * are indistinguishable.
  */
 function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
-  d: string; mid: { x: number; y: number };
+  d: string; mid: { x: number; y: number }; pts: Pt[];
 } {
   if (dir === "across") {
     // Right-to-left when the target is left of the source, so the return leg
@@ -230,6 +234,7 @@ function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
     return {
       d: `M ${x1} ${y1} C ${x1 + k} ${c1y} ${x2 - k} ${c2y} ${x2} ${y2}`,
       mid: { x: midOf(x1, x1 + k, x2 - k, x2), y: midOf(y1, c1y, c2y, y2) },
+      pts: [{ x: x1, y: y1 }, { x: x1 + k, y: c1y }, { x: x2 - k, y: c2y }, { x: x2, y: y2 }],
     };
   }
   // Inset the TARGET only, and this asymmetry is the point. A backend's content
@@ -240,10 +245,26 @@ function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
   // backends instead.
   const x1 = a.x + a.w / 2, y1 = a.y + a.h;
   const x2 = b.x + b.w / 2, y2 = b.y + inset(b);
-  const k = Math.max(20, (y2 - y1) * 0.55);
+  // A straight run, and it has to be straight.
+  //
+  // Wires into one card converge on one point, so straight ones cannot swap
+  // sides on the way there however the tier wraps — six sidecars on a shared
+  // CPU fan in cleanly whether they sit in one row or two. Any bow at all
+  // reintroduces crossings, and a bow that leaves VERTICALLY is the worst of
+  // them: the wire loiters above the backend in the row below, then sweeps
+  // across that backend's own wire to reach the card they share. Measured, not
+  // assumed — see countCrossings and test/layout.test.ts.
+  //
+  // Kept as a cubic rather than a line so the shape stays one type: the
+  // particles ride it with offsetPath and the flattening below reads it the
+  // same as the bowed peer arcs.
+  const dx = x2 - x1, dy = y2 - y1;
+  const c1x = x1 + dx / 3, c1y = y1 + dy / 3;
+  const c2x = x2 - dx / 3, c2y = y2 - dy / 3;
   return {
-    d: `M ${x1} ${y1} C ${x1} ${y1 + k} ${x2} ${y2 - k} ${x2} ${y2}`,
-    mid: { x: midOf(x1, x1, x2, x2), y: midOf(y1, y1 + k, y2 - k, y2) },
+    d: `M ${x1} ${y1} C ${c1x} ${c1y} ${c2x} ${c2y} ${x2} ${y2}`,
+    mid: { x: midOf(x1, c1x, c2x, x2), y: midOf(y1, c1y, c2y, y2) },
+    pts: [{ x: x1, y: y1 }, { x: c1x, y: c1y }, { x: c2x, y: c2y }, { x: x2, y: y2 }],
   };
 }
 
@@ -383,8 +404,8 @@ export function layout(width: number, height: number, peers: Node[],
   const push = (from: string, to: string, dir: "across" | "down", lift = 0) => {
     const a = nodes.get(from), b = nodes.get(to);
     if (!a || !b) return;
-    const { d, mid } = curve(a, b, dir, lift);
-    edges.push({ id: `${from}>${to}`, from, to, dir, d, mid });
+    const { d, mid, pts } = curve(a, b, dir, lift);
+    edges.push({ id: `${from}>${to}`, from, to, dir, d, mid, pts });
   };
   // Two arcs per peer, bowed opposite ways: what we send them, and what they
   // send us. They are separate facts and one line cannot hold both.
@@ -417,40 +438,19 @@ export function layout(width: number, height: number, peers: Node[],
 
 /* -------------------------------------------------------- crossings */
 
-/**
- * How many pairs of backend->card edges cross.
- *
- * Counted on the straight line between the two endpoints rather than on the
- * drawn curve. The curves are monotone in y and bow only slightly, so two that
- * do not cross as segments do not cross as curves either — and the point of
- * this number is to compare one ORDERING against another, not to be a pixel
- * measurement.
- *
- * Only the backend tier's downward edges are counted. The fan from self to the
- * backends leaves one point and converges nowhere, so it cannot self-cross, and
- * peer arcs are drawn deliberately bowed apart.
- */
-export function countCrossings(scene: Scene): number {
-  const segs = scene.edges
-    .filter((e) => e.from.startsWith("backend:") && e.to.startsWith("resource:"))
-    .map((e) => {
-      const a = scene.nodes.get(e.from)!;
-      const b = scene.nodes.get(e.to)!;
-      return { x1: a.x + a.w / 2, y1: a.y + a.h, x2: b.x + b.w / 2, y2: b.y };
+/** A cubic, flattened to a polyline. Enough segments that a bow is not a chord. */
+function flatten(pts: Pt[], steps = 32): Pt[] {
+  const [p0, p1, p2, p3] = pts as [Pt, Pt, Pt, Pt];
+  const out: Pt[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps, u = 1 - t;
+    const a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, dd = t * t * t;
+    out.push({
+      x: a * p0.x + b * p1.x + c * p2.x + dd * p3.x,
+      y: a * p0.y + b * p1.y + c * p2.y + dd * p3.y,
     });
-
-  let n = 0;
-  for (let i = 0; i < segs.length; i++) {
-    for (let j = i + 1; j < segs.length; j++) {
-      const p = segs[i]!, q = segs[j]!;
-      // Edges into the same card converge on one point; they meet there by
-      // construction rather than crossing, and counting that would punish
-      // exactly the grouping this is meant to reward.
-      if (p.x2 === q.x2 && p.y2 === q.y2) continue;
-      if (segmentsCross(p, q)) n++;
-    }
   }
-  return n;
+  return out;
 }
 
 interface Seg { x1: number; y1: number; x2: number; y2: number }
@@ -462,4 +462,51 @@ function segmentsCross(p: Seg, q: Seg): boolean {
   const a = side(p, q.x1, q.y1), b = side(p, q.x2, q.y2);
   const c = side(q, p.x1, p.y1), d = side(q, p.x2, p.y2);
   return a !== b && c !== d && a !== 0 && b !== 0 && c !== 0 && d !== 0;
+}
+
+/**
+ * How many pairs of backend->card wires cross where somebody can see it.
+ *
+ * Measured on the CURVE, not on the straight line between the endpoints, and
+ * that distinction is the whole point of this function. A wire leaves its
+ * backend going straight down and only then sweeps sideways, so two wires whose
+ * chords never meet can still cross on the page — which is exactly what
+ * happens to two backends stacked in one column that both feed a card away to
+ * one side.
+ *
+ * Edges that share a card are counted too. They converge on one point, so they
+ * necessarily meet THERE; what is being looked for is a pair that has already
+ * swapped sides before it arrives, which reads as a tangle rather than as a
+ * join. Meetings within `MERGE` of the shared end are ignored for that reason.
+ */
+const MERGE = 40;
+
+export function countCrossings(scene: Scene): number {
+  const wires = scene.edges
+    .filter((e) => e.from.startsWith("backend:") && e.to.startsWith("resource:"))
+    .map((e) => ({ to: e.to, line: flatten(e.pts) }));
+
+  let n = 0;
+  for (let i = 0; i < wires.length; i++) {
+    for (let j = i + 1; j < wires.length; j++) {
+      const a = wires[i]!, b = wires[j]!;
+      const shared = a.to === b.to ? a.line[a.line.length - 1]! : null;
+      if (crosses(a.line, b.line, shared)) n++;
+    }
+  }
+  return n;
+}
+
+function crosses(a: Pt[], b: Pt[], shared: Pt | null): boolean {
+  for (let i = 0; i + 1 < a.length; i++) {
+    const p: Seg = { x1: a[i]!.x, y1: a[i]!.y, x2: a[i + 1]!.x, y2: a[i + 1]!.y };
+    for (let j = 0; j + 1 < b.length; j++) {
+      const q: Seg = { x1: b[j]!.x, y1: b[j]!.y, x2: b[j + 1]!.x, y2: b[j + 1]!.y };
+      if (!segmentsCross(p, q)) continue;
+      // Near the card they share, this is the join and not a tangle.
+      if (shared && Math.hypot(p.x1 - shared.x, p.y1 - shared.y) < MERGE) continue;
+      return true;
+    }
+  }
+  return false;
 }

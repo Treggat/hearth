@@ -150,13 +150,35 @@ console.log("layout.test.ts ok");
     ["classifier", ["cpu"]],
   ]);
 
-  for (const [label, { backends, resources }] of [["real", real], ["interleaved", interleaved]] as const) {
-    for (const [w, h] of [[1900, 1150], [1500, 900], [1200, 900], [900, 800]] as const) {
-      const scene = layout(w, h, [], orderBackends(backends, resources), resources);
-      assert.equal(countCrossings(scene), 0,
-        `${label} at ${w}x${h} should draw no crossed wires`);
+  // Eight sidecars on one shared cpu: a group far too big for one row, which is
+  // the case that forced the wires straight.
+  const manyCpu = mk([
+    ["gpu", ["b70"]],
+    ...Array.from({ length: 8 }, (_, i) => [`side${i}`, ["cpu"]] as [string, string[]]),
+  ]);
+  // Two cards, no shared hardware, nothing in common between the halves.
+  const split = mk([
+    ["a", ["g0"]], ["b", ["g0"]], ["c", ["g0"]],
+    ["d", ["g1"]], ["e", ["g1"]], ["f", ["g1"]],
+  ]);
+
+  // Every window a laptop or a monitor might give the stage, not the three that
+  // happened to look right: the tier wraps to one, two and three rows across
+  // this range, and the wrap is what used to decide whether wires tangled.
+  let checked = 0;
+  for (const [label, { backends, resources }] of
+       [["real", real], ["interleaved", interleaved],
+        ["manyCpu", manyCpu], ["split", split]] as const) {
+    const ordered = orderBackends(backends, resources);
+    for (let w = 660; w <= 2000; w += 40) {
+      for (const h of [600, 800, 1000, 1200]) {
+        assert.equal(countCrossings(layout(w, h, [], ordered, resources)), 0,
+          `${label} at ${w}x${h} should draw no crossed wires`);
+        checked++;
+      }
     }
   }
+  assert.ok(checked > 500, `the sweep must actually run (${checked} layouts)`);
 
   // The ordering is what does it, not the fill alone: the interleaved config
   // still crosses if the backends are left in the order they were declared.
