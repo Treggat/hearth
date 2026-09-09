@@ -15,13 +15,41 @@
  * polling /running, so a stream that's open but no longer delivering can't pin
  * our picture of the world forever.
  */
-import type { WarmSource } from "./config.js";
+import type { ActivityDecl, WarmSource } from "./config.js";
 import type { Logger } from "./log.js";
 import { known, statsFromProps, type ModelStats } from "./stats.js";
 import { getJson, send } from "./upstream.js";
 
 /** llama-swap only counts a model as loaded once it's ready to serve. */
 const READY = "ready";
+
+/**
+ * How often an activity path is read, and how long we wait for it.
+ *
+ * Sampled from build() while a page is open, so this is a floor on how often a
+ * given backend is asked no matter how fast the page ticks — a render lasts far
+ * longer than either number, so 2s of granularity loses nothing. A read that
+ * has not answered in 2s is treated as "cannot tell", which is the honest thing
+ * to draw for a backend that is not answering rather than making the page wait.
+ */
+const ACTIVITY_POLL_MS = 2_000;
+const ACTIVITY_TIMEOUT_MS = 2_000;
+
+/**
+ * Read a declared field as a count. An array is its length, a number is itself,
+ * and anything else — missing, a string, an object — is `null`, "cannot tell".
+ * The field may be dotted (`exec_info.queue_remaining`), walked without ever
+ * throwing on a missing hop.
+ */
+function countField(body: unknown, field: string): number | null {
+  const v = field.split(".").reduce<unknown>(
+    (cur, k) => (cur && typeof cur === "object" ? (cur as Record<string, unknown>)[k] : undefined),
+    body,
+  );
+  if (Array.isArray(v)) return v.length;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  return null;
+}
 /**
  * ...and this is what it says for the minute before that.
  *
@@ -165,6 +193,18 @@ export class BackendState {
   /** Per-wire in-flight learnContext, so concurrent callers dedupe. */
   private contextInFlight = new Map<string, Promise<void>>();
 
+  /**
+   * The last activity reading, its timestamp, and any read in flight.
+   *
+   * `null` until the first read comes back, which `activity()` reports as
+   * "cannot tell" rather than idle — we have not looked yet. The timestamp is
+   * the rate-limit floor and the promise is the in-flight dedupe, so a fast page
+   * tick is still one request every ACTIVITY_POLL_MS.
+   */
+  private activityReading: { running: number; queued: number | null; ok: boolean } | null = null;
+  private activityAt = 0;
+  private activityInFlight: Promise<void> | null = null;
+
   constructor(
     private readonly url: string,
     private readonly kind: WarmSource,
@@ -172,6 +212,52 @@ export class BackendState {
   ) {
     this.useEvents = kind === "llama-swap";
     this.warmIsKnown = kind !== "none";
+  }
+
+  /**
+   * Read the backend's own busy signal off its declared activity path.
+   *
+   * Fire-and-forget from the page build, so it runs ONLY while a page is open —
+   * hearth holds to making no background poll of a backend, and this keeps that
+   * true: nothing here has a timer of its own. Rate-limited to ACTIVITY_POLL_MS
+   * and deduped, so a fast page tick is not a fast poll, and a `none` backend is
+   * contacted only while someone is watching it. Returns the in-flight read so a
+   * test can await it; build() ignores the promise.
+   */
+  sampleActivity(decl: ActivityDecl): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.activityInFlight) return this.activityInFlight;
+    if (Date.now() - this.activityAt < ACTIVITY_POLL_MS) return Promise.resolve();
+    this.activityAt = Date.now();
+    const done = (async () => {
+      try {
+        const body = await getJson<unknown>(`${this.url}${decl.path}`, {
+          totalTimeoutMs: ACTIVITY_TIMEOUT_MS,
+        });
+        const running = countField(body, decl.running);
+        // A missing running field is the operator's field name being wrong, or
+        // the app changing shape — not zero. Either way we cannot tell.
+        this.activityReading = running === null
+          ? { running: 0, queued: null, ok: false }
+          : { running, queued: decl.queued ? countField(body, decl.queued) : null, ok: true };
+      } catch {
+        // Unreachable, timed out, or not JSON: cannot tell, never idle.
+        this.activityReading = { running: 0, queued: null, ok: false };
+      } finally {
+        this.activityInFlight = null;
+      }
+    })();
+    this.activityInFlight = done;
+    return done;
+  }
+
+  /** The last activity reading, or "cannot tell" until one has come back. */
+  activity(): { running: number; queued?: number; ok: boolean } {
+    const a = this.activityReading;
+    if (!a) return { running: 0, ok: false };
+    return a.queued === null
+      ? { running: a.running, ok: a.ok }
+      : { running: a.running, queued: a.queued, ok: a.ok };
   }
 
   private useEvents: boolean;

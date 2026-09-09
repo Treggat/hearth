@@ -105,6 +105,20 @@ export interface Backend {
    * light an edge but never claim a slot, a queue position or a card.
    */
   proxying?: { id: string; model: string | null }[];
+  /**
+   * A backend's OWN busy state, read from a declared `activity:` path — for one
+   * hearth forwards to but does not schedule (ComfyUI's `/queue`). Present only
+   * when the path was declared.
+   *
+   * `ok: false` is "we could not read it" — an unreachable backend, a missing
+   * field — and the page draws it as unknown, NEVER as idle: a failed reading is
+   * not evidence the thing is quiet. `running > 0` lights the node and its card
+   * edge amber, exactly like forwarded work, and never claims the card: this is
+   * work the arbiter cannot see, so it must not draw a holder for it. `queued`
+   * is nested here on purpose, away from the backend's own `queued` above, which
+   * means hearth's admission queue and would be misread as the same number.
+   */
+  activity?: { running: number; queued?: number; ok: boolean };
 }
 
 /**

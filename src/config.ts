@@ -150,6 +150,31 @@ export interface RouteRule {
   queue: boolean;
 }
 
+/**
+ * `activity:` — where a backend reports its OWN busy state.
+ *
+ * For a backend hearth forwards to but does not schedule — a submit-then-poll
+ * app like ComfyUI, whose `/prompt` answers in milliseconds while the render
+ * runs for a minute. The forwarded mark is gone long before the GPU even spins
+ * up (it tracks the HTTP request, which already returned), so the node draws
+ * idle through the whole job. `routes:` cannot fix that: a route holds a slot
+ * across the poll, and the moment a client stops polling the slot leaks.
+ *
+ * So instead the operator names a path the backend already serves and which
+ * field on it carries the count. hearth reads only those and never learns the
+ * app — the same bargain `routes:` strikes. `running` and the optional `queued`
+ * may be a dotted field path; each is read as an array (its length) or a number
+ * (itself), and anything else — missing, wrong type, an unreachable backend —
+ * is "cannot tell", which the page draws as unknown and never as idle.
+ */
+export interface ActivityDecl {
+  path: string;
+  /** Field holding what is running now. */
+  running: string;
+  /** Field holding what is queued, if the backend distinguishes the two. */
+  queued: string | null;
+}
+
 export interface BackendConfig {
   /** How this backend is named in `models.<id>.backend` and in status output.
    *  A single-backend config gets "default" without having to say so. */
@@ -231,6 +256,12 @@ export interface BackendConfig {
    * config that predates this.
    */
   routes: RouteRule[];
+  /**
+   * Where this backend reports its OWN busy state, for one hearth forwards to
+   * but does not schedule. Null for every backend that speaks `/v1`, which is
+   * most of them — see ActivityDecl.
+   */
+  activity: ActivityDecl | null;
 }
 
 export interface ModelRoute {
@@ -802,6 +833,41 @@ function apiKeyList(v: unknown, where: string): { keys: string[]; labels: string
 }
 
 /**
+ * A path that can actually match a request: absolute, no query string. Shared
+ * by `routes:` and `activity:` so the two rules cannot drift apart.
+ */
+function requirePath(path: string, at: string): void {
+  // A path that does not start with "/" can never match a request — a typo that
+  // would otherwise fail silently at 3am rather than at startup. Matching is on
+  // pathname alone, so a query string in the config is a mistake as well.
+  if (!path.startsWith("/")) {
+    throw new ConfigError(`${at}.path must start with "/" (got ${path})`);
+  }
+  if (path.includes("?")) {
+    throw new ConfigError(`${at}.path must not include a query string (got ${path})`);
+  }
+}
+
+/**
+ * `activity:` on a backend — see ActivityDecl. Absent or null for most.
+ *
+ * The path reuses the route-path rule; `running` is required because an
+ * activity block with nothing to read is a no-op the operator will think is
+ * working. `queued` is optional: some backends report one queue, some two.
+ */
+function activityDecl(v: unknown, where: string): ActivityDecl | null {
+  if (v === undefined || v === null) return null;
+  const o = asRecord(v, where);
+  const path = str(o.path, `${where}.path`);
+  requirePath(path, where);
+  return {
+    path,
+    running: str(o.running, `${where}.running`),
+    queued: o.queued === undefined ? null : str(o.queued, `${where}.queued`),
+  };
+}
+
+/**
  * `routes:` entries, as a bare path or an object.
  *
  * The bare form is the common case — one endpoint that does the work — and it
@@ -815,14 +881,7 @@ function routeList(v: unknown, where: string): RouteRule[] {
     const at = `${where}[${i}]`;
     const entry = typeof raw === "string" ? { path: raw } : asRecord(raw, at);
     const path = str(entry.path, `${at}.path`);
-    // A path that does not start with "/" cannot ever match a request, so it is
-    // a typo that would otherwise fail silently at 3am rather than at startup.
-    if (!path.startsWith("/")) {
-      throw new ConfigError(`${at}.path must start with "/" (got ${path})`);
-    }
-    if (path.includes("?")) {
-      throw new ConfigError(`${at}.path must not include a query string (got ${path})`);
-    }
+    requirePath(path, at);
     // One placeholder, standing for one whole segment. More than one, or one
     // glued to other characters, is a pattern nobody can predict the reach of —
     // which is the objection that kept wildcards out of here in the first place.
@@ -916,6 +975,7 @@ export function parseConfig(raw: unknown): HearthConfig {
           : atLeast(entry.firstByteMs, `backends[${i}].firstByteMs`, 0),
         resources: strList(entry.resources, `backends[${i}].resources`),
         routes: routeList(entry.routes, `backends[${i}].routes`),
+        activity: activityDecl(entry.activity, `backends[${i}].activity`),
       });
     }
     const seen = new Set<string>();
@@ -955,6 +1015,7 @@ export function parseConfig(raw: unknown): HearthConfig {
         : atLeast(backend.firstByteMs, "backend.firstByteMs", 0),
       resources: strList(backend.resources, "backend.resources"),
       routes: routeList(backend.routes, "backend.routes"),
+      activity: activityDecl(backend.activity, "backend.activity"),
     });
   }
   const backendNames = new Set(backends.map((b) => b.name));

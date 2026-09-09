@@ -71,6 +71,7 @@ Every key with its default. Only `backend.url` is required.
 | `backends` | — | several local backends, each with its own queue. See below |
 | `backends[].serves` | discover | model ids this backend serves. Declaring replaces discovery and acts as an allowlist |
 | `backends[].kind` | `llama-swap` | where warm state comes from: `llama-swap`, `ollama`, `single`, `none` |
+| `backends[].activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
 | `scheduler.concurrency` | `1` | default jobs-at-once per backend; a backend can override it |
 | `scheduler.lanes` | `chat`, `batch` | named lanes and their base priority |
 | `scheduler.agePerSecond` | `1` | priority earned per second waited, which is also the starvation bound |
@@ -224,6 +225,46 @@ compare it to.
 
 None of this is a fault to clear. It is a fact worth knowing about the model
 that is paying for it.
+
+### A backend that works without hearth scheduling it
+
+Some backends do their work across two requests, not one. ComfyUI takes a
+workflow on `/prompt`, answers in milliseconds with an id, and then renders for
+the next minute — the request hearth forwarded is long gone before the GPU even
+spins up. `routes:` cannot queue that: a slot held across a poll leaks the
+moment a client stops polling. So such a backend runs as a `kind: none` node
+hearth forwards to and otherwise cannot see, and it draws idle through the whole
+render.
+
+`activity:` fixes the drawing without pretending to schedule the work. The
+operator names a path the backend already serves and which field on it carries
+the count:
+
+```yaml
+backends:
+  - name: comfy
+    url: http://127.0.0.1:8188
+    kind: none
+    resources: [gpu0]
+    activity:
+      path: /queue              # a path the backend already serves
+      running: queue_running    # a field: an array is its length, a number is itself
+      queued: queue_pending     # optional; some backends report one queue, some two
+```
+
+hearth reads only those fields and never learns the app — the same bargain
+`routes:` strikes. When something is running the node lights **amber**, exactly
+like a forwarded request: real work on the card that hearth did not admit, so it
+holds no slot and the card draws no holder for it. `running` and `queued` may be
+dotted paths (`exec_info.queue_remaining`).
+
+Two things it will not do. It never claims the card — with the backend sharing a
+GPU, hearth's arbiter genuinely cannot see this work, and drawing it as held
+would be the same lie forwarded work exists to correct. And a reading it could
+not get — an unreachable backend, a field that was not there — draws as
+**unknown**, never as idle: a failed poll is not evidence the thing is quiet.
+The path is read only while a page is open, on the same page-driven cadence as
+the rest of the console; hearth adds no background poll for it.
 
 ### What `/healthz` actually checks
 
