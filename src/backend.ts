@@ -36,6 +36,19 @@ const ACTIVITY_POLL_MS = 2_000;
 const ACTIVITY_TIMEOUT_MS = 2_000;
 
 /**
+ * How old the last good reading may be before it is reported as "cannot tell".
+ *
+ * A single dropped read must not erase what is known. At a 1s page tick that
+ * would flip a working node to unknown and back inside two frames, which reads
+ * as a fault rather than the blip it was — so a failed read leaves the last good
+ * one standing and only time retires it, the way a peer's `lastOkAt` ages out
+ * against `peerStaleMs` rather than being cleared by one bad poll. Three
+ * intervals: one failure is absorbed, a backend that is genuinely gone still
+ * goes unknown within seconds.
+ */
+const ACTIVITY_STALE_MS = 3 * ACTIVITY_POLL_MS;
+
+/**
  * Read a declared field as a count. An array is its length, a number is itself,
  * and anything else — missing, a string, an object — is `null`, "cannot tell".
  * The field may be dotted (`exec_info.queue_remaining`), walked without ever
@@ -194,14 +207,17 @@ export class BackendState {
   private contextInFlight = new Map<string, Promise<void>>();
 
   /**
-   * The last activity reading, its timestamp, and any read in flight.
+   * The last reading that actually came back, when it came back, and any read in
+   * flight.
    *
-   * `null` until the first read comes back, which `activity()` reports as
-   * "cannot tell" rather than idle — we have not looked yet. The timestamp is
-   * the rate-limit floor and the promise is the in-flight dedupe, so a fast page
-   * tick is still one request every ACTIVITY_POLL_MS.
+   * `null` until the first good read, which `activity()` reports as "cannot
+   * tell" rather than idle — we have not looked yet. Only readings that came
+   * back are stored: a failed one leaves this alone and lets ACTIVITY_STALE_MS
+   * retire it. `activityAt` is the rate-limit floor and the promise is the
+   * in-flight dedupe, so a fast page tick is still one request every
+   * ACTIVITY_POLL_MS.
    */
-  private activityReading: { running: number; queued: number | null; ok: boolean } | null = null;
+  private activityReading: { running: number; queued: number | null; at: number } | null = null;
   private activityAt = 0;
   private activityInFlight: Promise<void> | null = null;
 
@@ -228,7 +244,6 @@ export class BackendState {
     if (this.stopped) return Promise.resolve();
     if (this.activityInFlight) return this.activityInFlight;
     if (Date.now() - this.activityAt < ACTIVITY_POLL_MS) return Promise.resolve();
-    this.activityAt = Date.now();
     const done = (async () => {
       try {
         const body = await getJson<unknown>(`${this.url}${decl.path}`, {
@@ -236,14 +251,25 @@ export class BackendState {
         });
         const running = countField(body, decl.running);
         // A missing running field is the operator's field name being wrong, or
-        // the app changing shape — not zero. Either way we cannot tell.
-        this.activityReading = running === null
-          ? { running: 0, queued: null, ok: false }
-          : { running, queued: decl.queued ? countField(body, decl.queued) : null, ok: true };
+        // the app changing shape — not zero, and not a reading. Leave the last
+        // good one to age out, exactly as a failed read does.
+        if (running !== null) {
+          this.activityReading = {
+            running,
+            queued: decl.queued ? countField(body, decl.queued) : null,
+            at: Date.now(),
+          };
+        }
       } catch {
-        // Unreachable, timed out, or not JSON: cannot tell, never idle.
-        this.activityReading = { running: 0, queued: null, ok: false };
+        // Unreachable, timed out, or not JSON: cannot tell, never idle. The last
+        // good reading stands until ACTIVITY_STALE_MS retires it.
       } finally {
+        // Stamped when the read SETTLES, not when it starts. The floor and the
+        // timeout are the same number, so stamping on the way in means a backend
+        // that hangs for the whole timeout has already cleared the floor by the
+        // time it fails — and the next page tick fires again immediately, which
+        // is a hung backend polled back-to-back for as long as a page is open.
+        this.activityAt = Date.now();
         this.activityInFlight = null;
       }
     })();
@@ -251,13 +277,16 @@ export class BackendState {
     return done;
   }
 
-  /** The last activity reading, or "cannot tell" until one has come back. */
+  /**
+   * The last activity reading, or "cannot tell" — either nothing has come back
+   * yet, or the last thing that did is older than ACTIVITY_STALE_MS.
+   */
   activity(): { running: number; queued?: number; ok: boolean } {
     const a = this.activityReading;
-    if (!a) return { running: 0, ok: false };
+    if (!a || Date.now() - a.at > ACTIVITY_STALE_MS) return { running: 0, ok: false };
     return a.queued === null
-      ? { running: a.running, ok: a.ok }
-      : { running: a.running, queued: a.queued, ok: a.ok };
+      ? { running: a.running, ok: true }
+      : { running: a.running, queued: a.queued, ok: true };
   }
 
   private useEvents: boolean;

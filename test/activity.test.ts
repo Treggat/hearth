@@ -114,6 +114,47 @@ assert.deepEqual(
   assert.deepEqual(st.activity(), { running: 0, ok: false }, "an unreachable backend is unknown");
 }
 
+// --- a blip does not erase a good reading, but staying down does -----------
+{
+  body = { queue_running: [1, 2] };
+  const st = new BackendState(url, "none", silentLogger);
+  const decl = { path: "/queue", running: "queue_running", queued: null };
+  await st.sampleActivity(decl);
+  assert.deepEqual(st.activity(), { running: 2, ok: true }, "read once, known");
+
+  // A failed read leaves the last good one standing rather than blanking the
+  // node for a frame. sampleActivity is rate-limited, so drive the failure
+  // through a second state pointed at nothing and assert the first is untouched.
+  const dead = new BackendState("http://127.0.0.1:1", "none", silentLogger);
+  await dead.sampleActivity(decl);
+  body = "not json";
+  st["activityAt"] = 0;
+  await st.sampleActivity(decl);
+  assert.deepEqual(st.activity(), { running: 2, ok: true },
+    "one failed read does not erase the reading before it");
+
+  // ...but it is only held for a few seconds, so a backend that is actually gone
+  // does not draw a stale count forever.
+  st["activityReading"]!.at = Date.now() - 60_000;
+  assert.deepEqual(st.activity(), { running: 0, ok: false }, "a stale reading is unknown");
+}
+
+// The rate-limit floor is stamped when a read settles, not when it starts, so a
+// backend that hangs for the whole timeout still gets a gap before the next one.
+{
+  const slow = createServer((_req, res) => { setTimeout(() => res.end("{}"), 5_000).unref(); });
+  await new Promise<void>((r) => slow.listen(0, "127.0.0.1", r));
+  const st = new BackendState(`http://127.0.0.1:${(slow.address() as AddressInfo).port}`,
+    "none", silentLogger);
+  const began = Date.now();
+  await st.sampleActivity({ path: "/queue", running: "n", queued: null });
+  const settled = Date.now();
+  assert.ok(settled - began >= 1_500, "the read ran to its timeout");
+  assert.ok(st["activityAt"] >= settled - 50,
+    "the floor runs from when the read gave up, not from when it started");
+  slow.close();
+}
+
 // Before the first read has come back, "cannot tell" — not idle.
 assert.deepEqual(new BackendState(url, "none", silentLogger).activity(),
   { running: 0, ok: false }, "unread is unknown");

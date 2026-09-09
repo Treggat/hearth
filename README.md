@@ -252,11 +252,22 @@ backends:
       queued: queue_pending     # optional; some backends report one queue, some two
 ```
 
+Prefer the smallest endpoint that carries the count. ComfyUI also answers
+`/prompt` with `exec_info.queue_remaining`, a single number; `/queue` above is
+richer because it splits running from pending, but it embeds the whole workflow
+graph of every item, and a buffered control-plane reply is capped at 1 MiB — a
+queue deep enough to pass that reads as unknown rather than as a count, which is
+the moment you most wanted one.
+
 hearth reads only those fields and never learns the app — the same bargain
 `routes:` strikes. When something is running the node lights **amber**, exactly
 like a forwarded request: real work on the card that hearth did not admit, so it
 holds no slot and the card draws no holder for it. `running` and `queued` may be
 dotted paths (`exec_info.queue_remaining`).
+
+A reading that came back stands for a few seconds after it does, so one dropped
+poll does not blank a working node — but only for a few: a backend that stays
+unreadable goes to unknown on its own.
 
 Two things it will not do. It never claims the card — with the backend sharing a
 GPU, hearth's arbiter genuinely cannot see this work, and drawing it as held
