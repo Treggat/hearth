@@ -724,6 +724,11 @@ export function Graph({ d, sel, onSelect }: {
             // scheduling. A read that never came back (ok false) is unknown, not
             // idle; a confirmed empty queue is idle.
             const active = b.activity?.ok === true && b.activity.running > 0;
+            // Queued-but-not-running is work too, and drawing it "idle" is the
+            // same lie as drawing a failed read idle — here the count was read,
+            // it just is not on the card yet. Its own tone, the one hearth's own
+            // queue already uses: waiting, not working.
+            const waiting = b.activity?.ok === true && (b.activity.queued ?? 0) > 0;
             // Silence from a backend we are actually watching. Only ever
             // `false` for the backends whose event stream we hold open, so it
             // is a reading rather than an absence of one — and it outranks
@@ -736,7 +741,7 @@ export function Graph({ d, sel, onSelect }: {
             const tone = mute ? "fault"
               : loading.length ? "cold"
               : stalled ? "work"
-              : used > 0 || proxied.length || active ? "live" : q > 0 ? "work" : "idle";
+              : used > 0 || proxied.length || active ? "live" : q > 0 || waiting ? "work" : "idle";
             return (
               <NodeBox key={b.name} p={p} tone={tone}
                        icon={backendIcon(b.kind, (b.routes ?? []).length > 0)}
@@ -746,6 +751,7 @@ export function Graph({ d, sel, onSelect }: {
                          : used > 0 ? `${used} running`
                          : proxied.length ? `${proxied.length} forwarded`
                          : active ? `${b.activity?.running} working`
+                         : waiting ? `${b.activity?.queued} queued`
                          : b.activity && !b.activity.ok ? "activity unknown" : "idle"}`}
                        selected={sel?.kind === "backend" && sel.id === b.name}
                        dim={dimmed(`backend:${b.name}`)}
@@ -808,6 +814,12 @@ export function Graph({ d, sel, onSelect }: {
                   <Sub color="warning.main">
                     {b.activity?.running} working{b.activity?.queued ? `, ${b.activity.queued} queued` : ""}
                   </Sub>
+                )}
+                {!active && waiting && (
+                  // Waiting, with nothing on the card yet — so not amber, which
+                  // means work is running. Said anyway: it is the difference
+                  // between a backend at rest and one with a queue.
+                  <Sub color="faint">{b.activity?.queued} queued</Sub>
                 )}
                 {b.activity && !b.activity.ok && (
                   // The read did not come back — NOT a claim that it is idle.
