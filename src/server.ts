@@ -1897,6 +1897,13 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    */
   async function uiPayload(canWarm: boolean): Promise<Record<string, unknown>> {
     await peers.ensureFresh();
+    // Page-driven, exactly like ensureFresh above: a backend's declared activity
+    // path is read only while a page is assembling its data — a broadcast tick,
+    // the first snapshot, or the /ui/data poll fallback — never on a background
+    // timer, so hearth still makes no unbidden poll of a backend. Fire-and-forget
+    // and rate-limited inside: this frame draws the last reading, the next draws
+    // this one.
+    for (const b of pool.all()) if (b.cfg.activity) void b.state.sampleActivity(b.cfg.activity);
     return {
       canWarm,
       // How this page must authenticate its writes, decided per socket rather
@@ -2394,6 +2401,11 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             // the wire instead of in a rule the page has to remember. Same
             // reasoning as `knowsWarm` above: not knowing is its own answer.
             ...(b.state.watched() ? { answering: b.state.answering() } : {}),
+            // A backend's own busy signal, for one hearth forwards to but does
+            // not schedule. Sent whenever the path is declared — INCLUDING when
+            // it could not be read (ok:false), which the page draws as unknown
+            // rather than idle, so omitting it there would be the wrong silence.
+            ...(b.cfg.activity ? { activity: b.state.activity() } : {}),
             // Only llama-swap evicts. An ollama backend keeps its set resident
             // and serves them together, so there is no thrash to warn about.
             evicts: b.cfg.kind === "llama-swap",

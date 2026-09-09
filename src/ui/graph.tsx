@@ -445,7 +445,11 @@ export function Graph({ d, sel, onSelect }: {
      */
     for (const b of backends) {
       const running = jobs.some((j) => !j.offbox && j.backend === b.name);
-      const forwarded = (b.proxying ?? []).length > 0;
+      // Observed activity joins forwarded, never running: it is work hearth
+      // watches but did not admit, so the card leg lights amber and the arbiter
+      // still holds no one for it.
+      const forwarded = (b.proxying ?? []).length > 0
+        || (b.activity?.ok === true && b.activity.running > 0);
       if (!running && !forwarded) continue;
       for (const r of b.resources ?? []) {
         const toCard = `backend:${b.name}>resource:${r}`;
@@ -715,6 +719,11 @@ export function Graph({ d, sel, onSelect }: {
             const loading = (b.loading ?? []).map((m) => displayId(m, d.aliases, d.net.available));
             const split = (b.offload ?? []).filter((o) => o.cpuLayers !== null || o.cpuExpertsAll);
             const proxied = b.proxying ?? [];
+            // A backend's own busy signal off a declared activity path. Running
+            // lights it amber like forwarded work — hearth is watching, not
+            // scheduling. A read that never came back (ok false) is unknown, not
+            // idle; a confirmed empty queue is idle.
+            const active = b.activity?.ok === true && b.activity.running > 0;
             // Silence from a backend we are actually watching. Only ever
             // `false` for the backends whose event stream we hold open, so it
             // is a reading rather than an absence of one — and it outranks
@@ -727,7 +736,7 @@ export function Graph({ d, sel, onSelect }: {
             const tone = mute ? "fault"
               : loading.length ? "cold"
               : stalled ? "work"
-              : used > 0 || proxied.length ? "live" : q > 0 ? "work" : "idle";
+              : used > 0 || proxied.length || active ? "live" : q > 0 ? "work" : "idle";
             return (
               <NodeBox key={b.name} p={p} tone={tone}
                        icon={backendIcon(b.kind, (b.routes ?? []).length > 0)}
@@ -735,7 +744,9 @@ export function Graph({ d, sel, onSelect }: {
                          : loading.length ? `loading ${loading.join(", ")}`
                          : stalled ? "blocked"
                          : used > 0 ? `${used} running`
-                         : proxied.length ? `${proxied.length} forwarded` : "idle"}`}
+                         : proxied.length ? `${proxied.length} forwarded`
+                         : active ? `${b.activity?.running} working`
+                         : b.activity && !b.activity.ok ? "activity unknown" : "idle"}`}
                        selected={sel?.kind === "backend" && sel.id === b.name}
                        dim={dimmed(`backend:${b.name}`)}
                        onHover={(on) => setHover(on ? `backend:${b.name}` : null)}
@@ -791,6 +802,19 @@ export function Graph({ d, sel, onSelect }: {
                     {proxied.length} forwarded
                   </Sub>
                 )}
+                {active && (
+                  // Amber like forwarded work, and for the same reason: real work
+                  // on the card that hearth is watching, not scheduling.
+                  <Sub color="warning.main">
+                    {b.activity?.running} working{b.activity?.queued ? `, ${b.activity.queued} queued` : ""}
+                  </Sub>
+                )}
+                {b.activity && !b.activity.ok && (
+                  // The read did not come back — NOT a claim that it is idle.
+                  // Muted, not amber: nothing is known to be running here, only
+                  // that we cannot say, which must read apart from a confirmed rest.
+                  <Sub color="faint">activity unknown</Sub>
+                )}
                 <Sparks calls={(d.calls ?? []).filter((c) => c.backend === b.name)} now={now} />
               </NodeBox>
             );
@@ -806,7 +830,8 @@ export function Graph({ d, sel, onSelect }: {
             // as "free" was true of the arbiter and false of the hardware; the
             // fix is to say both things rather than to fake a holder.
             const unqueued = backends.filter((b) => (b.resources ?? []).includes(r.name)
-              && (b.proxying ?? []).length > 0);
+              && ((b.proxying ?? []).length > 0
+                || (b.activity?.ok === true && b.activity.running > 0)));
             // For shared hardware there is no holder to report, so what is worth
             // saying is how many of the things on it are actually working.
             const inUse = backends.filter((b) => (b.resources ?? []).includes(r.name)
