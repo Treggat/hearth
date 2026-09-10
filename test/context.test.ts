@@ -414,4 +414,55 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   be.close();
 }
 
+// --- a peer-only model is listed, with the window the peer reported ---------
+// A client picks the model by OUR id and sizes its limit from /v1/models, so a
+// model that only a peer serves has to appear there too, and /v1/models/<id>
+// must answer from the same list rather than falling through to a local
+// backend that has never heard of it.
+{
+  const be = swapBackend();
+  await be.listen();
+  const peer = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    if (req.url === "/peer/hello") {
+      res.end(JSON.stringify({ name: "friend", protocol: 2, models: ["their-big"], lanes: ["chat"] }));
+      return;
+    }
+    res.end(JSON.stringify({
+      slots: 1, free: 1, running: 0, offbox: 0, queued: { chat: 0 }, resident: null,
+      loaded: [], serves: ["their-big"],
+      models: { "their-big": { slots: 1, free: 1, queued: 0, warm: false, stats: { context: 32768 } } },
+    }));
+  });
+  await new Promise<void>((r) => peer.listen(0, "127.0.0.1", r));
+  const peerUrl = `http://127.0.0.1:${(peer.address() as AddressInfo).port}`;
+  const cfg = parseConfig({
+    name: "me",
+    backend: { url: be.url(), kind: "llama-swap" },
+    scheduler: { lanes: { chat: { priority: 0 } } },
+    peers: [{ name: "friend", url: peerUrl, token: "t", models: { big: "their-big" } }],
+  });
+  const node = createNode(cfg, silentLogger);
+  const url = await listen(node);
+  await node.pool.first().state.ensureFresh();
+  await node.peers.pollAll();
+
+  const list = (await (await fetch(`${url}/v1/models`)).json()) as
+    { data: { id: string; status?: { value: string }; context_length?: number }[] };
+  const big = list.data.find((m) => m.id === "big");
+  assert.ok(big, "a peer-only model is listed under our id");
+  assert.equal(big?.context_length, 32768, "with the window the peer reported");
+  assert.equal(big?.status?.value, "unloaded", "and the warmth it reported");
+  assert.ok(list.data.find((m) => m.id === "alpha"), "beside the local ones");
+
+  const one = await fetch(`${url}/v1/models/big`);
+  assert.equal(one.status, 200, "/v1/models/<id> answers for a peer model");
+  assert.equal(((await one.json()) as { context_length?: number }).context_length, 32768);
+  assert.equal((await fetch(`${url}/v1/models/nope`)).status, 404, "and 404s an unknown id");
+
+  await node.close();
+  peer.closeAllConnections(); peer.close();
+  be.close();
+}
+
 console.log("context.test.ts ok");

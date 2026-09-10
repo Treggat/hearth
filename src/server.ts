@@ -824,7 +824,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
     // The OpenAI surface: a peer may send us work here, and so may we.
     { path: "/v1/warm", methods: ["POST"], auth: "either", envelope: "openai", handler: routeWarm },
-    { path: "/v1/models", auth: "either", envelope: "openai", handler: routeModels },
+    { path: ["/v1/models", "/v1/models/*"], auth: "either", envelope: "openai",
+      handler: routeModels },
     { path: "/v1/chat/completions", methods: ["POST"], auth: "either", envelope: "openai",
       handler: routeChat },
 
@@ -839,7 +840,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   const claims = (r: Route, path: string, method: string | undefined): boolean => {
     if (r.path !== "*") {
       const paths = Array.isArray(r.path) ? r.path : [r.path];
-      if (!paths.includes(path)) return false;
+      // A trailing "/*" claims everything under it, with at least one char.
+      if (!paths.some((p) => p === path
+                             || (p.endsWith("/*") && path.length > p.length - 1
+                                 && path.startsWith(p.slice(0, -1))))) return false;
     }
     return r.methods === undefined || r.methods.includes(method ?? "GET");
   };
@@ -1430,7 +1434,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // see, and a client that loses this field loses any idea of which model
       // answers now and which one costs a load first.
       const warm = new Set(pool.loaded());
-      const upstream: { data?: { id: string; status?: { value: string }; context_length?: number }[] } = {
+      type Entry = { id: string; status?: { value: string }; context_length?: number };
+      const upstream: { data?: Entry[] } = {
         data: pool.catalog().map((id) => {
           // A backend that cannot report warm state must not be flattened
           // into cold. "We cannot see" and "nothing is loaded" are different
@@ -1438,7 +1443,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           // carries no status at all rather than a made-up one.
           // Same principle for context_length: absent when unknown, not null,
           // because we cannot see is not the same claim as a value.
-          const entry: { id: string; status?: { value: string }; context_length?: number } = { id };
+          const entry: Entry = { id };
           if (pool.for(id).cfg.kind === "none") return entry;
           entry.status = { value: warm.has(id) ? "loaded" : "unloaded" };
           const ctx = pool.contextLength(id);
@@ -1446,6 +1451,24 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           return entry;
         }),
       };
+      // Models only a peer serves. A client asks for them by OUR id, so that
+      // is what gets listed, with the window and warmth the peer reported for
+      // THEIR id on its last poll. Nothing reported (peer down, protocol 1,
+      // never loaded) is silence, not cold and not unlimited, as above. A
+      // model we also serve locally keeps the local reading: that is where a
+      // request lands when the peer is not chosen.
+      const seen = new Set(upstream.data!.map((m) => m.id));
+      for (const p of peers.all()) {
+        for (const [mine, theirs] of Object.entries(peers.config(p.name)?.models ?? {})) {
+          if (seen.has(mine)) continue;
+          seen.add(mine);
+          const entry: Entry = { id: mine };
+          const per = p.capacity?.models?.[theirs];
+          if (per) entry.status = { value: per.warm ? "loaded" : "unloaded" };
+          if (per?.stats?.context !== undefined) entry.context_length = per.stats.context;
+          upstream.data!.push(entry);
+        }
+      }
       // A peer only sees what it may use. This used to hand the whole backend
       // catalogue to anyone with a peer token. Unusable, since every other
       // route enforces the share list, but a full inventory of what someone
@@ -1453,10 +1476,19 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // The context_length field travels with the entry, so a peer can size
       // its own client limit from the shared subset.
       if (modelsPeer !== null) {
-        json(res, 200, {
-          ...upstream,
-          data: (upstream.data ?? []).filter((m) => shared().includes(m.id)),
-        });
+        upstream.data = (upstream.data ?? []).filter((m) => shared().includes(m.id));
+      }
+      // /v1/models/<id>: one entry from the same list, so a peer model answers
+      // here too instead of falling through to the passthrough and asking a
+      // local backend that has never heard of it.
+      if (c.path.startsWith("/v1/models/")) {
+        const want = c.path.slice("/v1/models/".length);
+        const one = upstream.data!.find((m) => m.id === want);
+        if (one === undefined) {
+          apiError(res, 404, `no model "${want}"`, "invalid_request_error");
+          return;
+        }
+        json(res, 200, one);
         return;
       }
       json(res, 200, upstream);
