@@ -689,6 +689,12 @@ export class BackendPool {
    */
   loadedCapacity(slot: BackendSlot): ReturnType<Scheduler["capacity"]> {
     const base = slot.scheduler.capacity();
+    // "The loaded model" is a one-model idea. Ollama holds a set and serves it
+    // side by side, so narrowing to any ONE member's ceiling draws a two-stream
+    // backend as 0/1 while two calls run on it. There the backend's own number
+    // is the honest one; each model's ceiling still binds at admission and is
+    // reported per model by capacityFor().
+    if (slot.cfg.kind === "ollama") return base;
     const raw = slot.state.resident();
     if (raw === null) return base;
     // Advertised, because that is the vocabulary the scheduler's slot counts
