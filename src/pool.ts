@@ -401,6 +401,30 @@ export class BackendPool {
   }
 
   /**
+   * The model a request on a declared route is actually running.
+   *
+   * A route names a model because most routed paths carry none: a render, a
+   * transcription. Some do — two embedders share /v1/embeddings — and then the
+   * route's model is only the default. Scheduling every call under it queues,
+   * counts and records `gemma-embed` as `nomic-embed`, which stops being
+   * cosmetic the moment each model has its own ceiling: both then compete for
+   * ONE model's slots.
+   *
+   * The caller's id is taken only when it is this backend's own: pinned to it
+   * in `models:`, declared in its `serves`, or listed in its catalogue.
+   * Anything else keeps the route's model, as before — a routed path's body may
+   * use `model` for something that is not ours to interpret, and an arbitrary
+   * string must not mint a new model in the queue.
+   */
+  routedModel(slot: BackendSlot, rule: RouteRule, asked: string | undefined): string {
+    if (asked === undefined || asked === rule.model) return rule.model;
+    if (this.cfg.models[asked]?.backend === slot.name) return asked;
+    const wire = this.outboundId(asked);
+    if (slot.cfg.serves.includes(wire) || slot.state.catalog().includes(wire)) return asked;
+    return rule.model;
+  }
+
+  /**
    * Is it CERTAIN that no backend here can serve this id?
    *
    * `for()` sends an unrecognised id to the first backend, which is the right
