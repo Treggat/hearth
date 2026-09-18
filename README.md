@@ -758,7 +758,19 @@ The rules:
   `reasoning_effort: high` on every request (some do) must not be able to undo
   the `-low` id it just picked.
 - `model`, `messages`, `stream` and `lane` are refused at startup: `model` is
-  what `as:` is for, and the others belong to the request, not the route.
+  what `as:` is for, `lane` has its own key (below), and the others belong to
+  the request, not the route.
+- `lane:` on the route pins the id's queue position the same way, over any
+  `lane` the client sent. A voice assistant that can only pick a model id
+  gets `lane: batch` and never queues ahead of a person's chat turn:
+
+  ```yaml
+  jarvis:
+    backend: swap
+    as: coder
+    lane: batch
+    params: { reasoning_effort: none }
+  ```
 - Chat completions only. The passthrough (`/v1/embeddings` and the rest) still
   forwards byte for byte apart from the `as:` rename.
 - They travel with the job. A request that spills over to a peer carries its

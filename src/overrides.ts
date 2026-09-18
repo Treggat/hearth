@@ -166,6 +166,7 @@ const DEFAULT_ROUTE: ModelRoute = {
   fallbackLocal: true,
   concurrency: null,
   params: null,
+  lane: null,
   stats: null,
 };
 
@@ -581,7 +582,7 @@ export class Overrides {
     if (!r) return;
     const onlyAPolicy =
       r.backend === null && r.as === null && r.concurrency === null && r.spilloverAt === 1
-      && r.params === null && r.stats === null;
+      && r.params === null && r.lane === null && r.stats === null;
     if (onlyAPolicy) delete this.cfg.models[id];
     else this.cfg.models[id] = { ...r, policy: "local", peers: [] };
   }

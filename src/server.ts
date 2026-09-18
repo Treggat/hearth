@@ -1564,13 +1564,15 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
     // Peers don't choose our lane, see cfg.peerLane. Local callers can, with
     // a non-standard `lane` field, which we strip before forwarding so it
-    // never reaches an OpenAI backend that would reject it.
+    // never reaches an OpenAI backend that would reject it. A lane on the
+    // model route beats the client's: the operator ranked that id.
     const lane =
       fromPeer !== null
         ? cfg.peerLane
-        : typeof payload.lane === "string" && payload.lane in cfg.scheduler.lanes
-          ? payload.lane
-          : Object.keys(cfg.scheduler.lanes)[0]!;
+        : cfg.models[model]?.lane ??
+          (typeof payload.lane === "string" && payload.lane in cfg.scheduler.lanes
+            ? payload.lane
+            : Object.keys(cfg.scheduler.lanes)[0]!);
     delete payload.lane;
 
     const ctrl = new AbortController();

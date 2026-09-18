@@ -302,6 +302,15 @@ export interface ModelRoute {
    */
   params: Record<string, unknown> | null;
   /**
+   * Which lane every request for this id queues in, OVER whatever the client
+   * sent. null means the client's `lane` field (or the default) applies, as it
+   * does for every model without it. The other half of `params`: an advertised
+   * id can carry both the request defaults and the queue position the operator
+   * wants for it, so a caller that only picks a model id cannot queue ahead of
+   * work the operator ranked above it.
+   */
+  lane: string | null;
+  /**
    * What this model can take, when nothing can be asked.
    *
    * Only for what cannot be learned: a cold model, or a backend that does not
@@ -1153,6 +1162,12 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
     const alias = str(entry.as, `models.${id}.as`, "");
     const params = modelParams(entry.params, id);
+    const lane = str(entry.lane, `models.${id}.lane`, "");
+    if (lane !== "" && !(lane in lanes)) {
+      throw new ConfigError(
+        `models.${id}.lane is "${lane}", which is not in scheduler.lanes (${Object.keys(lanes).join(", ")})`,
+      );
+    }
     // `as` and a peer policy used to be refused together, on the grounds that
     // two rewrites of one id is ambiguous. They are not ambiguous, they are the
     // two destinations: `as` is applied by pool.outboundId() and ONLY on the
@@ -1173,6 +1188,7 @@ export function parseConfig(raw: unknown): HearthConfig {
       fallbackLocal: bool(entry.fallbackLocal, `models.${id}.fallbackLocal`, true),
       concurrency: modelConcurrency(entry, id),
       params,
+      lane: lane === "" ? null : lane,
       stats: declaredStats(entry.stats, id),
     };
   }
