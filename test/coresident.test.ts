@@ -20,6 +20,8 @@
  * model's ceiling counts that model's own jobs.
  */
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 
 import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
@@ -203,6 +205,41 @@ const tick = () => new Promise((r) => setImmediate(r));
   first.release();
   await other.started;
   other.release();
+}
+
+// --- the status page states the backend's streams, not one model's ----------
+// The page narrows a backend's headline number to "what the loaded model can
+// hold", which is the right figure for a seat that holds ONE model. Ollama holds
+// a set: with both embedders loaded at 1 each, picking one of them and showing
+// its ceiling drew a two-stream backend as 0/1 while two calls ran side by side.
+{
+  const fake = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(req.url === "/api/ps"
+      ? { models: [{ name: "nomic:latest" }, { name: "gemma:latest" }] }
+      : { models: [], data: [] }));
+  });
+  await new Promise<void>((r) => fake.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(fake.address() as AddressInfo).port}`;
+  const pool = new BackendPool(parseConfig({
+    name: "n",
+    backends: [{ name: "embed", url, kind: "ollama", concurrency: 2 }],
+    models: {
+      nomic: { backend: "embed", as: "nomic:latest", concurrency: 1 },
+      gemma: { backend: "embed", as: "gemma:latest", concurrency: 1 },
+    },
+  }), silentLogger);
+  const slot = pool.get("embed")!;
+  await slot.state.ensureFresh();
+  assert.notEqual(slot.state.resident(), null, "the fake ollama reports a loaded model");
+  assert.deepEqual(
+    [pool.loadedCapacity(slot).slots, pool.loadedCapacity(slot).free],
+    [2, 2],
+    "two models loaded side by side are two streams, whatever each one's own ceiling is",
+  );
+  assert.equal(pool.loadedAggregate().slots, 2, "and the node's headline number agrees");
+  fake.closeAllConnections();
+  fake.close();
 }
 
 console.log("coresident: ok");
