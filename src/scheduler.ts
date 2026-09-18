@@ -94,6 +94,20 @@ export interface SchedulerOptions {
    * the model's own slot count above `concurrency` is unreachable.
    */
   wire?: (model: string) => string;
+  /**
+   * The backend keeps several models resident and serves them side by side.
+   *
+   * A model's own ceiling is normally read against everything running here,
+   * which is right for llama-swap: one model is loaded at a time, so the
+   * backend's jobs ARE that model's jobs. Ollama holds a set resident and
+   * serves one request per model, and there the same reading counts the first
+   * model's job against the second — two embedders declared at 1 each behind a
+   * backend of 2 collapse to a single stream.
+   *
+   * With this set, a model's ceiling counts only that model's jobs. False (the
+   * default) is every backend that predates it, unchanged.
+   */
+  coresident?: boolean;
   /** Fires whenever the job list changes, for status surfaces. */
   onChange?: (jobs: JobView[]) => void;
   /**
@@ -222,6 +236,7 @@ export class Scheduler {
   private readonly isWarm: (model: string) => boolean;
   private readonly slotsOf: (model: string) => number | null;
   private readonly wireOf: (model: string) => string;
+  private readonly coresident: boolean;
   private readonly onChange?: (jobs: JobView[]) => void;
   private readonly resources: readonly string[];
   private readonly arbiter?: ResourceArbiter;
@@ -259,6 +274,7 @@ export class Scheduler {
     this.isWarm = opts.warm ?? ((m) => m === this.resident());
     this.slotsOf = opts.slots ?? (() => null);
     this.wireOf = opts.wire ?? ((m) => m);
+    this.coresident = opts.coresident ?? false;
     this.onChange = opts.onChange;
     // Only arbitrate when there is both something to hold and somewhere to hold
     // it. Half of the pair is a config that meant to exclude and silently does
@@ -351,6 +367,21 @@ export class Scheduler {
   }
 
   /**
+   * How many running jobs count against one model's ceiling.
+   *
+   * Everything running here, unless the backend serves its models side by side
+   * — then only this model's own jobs, by the id they occupy the backend under,
+   * so two advertised ids fronting one model still share its slots.
+   */
+  private heldBy(model: string): number {
+    if (!this.coresident) return this.running.size;
+    const wire = this.wireOf(model);
+    let n = 0;
+    for (const j of this.running) if (this.wireOf(j.model) === wire) n++;
+    return n;
+  }
+
+  /**
    * May this job start right now?
    *
    * The model's own ceiling is checked FIRST, because it can be lower than
@@ -423,7 +454,7 @@ export class Scheduler {
     // ignores what we already hold, so a backend with a job in flight is not
     // blocked by itself.
     if (!this.hardwareFree()) return false;
-    if (this.running.size >= this.limitFor(job.model)) return false;
+    if (this.heldBy(job.model) >= this.limitFor(job.model)) return false;
     if (this.running.size < this.concurrency) return true;
     const wire = this.wireOf(job.model);
     for (const j of this.running) if (this.wireOf(j.model) !== wire) return false;
@@ -452,15 +483,26 @@ export class Scheduler {
       const wire = this.wireOf(model);
       for (const j of this.running) if (this.wireOf(j.model) !== wire) return base;
     }
+    // Counted the way admission counts it, so a side-by-side backend is not
+    // reported full on one model because a different one is busy.
+    const held = this.heldBy(model);
+    const spare = Math.max(0, limit - held);
     return {
       ...base,
       // Never fewer slots than jobs in flight, same guard capacity() carries:
       // a model can be told it has 2 while 3 of its jobs are still running, if
       // its number arrived (or shrank) after they started.
-      slots: Math.max(limit, this.running.size),
+      slots: Math.max(limit, held),
       // Same rule as capacity(): a model's own ceiling is still zero while the
-      // card is somebody else's.
-      free: this.hardwareFree() ? Math.max(0, limit - this.running.size) : 0,
+      // card is somebody else's. Side by side, a model's spare slot is also
+      // only as good as the backend's: other models can have filled it. (A
+      // RAISED ceiling is left alone — it is reachable only with nothing
+      // foreign running, which the early return above already settled.)
+      free: !this.hardwareFree()
+        ? 0
+        : this.coresident && limit < this.concurrency
+          ? Math.min(spare, base.free)
+          : spare,
     };
   }
 
@@ -554,29 +596,51 @@ export class Scheduler {
       );
   }
 
-  private pump(): void {
-    // File our claim BEFORE asking whether we may start, or the arbiter reads
-    // us as having only just turned up and hands the hardware to whoever
-    // claimed first — including on the tick where we are the longest waiter.
-    this.updateClaim();
-    while (this.queued.length > 0) {
-      const now = Date.now();
-      const resident = this.resident();
+  /**
+   * The job to start now, or null when nothing may.
+   *
+   * Strictly the best-scoring job, even when a lower-ranked one could batch
+   * with what is running. Letting it jump would invert priority: the batched
+   * model already gets the warm bonus, so if something still outranks it, that
+   * something genuinely should go next.
+   *
+   * One exception, and only where models are served side by side: a job held
+   * back by its OWN model's ceiling is not waiting for this backend, so it does
+   * not get to make the other models wait with it. Passing it costs it nothing
+   * — it becomes runnable the moment one of its model's jobs ends, and that
+   * same moment frees the backend slot it needs, with it still ranked first.
+   * Anything blocked for another reason stops the search exactly as before.
+   */
+  private next(): Job | null {
+    const now = Date.now();
+    const resident = this.resident();
+    const passed = new Set<Job>();
+    for (;;) {
       let best: Job | null = null;
       let bestScore = Infinity;
       for (const j of this.queued) {
+        if (passed.has(j)) continue;
         const s = this.score(j, now, resident);
         if (s < bestScore) {
           bestScore = s;
           best = j;
         }
       }
-      // Strictly the best-scoring job, even when a lower-ranked one could batch
-      // with what is running. Letting it jump would invert priority: the batched
-      // model already gets the warm bonus, so if something still outranks it,
-      // that something genuinely should go next.
-      if (!best || !this.canAdmit(best)) break;
-      const job = best;
+      if (!best) return null;
+      if (this.canAdmit(best)) return best;
+      if (!this.coresident || this.heldBy(best.model) < this.limitFor(best.model)) return null;
+      passed.add(best);
+    }
+  }
+
+  private pump(): void {
+    // File our claim BEFORE asking whether we may start, or the arbiter reads
+    // us as having only just turned up and hands the hardware to whoever
+    // claimed first — including on the tick where we are the longest waiter.
+    this.updateClaim();
+    while (this.queued.length > 0) {
+      const job = this.next();
+      if (!job) break;
       this.remove(job);
       job.state = "running";
       job.startedAt = Date.now();

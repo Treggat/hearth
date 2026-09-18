@@ -141,6 +141,11 @@ export class BackendPool {
           // to a backend that batches; without this the scheduler sees a
           // foreign job and refuses to run them together.
           wire: (m) => this.outboundId(m),
+          // Ollama holds a set of models resident and serves them side by side,
+          // so a model's own `concurrency` has to count that model's jobs. Read
+          // against the backend's total — right for a seat that loads one model
+          // at a time — two embedders at 1 each would share a single stream.
+          coresident: b.kind === "ollama",
           resources: this.arbitrated(b.resources),
           arbiter: this.arbiter,
           // Winning the arbitration only means nobody else is RUNNING on this
