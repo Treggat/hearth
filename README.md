@@ -657,6 +657,27 @@ to prevent. So a swap stays exactly as serialized as it was, and batching is
 free only where it is actually free. A batched model does not jump the queue either — if something still
 outranks it after the warm bonus, that something goes next.
 
+**On `kind: ollama` a model's number counts that model's own jobs.** Ollama
+keeps a set of models resident and serves them side by side — with
+`OLLAMA_MAX_LOADED_MODELS=2` and `OLLAMA_NUM_PARALLEL=1`, two streams in total
+and one per model:
+
+```yaml
+backends:
+  - name: ollama
+    kind: ollama
+    concurrency: 2       # two models resident, so two streams
+models:
+  nomic-embed: { backend: ollama, concurrency: 1 }   # one request per model
+  gemma-embed: { backend: ollama, concurrency: 1 }
+```
+
+Both embedders run together, a second call to the *same* one waits here — as a
+`waitedMs` you can see, rather than inside ollama as a slow call — and it does
+not hold the other model up while it waits. Everywhere else the number is read
+against the whole backend, because a seat that loads one model at a time has
+nothing else running when that model is.
+
 Do **not** reach for a second `backends:` entry pointing at the same llama-swap
 with a higher concurrency. Nothing schedules across backends, so the two queues
 would dispatch to one GPU simultaneously and thrash it.

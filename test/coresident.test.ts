@@ -1,0 +1,208 @@
+/**
+ * Self-check for per-model ceilings on a backend that keeps SEVERAL models
+ * resident at once.
+ *
+ * The reason this exists: a model's own `concurrency` was written for
+ * llama-swap, where one model is loaded at a time, so "jobs running on this
+ * backend" and "jobs running on this model" are the same number and the
+ * ceiling was checked against the first. Ollama is not like that. With
+ * OLLAMA_MAX_LOADED_MODELS=2 it holds two embedders side by side and serves ONE
+ * request per model at a time: backend concurrency 2, each model 1.
+ *
+ * Read against the backend's total, `concurrency: 1` on each model collapsed
+ * the whole backend to a single stream — the second model was refused because
+ * the FIRST model's job was counted against it. Left undeclared, two calls to
+ * the same model were both dispatched and the second queued inside ollama,
+ * where it shows as a slow call instead of a wait, while holding the slot the
+ * other model could have used.
+ *
+ * `coresident` says the backend serves its models side by side, and then a
+ * model's ceiling counts that model's own jobs.
+ */
+import assert from "node:assert/strict";
+
+import { parseConfig } from "../src/config.js";
+import { silentLogger } from "../src/log.js";
+import { BackendPool } from "../src/pool.js";
+import { Scheduler } from "../src/scheduler.js";
+
+const lanes = { chat: { priority: 0 }, batch: { priority: 100 } };
+/** Two embedders, one request each at a time. */
+const one = (m: string) => (m === "nomic" || m === "gemma" ? 1 : null);
+
+/** A job that runs until released. `started` settles only once it is running. */
+function job(s: Scheduler, model: string, log: string[], lane = "chat") {
+  let release!: () => void;
+  const started = new Promise<void>((ready) => {
+    void s.submit({ lane, model, caller: "test" }, () => {
+      log.push(model);
+      ready();
+      return new Promise<void>((done) => {
+        release = done;
+      });
+    });
+  });
+  return { started, release: () => release() };
+}
+
+const tick = () => new Promise((r) => setImmediate(r));
+
+// --- two models run side by side -------------------------------------------
+// The bug: gemma was refused because nomic's job was counted against gemma's
+// ceiling of 1, so a two-stream backend served one stream.
+{
+  const s = new Scheduler({ lanes, concurrency: 2, slots: one, coresident: true });
+  const log: string[] = [];
+  const nomic = job(s, "nomic", log);
+  await nomic.started;
+  const gemma = job(s, "gemma", log);
+  await tick();
+  assert.deepEqual(log, ["nomic", "gemma"], "a different model has its own slot");
+  nomic.release();
+  gemma.release();
+}
+
+// --- the same model still takes turns ---------------------------------------
+// One request per model is the whole point: the second nomic call waits HERE,
+// as a wait hearth can see, instead of inside ollama as a slow call.
+{
+  const s = new Scheduler({ lanes, concurrency: 2, slots: one, coresident: true });
+  const log: string[] = [];
+  const first = job(s, "nomic", log);
+  await first.started;
+  const second = job(s, "nomic", log);
+  await tick();
+  assert.deepEqual(log, ["nomic"], "a model with one slot runs one job");
+  first.release();
+  await second.started;
+  assert.deepEqual(log, ["nomic", "nomic"], "and the next goes when it frees up");
+  second.release();
+}
+
+// --- a job waiting on its own model does not hold up the other model --------
+// nomic#2 is older, so it ranks first — but it is waiting for NOMIC's slot, not
+// for the backend. Stopping the queue at it leaves gemma's slot idle for a
+// whole nomic call, which is the wait this exists to remove. Letting gemma past
+// costs nomic#2 nothing: it becomes runnable the moment a nomic job ends, and
+// that same moment frees the backend slot it needs.
+{
+  const s = new Scheduler({ lanes, concurrency: 2, slots: one, coresident: true });
+  const log: string[] = [];
+  const first = job(s, "nomic", log);
+  await first.started;
+  const second = job(s, "nomic", log);
+  await tick();
+  const gemma = job(s, "gemma", log);
+  await tick();
+  assert.deepEqual(log, ["nomic", "gemma"], "gemma runs past the queued nomic job");
+  first.release();
+  await second.started;
+  assert.deepEqual(log, ["nomic", "gemma", "nomic"], "and nomic#2 still goes the moment nomic frees up");
+  second.release();
+  gemma.release();
+}
+
+// --- capacity is answered for the model that was asked about ----------------
+// gemma being busy says nothing about nomic: reporting nomic full while its
+// slot sits idle is the same miscount, told to the status page and to peers.
+{
+  const s = new Scheduler({ lanes, concurrency: 2, slots: one, coresident: true });
+  const log: string[] = [];
+  assert.deepEqual([s.capacityFor("nomic").slots, s.capacityFor("nomic").free], [1, 1]);
+  const gemma = job(s, "gemma", log);
+  await gemma.started;
+  assert.deepEqual(
+    [s.capacityFor("nomic").slots, s.capacityFor("nomic").free],
+    [1, 1],
+    "nomic's slot is still free while gemma runs",
+  );
+  assert.deepEqual(
+    [s.capacityFor("gemma").slots, s.capacityFor("gemma").free],
+    [1, 0],
+    "and gemma's is the one that is taken",
+  );
+  const nomic = job(s, "nomic", log);
+  await nomic.started;
+  assert.deepEqual(
+    [s.capacityFor("nomic").slots, s.capacityFor("nomic").free],
+    [1, 0],
+    "one slot, not the backend's two, once both are busy",
+  );
+  gemma.release();
+  nomic.release();
+}
+
+// --- a free model slot is still bounded by the backend -----------------------
+// Three models behind a backend of two: with two of them busy the third has an
+// idle slot of its own and nowhere to run. Its ceiling is the smaller of the two.
+{
+  const three = (m: string) => (m === "a" || m === "b" || m === "c" ? 1 : null);
+  const s = new Scheduler({ lanes, concurrency: 2, slots: three, coresident: true });
+  const log: string[] = [];
+  const a = job(s, "a", log);
+  const b = job(s, "b", log);
+  await Promise.all([a.started, b.started]);
+  assert.equal(s.capacityFor("c").free, 0, "the backend is full, whatever c has spare");
+  const c = job(s, "c", log);
+  await tick();
+  assert.deepEqual(log, ["a", "b"], "and admission agrees: c waits for a backend slot");
+  a.release();
+  await c.started;
+  b.release();
+  c.release();
+}
+
+// --- without the flag, nothing changes --------------------------------------
+// llama-swap loads one model at a time, so another model's job really does
+// occupy the seat this one needs. Same config, no `coresident`: serialized.
+{
+  const s = new Scheduler({ lanes, concurrency: 2, slots: one });
+  const log: string[] = [];
+  const nomic = job(s, "nomic", log);
+  await nomic.started;
+  const gemma = job(s, "gemma", log);
+  await tick();
+  assert.deepEqual(log, ["nomic"], "the default reading is the backend's total, as before");
+  nomic.release();
+  await gemma.started;
+  gemma.release();
+}
+
+// --- the config that needs it gets it ---------------------------------------
+// Nobody writes `coresident` in a config: `kind: ollama` already says the
+// backend serves a resident set. Through parseConfig and the pool's own
+// schedulers, so this tests the wiring rather than a flag the test set itself.
+{
+  const embedders = (kind: string) => new BackendPool(parseConfig({
+    name: "n",
+    backends: [{ name: "embed", url: "http://127.0.0.1:1", kind, concurrency: 2 }],
+    models: {
+      nomic: { backend: "embed", concurrency: 1 },
+      gemma: { backend: "embed", concurrency: 1 },
+    },
+  }), silentLogger).get("embed")!.scheduler;
+
+  const ollama = embedders("ollama");
+  const log: string[] = [];
+  const nomic = job(ollama, "nomic", log);
+  await nomic.started;
+  const gemma = job(ollama, "gemma", log);
+  await tick();
+  assert.deepEqual(log, ["nomic", "gemma"], "kind: ollama serves its models side by side");
+  nomic.release();
+  gemma.release();
+
+  // The control: the same models behind a llama-swap still take turns.
+  const swap = embedders("llama-swap");
+  const swapLog: string[] = [];
+  const first = job(swap, "nomic", swapLog);
+  await first.started;
+  const other = job(swap, "gemma", swapLog);
+  await tick();
+  assert.deepEqual(swapLog, ["nomic"], "kind: llama-swap is read exactly as before");
+  first.release();
+  await other.started;
+  other.release();
+}
+
+console.log("coresident: ok");

@@ -331,6 +331,10 @@ export interface ModelRoute {
    * two queue inside llama.cpp where this scheduler cannot see them, and it
    * goes on counting them as running.
    *
+   * Counted against everything running on the backend, except on `kind: ollama`,
+   * which serves a resident set side by side: there it counts this model's own
+   * jobs, so two models at 1 each behind a backend of 2 run together.
+   *
    * Written as `concurrency:`, matching the backend field it overrides. `batch:`
    * is the older name for the same thing, from when it could only raise.
    */
