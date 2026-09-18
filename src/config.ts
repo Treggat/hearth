@@ -443,6 +443,18 @@ export interface HearthConfig {
    *  as `key:<label>` instead of the sha256 prefix, so the console can say `dsh`
    *  rather than `key:ff2f1c4e`. A label is not a secret and never hashed. */
   apiKeyLabels: string[];
+  /**
+   * What each key may run, index-aligned with `apiKeys`. null is the full
+   * local surface, which every key had before this existed. A list makes the
+   * key a scoped one: `POST /v1/chat/completions` for exactly those ids and
+   * `GET /v1/models` (filtered to them), and nothing else -- no passthrough,
+   * no warm, no control, no queue. The ids must be routes in `models:`,
+   * because what a scoped key may do is policy, and policy lives on routes.
+   *
+   * For the caller that holds only a model picker and runs on the softest
+   * box you own. Its key leaking must cost you that one model, not the GPU.
+   */
+  apiKeyModels: (string[] | null)[];
   /** Tokens peers present to us, by peer name. Kept separate from apiKeys so
    *  peer traffic is attributable and can be capped on its own. */
   peerTokens: Record<string, string>;
@@ -792,15 +804,18 @@ function strList(v: unknown, where: string): string[] {
  * the off-loopback status port included, which is the reason it is opt-in per
  * key: name only the callers you are content to see named there.
  */
-function apiKeyList(v: unknown, where: string): { keys: string[]; labels: string[] } {
-  if (v === undefined) return { keys: [], labels: [] };
+function apiKeyList(
+  v: unknown, where: string, routeIds: Set<string>,
+): { keys: string[]; labels: string[]; models: (string[] | null)[] } {
+  if (v === undefined) return { keys: [], labels: [], models: [] };
   if (!Array.isArray(v)) throw new ConfigError(`${where} must be a list`);
   const keys: string[] = [];
   const labels: string[] = [];
+  const models: (string[] | null)[] = [];
   // Both refuse a duplicate, and neither message ever names the secret.
   const seenKey = new Map<string, number>();
   const seenLabel = new Map<string, number>();
-  const take = (key: string, label: string, at: string): void => {
+  const take = (key: string, label: string, at: string, scope: string[] | null = null): void => {
     // The first match wins in localCaller, so a repeated secret makes every
     // later entry unreachable — including its label, which would then be a name
     // the operator sees in the config and never in a log.
@@ -826,6 +841,7 @@ function apiKeyList(v: unknown, where: string): { keys: string[]; labels: string
     }
     keys.push(key);
     labels.push(label);
+    models.push(scope);
   };
   v.forEach((raw, i) => {
     const at = `${where}[${i}]`;
@@ -839,9 +855,22 @@ function apiKeyList(v: unknown, where: string): { keys: string[]; labels: string
     // no label — so it is refused rather than silently falling back to the hash.
     const label = str(entry.label, `${at}.label`).trim();
     if (label === "") throw new ConfigError(`${at}.label must not be empty`);
-    take(key, label, at);
+    // A scope names routes, not backend ids: an unknown id is refused here
+    // rather than found as a 403 on the client, and a scoped key can only ever
+    // reach ids whose lane and params the operator wrote down.
+    let scope: string[] | null = null;
+    if (entry.models !== undefined) {
+      scope = strList(entry.models, `${at}.models`);
+      if (scope.length === 0) throw new ConfigError(`${at}.models must name at least one model`);
+      for (const id of scope) {
+        if (!routeIds.has(id)) {
+          throw new ConfigError(`${at}.models names "${id}", which is not a route in models:`);
+        }
+      }
+    }
+    take(key, label, at, scope);
   });
-  return { keys, labels };
+  return { keys, labels, models };
 }
 
 /**
@@ -1193,7 +1222,8 @@ export function parseConfig(raw: unknown): HearthConfig {
     };
   }
 
-  const { keys: apiKeys, labels: apiKeyLabels } = apiKeyList(root.apiKeys, "apiKeys");
+  const { keys: apiKeys, labels: apiKeyLabels, models: apiKeyModels } =
+    apiKeyList(root.apiKeys, "apiKeys", new Set(Object.keys(models)));
 
   const peerTokensRaw = asRecord(root.peerTokens ?? {}, "peerTokens");
   const peerTokens: Record<string, string> = {};
@@ -1270,6 +1300,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     },
     apiKeys,
     apiKeyLabels,
+    apiKeyModels,
     peerTokens,
     share: strList(root.share, "share"),
     peerRateLimit: count(root.peerRateLimit, "peerRateLimit", 600, 1),

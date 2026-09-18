@@ -127,6 +127,22 @@ port included. That is the one thing to weigh: name the keys you are content to
 see named on whatever the status page is reachable from. Leave a key bare and
 it stays a hash.
 
+A key can also be **scoped** with `models:`. Every key above is a full local
+caller — chat on anything, the passthrough, `/v1/warm`, `/control`. A scoped
+key gets `POST /v1/chat/completions` for exactly the ids it names and a
+`/v1/models` filtered to them, and every other route answers 403:
+
+```yaml
+apiKeys:
+  - { key: env:HEARTH_APP_KEY, label: app }              # full
+  - { key: env:JARVIS_KEY, label: jarvis, models: [jarvis] }   # chat on one id, nothing else
+```
+
+For the caller that only has a model picker and runs on the softest box you
+own: its key leaking must cost you one model at one priority, not the GPU. The
+ids must be routes in `models:` — the lane and params that route carries are
+the whole point — so a typo is a startup error rather than a 403 in production.
+
 ## Endpoints
 
 Beyond `/v1/chat/completions` and `/v1/models`:

@@ -305,5 +305,83 @@ peers:
   await n.close();
 }
 
+// --- a scoped key is a chat client and nothing more -------------------------
+//
+// The key on the softest box you own. Everything an unscoped key reaches is
+// asserted closed to it, because the way this fails is a route added later
+// forgetting to think about it: `scoped` is opt-in per route for that reason.
+{
+  const dir = mkdtempSync(join(tmpdir(), "hearth-scoped-"));
+  const cfgFile = join(dir, "hearth.yaml");
+  writeFileSync(cfgFile, [
+    "name: scoped",
+    `backend: { url: ${yq(beUrl)}, kind: none, serves: [m, other] }`,
+    "apiKeys:",
+    "  - {key: full-key, label: app}",
+    "  - {key: narrow-key, label: voice, models: [quiet]}",
+    "models:",
+    "  quiet: {as: m}",
+  ].join("\n"));
+  const n = createNode(loadConfig(cfgFile), silentLogger);
+  n.start();
+  const base = await new Promise<string>((ready) =>
+    n.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(n.server.address() as AddressInfo).port}`)),
+  );
+  const call = async (path: string, token: string, method = "GET", body = "{}") => {
+    const r = await fetch(`${base}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      ...(method === "POST" ? { body } : {}),
+    });
+    return { status: r.status, body: (await r.json()) as Record<string, unknown> };
+  };
+  const chat = (token: string, model: string) =>
+    call("/v1/chat/completions", token, "POST", JSON.stringify({ model, messages: [] }));
+
+  // What it may do.
+  assert.equal((await chat("narrow-key", "quiet")).status, 200, "its own model answers");
+  const list = (await call("/v1/models", "narrow-key")).body as { data: { id: string }[] };
+  assert.deepEqual(list.data.map((m) => m.id), ["quiet"], "its picker shows only what it may pick");
+  assert.equal((await call("/v1/models/quiet", "narrow-key")).status, 200);
+
+  // What it may not.
+  assert.equal((await chat("narrow-key", "m")).status, 403, "the id behind the alias is not its to name");
+  assert.equal((await chat("narrow-key", "other")).status, 403, "nor any other");
+  assert.equal((await call("/v1/models/other", "narrow-key")).status, 404, "and it cannot see them");
+  for (const [path, method] of [
+    ["/v1/warm", "POST"], ["/queue", "GET"], ["/network", "GET"], ["/control", "POST"],
+    ["/v1/embeddings", "POST"], ["/upstream/x/generate", "POST"], ["/anything", "GET"],
+  ] as const) {
+    const { status } = await call(path, "narrow-key", method);
+    assert.equal(status, 403, `a scoped key must not reach ${method} ${path} (got ${status})`);
+  }
+
+  // The unscoped key next to it is untouched.
+  assert.equal((await chat("full-key", "other")).status, 200);
+  assert.equal((await call("/queue", "full-key")).status, 200);
+  assert.ok(((await call("/v1/models", "full-key")).body as { data: unknown[] }).data.length > 1);
+
+  await n.close();
+}
+
+// A scope names routes, so a typo is a startup error, not a 403 in production.
+{
+  const dir = mkdtempSync(join(tmpdir(), "hearth-scoped-bad-"));
+  const cfgFile = join(dir, "hearth.yaml");
+  writeFileSync(cfgFile, [
+    "name: scoped",
+    `backend: { url: ${yq(beUrl)}, serves: [m] }`,
+    "apiKeys: [{key: k, label: v, models: [m]}]",
+  ].join("\n"));
+  assert.throws(() => loadConfig(cfgFile), /not a route in models:/, "a backend id alone is not a route");
+  writeFileSync(cfgFile, [
+    "name: scoped",
+    `backend: { url: ${yq(beUrl)}, serves: [m] }`,
+    "apiKeys: [{key: k, label: v, models: []}]",
+  ].join("\n"));
+  assert.throws(() => loadConfig(cfgFile), /at least one model/, "an empty scope is a mistake, not a lock");
+}
+
 await new Promise<void>((r) => backend.close(() => r()));
 console.log("security.test.ts ok");
