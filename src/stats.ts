@@ -225,7 +225,11 @@ export function unfit(stats: ModelStats | undefined | null, need: Need): string 
   if (need.images && stats.vision === false) return "does not accept images";
   if (need.tools && stats.tools === false) return "does not support tool calls";
   if (stats.context !== undefined && need.tokens > stats.context) {
-    return `needs about ${need.tokens} tokens, its context window is ${stats.context}`;
+    // The trailing phrase is the one every agent harness already classifies as a
+    // context overflow (OpenAI's "context_length_exceeded" family), so the client
+    // compacts and retries instead of surfacing a dead turn. Keep the numbers first:
+    // they are what a human reads.
+    return `needs about ${need.tokens} tokens, its context window is ${stats.context} (context length exceeded)`;
   }
   return null;
 }
