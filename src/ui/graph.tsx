@@ -37,6 +37,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { backendIcon, resourceIcon, TypeIcon, type IconKind } from "./icons.js";
 import { MONO } from "./theme.js";
 import { displayId } from "./lib.js";
+import { SparkLedger, type Spark } from "./sparks.js";
 import { blockers } from "./why.js";
 import {
   glyphFor, layout, MIN_STAGE, orderBackends, polyLength, stitch, type Placed,
@@ -104,48 +105,23 @@ const pace = (len: number): number =>
 const laneColor = (lane: string): string =>
   lane === "chat" ? "success.main" : lane === "image" || lane === "edit" ? "warning.main" : "text.secondary";
 
-interface Spark { key: string; backend: string; color: string }
-
 /**
- * One-shot sparks for requests that finished since the last poll.
+ * One-shot sparks for requests that finished since the last frame.
  *
- * Running jobs already draw themselves, and at a homelab's duty cycle most
- * requests begin and end between two 3s polls — the queue is empty every time
- * you look, and the graph would sit dead while the box was busy. `calls` is the
- * record of exactly those, so a finished call gets one particle.
- *
- * The first payload carries up to ten minutes of them and fires NONE: seeding
- * the seen-set is the whole reason this keeps one.
+ * The bookkeeping — and the reason a spark's timer must outlive the frame that
+ * lit it — is in sparks.ts, where it can be tested without a DOM. This only
+ * feeds it frames and tells it when the page has gone.
  */
 function useSparks(calls: Call[] | undefined): Spark[] {
-  const seen = useRef<Set<string> | null>(null);
   const [sparks, setSparks] = useState<Spark[]>([]);
+  const ledger = useRef<SparkLedger | null>(null);
+  if (ledger.current === null) ledger.current = new SparkLedger(setSparks);
 
-  useEffect(() => {
-    if (!calls) return;
-    const key = (c: Call) => `${c.t}:${c.model}:${c.backend}`;
-    if (seen.current === null) { seen.current = new Set(calls.map(key)); return; }
-    const fresh = calls.filter((c) => !seen.current!.has(key(c)));
-    if (!fresh.length) return;
-    for (const c of fresh) seen.current.add(key(c));
-    // A burst of fifty would be a smear, not information. The newest few carry
-    // the same message: that backend is working.
-    const add = fresh.slice(-6).map((c) => ({
-      key: `${key(c)}:${Math.random().toString(36).slice(2, 7)}`,
-      backend: c.backend,
-      color: c.ok ? "success.main" : "error.main",
-    }));
-    setSparks((s) => [...s, ...add]);
-    const t = setTimeout(() => setSparks((s) => s.filter((x) => !add.some((a) => a.key === x.key))), 1100);
-    return () => clearTimeout(t);
-  }, [calls]);
-
-  // The set grows with a bounded 10-minute window, so it cannot run away — but
-  // a long-lived tab still trims it against the window it is given.
-  useEffect(() => {
-    if (!calls || !seen.current || seen.current.size < 2000) return;
-    seen.current = new Set(calls.map((c) => `${c.t}:${c.model}:${c.backend}`));
-  }, [calls]);
+  // NO cleanup here, deliberately. This runs on every frame, and a cleanup that
+  // cancelled the pending timer is exactly how a spark got stranded.
+  useEffect(() => { ledger.current!.feed(calls); }, [calls]);
+  // Unmount is the one moment a pending timer should be cancelled.
+  useEffect(() => () => ledger.current!.dispose(), []);
 
   return sparks;
 }
