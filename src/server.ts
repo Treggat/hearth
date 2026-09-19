@@ -301,11 +301,14 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    * Backwards for a box that's lending its GPU out. Anyone off-machine needs a
    * key now, whatever the config says.
    */
-  function localCaller(req: IncomingMessage): string | null {
+  /** A local identity, and what it may run: null is everything. */
+  type Local = { caller: string; models: string[] | null };
+
+  function localCaller(req: IncomingMessage): Local | null {
     const given = bearer(req);
     if (cfg.apiKeys.length === 0) {
       if (given !== "") return null; // presented a credential; it's not valid here
-      return LOOPBACK.has(req.socket.remoteAddress ?? "") ? "local" : null;
+      return LOOPBACK.has(req.socket.remoteAddress ?? "") ? { caller: "local", models: null } : null;
     }
     if (given === "") return null;
     // A labeled key shows the operator's own name; an unlabeled one keeps the
@@ -315,7 +318,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // guess — so the fallback stays the hash, never the key.
     let i = 0;
     for (const k of cfg.apiKeys) {
-      if (secretEq(given, k)) return "key:" + (cfg.apiKeyLabels[i] || keyId(k));
+      if (secretEq(given, k)) {
+        return { caller: "key:" + (cfg.apiKeyLabels[i] || keyId(k)), models: cfg.apiKeyModels[i] ?? null };
+      }
       i++;
     }
     return null;
@@ -701,6 +706,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     /** Who to bill and to log: a peer's name, "local", or "key:<label>".
      *  Empty for routes that need no caller. */
     caller: string;
+    /** The ids a scoped key may run, or null for an unscoped caller. */
+    models: string[] | null;
   }
 
   /**
@@ -750,6 +757,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     methods?: string[];
     auth: Auth;
     envelope?: Envelope;
+    /** A scoped key may reach this route. Off by default: a new route is
+     *  closed to scoped keys until someone decides otherwise. */
+    scoped?: true;
     handler: (c: Call) => Promise<void>;
   }
 
@@ -770,14 +780,14 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     const base = { req, res, url, path: url.pathname };
     const env = r.envelope ?? "plain";
 
-    if (r.auth === "open") return { ...base, peer: null, caller: "" };
+    if (r.auth === "open") return { ...base, peer: null, caller: "", models: null };
 
     if (r.auth === "loopback") {
       if (!isLoopback(req)) {
         refuse(res, 403, "the status page is loopback-only", env);
         return null;
       }
-      return { ...base, peer: null, caller: "" };
+      return { ...base, peer: null, caller: "", models: null };
     }
 
     const asPeer = r.auth === "local" ? null : peerCaller(req);
@@ -786,7 +796,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         refuse(res, 401, "unknown peer token", env);
         return null;
       }
-      return { ...base, peer: asPeer, caller: asPeer };
+      return { ...base, peer: asPeer, caller: asPeer, models: null };
     }
 
     const asLocal = localCaller(req);
@@ -794,7 +804,14 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       refuse(res, 401, "unauthorized", env);
       return null;
     }
-    return { ...base, peer: asPeer, caller: asPeer ?? asLocal! };
+    if (asPeer !== null) return { ...base, peer: asPeer, caller: asPeer, models: null };
+    // A scoped key is a chat client and nothing more. 403, not 404: the route
+    // exists, this key is not the kind that reaches it.
+    if (asLocal!.models !== null && r.scoped !== true) {
+      refuse(res, 403, "this key is scoped to chat on its models", env);
+      return null;
+    }
+    return { ...base, peer: null, caller: asLocal!.caller, models: asLocal!.models };
   }
 
   /**
@@ -824,10 +841,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
     // The OpenAI surface: a peer may send us work here, and so may we.
     { path: "/v1/warm", methods: ["POST"], auth: "either", envelope: "openai", handler: routeWarm },
-    { path: ["/v1/models", "/v1/models/*"], auth: "either", envelope: "openai",
+    { path: ["/v1/models", "/v1/models/*"], auth: "either", envelope: "openai", scoped: true,
       handler: routeModels },
     { path: "/v1/chat/completions", methods: ["POST"], auth: "either", envelope: "openai",
-      handler: routeChat },
+      scoped: true, handler: routeChat },
 
     // On the MAIN port the page stays loopback-only. Reaching it from
     // elsewhere is what uiListen is for, and that is a separate socket.
@@ -1478,6 +1495,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       if (modelsPeer !== null) {
         upstream.data = (upstream.data ?? []).filter((m) => shared().includes(m.id));
       }
+      // Same for a scoped key: its picker shows what it may pick.
+      if (c.models !== null) {
+        upstream.data = (upstream.data ?? []).filter((m) => c.models!.includes(m.id));
+      }
       // /v1/models/<id>: one entry from the same list, so a peer model answers
       // here too instead of falling through to the passthrough and asking a
       // local backend that has never heard of it.
@@ -1534,6 +1555,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       apiError(res, 403, `${cfg.name} does not share "${model}"`, "permission_error");
       return;
     }
+    if (c.models !== null && !c.models.includes(model)) {
+      apiError(res, 403, `this key may not run "${model}"`, "permission_error");
+      return;
+    }
     // Refused before it is queued, and only where it cannot be wrong. An id
     // nothing serves used to fall through to the first backend, wait its
     // turn, possibly evict whatever was resident, and then 404 — so a typo
@@ -1564,13 +1589,15 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
     // Peers don't choose our lane, see cfg.peerLane. Local callers can, with
     // a non-standard `lane` field, which we strip before forwarding so it
-    // never reaches an OpenAI backend that would reject it.
+    // never reaches an OpenAI backend that would reject it. A lane on the
+    // model route beats the client's: the operator ranked that id.
     const lane =
       fromPeer !== null
         ? cfg.peerLane
-        : typeof payload.lane === "string" && payload.lane in cfg.scheduler.lanes
-          ? payload.lane
-          : Object.keys(cfg.scheduler.lanes)[0]!;
+        : cfg.models[model]?.lane ??
+          (typeof payload.lane === "string" && payload.lane in cfg.scheduler.lanes
+            ? payload.lane
+            : Object.keys(cfg.scheduler.lanes)[0]!);
     delete payload.lane;
 
     const ctrl = new AbortController();
