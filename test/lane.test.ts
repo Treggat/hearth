@@ -18,7 +18,7 @@ import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
 
 /** A backend that answers only when told, so a job can be seen while running. */
-let release: () => void = () => {};
+let arrived: (respond: () => void) => void = () => {};
 const be = createServer((req, res) => {
   if (req.url === "/v1/models") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -27,10 +27,10 @@ const be = createServer((req, res) => {
   }
   req.resume();
   req.on("end", () => {
-    release = () => {
+    arrived(() => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
-    };
+    });
   });
 });
 await new Promise<void>((r) => be.listen(0, "127.0.0.1", r));
@@ -71,19 +71,18 @@ await node.pool.first().state.refresh();
 
 /** Lane of the one job in flight, as /queue would show it. */
 async function runningLane(body: Record<string, unknown>): Promise<string> {
+  // Wait for the backend to hold the request; the job shows as running before it lands.
+  const held = new Promise<() => void>((r) => (arrived = r));
   const done = fetch(`${url}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  let view = node.pool.first().scheduler.view();
-  for (let i = 0; i < 50 && view.length === 0; i++) {
-    await new Promise((r) => setTimeout(r, 10));
-    view = node.pool.first().scheduler.view();
-  }
+  const respond = await held;
+  const view = node.pool.first().scheduler.view();
   assert.equal(view.length, 1, "exactly one job in flight");
   const lane = view[0]!.lane;
-  release();
+  respond();
   assert.equal((await done).status, 200);
   return lane;
 }
