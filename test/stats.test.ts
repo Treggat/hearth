@@ -159,6 +159,13 @@ import { cleanStats, mergeStats, needsOf, statsFromProps, unfit } from "../src/s
   assert.equal(unfit({ context: 131072 }, big), null, "a window that fits says nothing");
   const why = unfit({ context: 32768 }, big);
   assert.ok(why?.includes("32768") && why.includes("100000"), `both numbers are in the message: ${why}`);
+  // Agent harnesses decide whether to compact and retry by matching the
+  // backend's wording. Without the phrase they all key on, a refusal from here
+  // reads as a dead turn, where the same overflow from llama.cpp would not.
+  assert.ok(
+    why?.includes("context length exceeded"),
+    `a client can tell this is a context overflow: ${why}`,
+  );
 
   assert.ok(unfit({ vision: false }, { ...tiny, images: true }), "a text-only model refuses an image");
   assert.equal(unfit({ vision: true }, { ...tiny, images: true }), null);
