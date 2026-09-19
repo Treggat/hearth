@@ -25,6 +25,7 @@ import { CallsTable, Depth, HistTable, Lanes } from "./charts.js";
 import { type Sel } from "./graph.js";
 import { LoadAction, ShareToggle, type Ctx } from "./inspect.js";
 import { ctxLabel, displayId, since } from "./lib.js";
+import { capabilityChips, capabilityGaps } from "./takes.js";
 import { MONO } from "./theme.js";
 import type { Backend, Node, UiData } from "./types.js";
 import { callStats, waitReason } from "./why.js";
@@ -269,9 +270,7 @@ export function ModelsTable({ d, ctx, onSelect }: { d: UiData; ctx: Ctx; onSelec
           ? `reported by ${src.name}, with declared values where it does not say`
           : `reported by ${src.name}`,
       st.quant ? `quantized ${st.quant}` : null,
-      st.vision === false ? "text only, no images" : null,
-      st.tools === false ? "no tool calls" : null,
-      st.thinking === false ? "no thinking level" : null,
+      ...capabilityGaps(st),
     ].filter(Boolean).join(" · ");
     return (
       <Tooltip title={notes}>
@@ -279,9 +278,7 @@ export function ModelsTable({ d, ctx, onSelect }: { d: UiData; ctx: Ctx; onSelec
           <Typography component="span" sx={{ ...mono, fontSize: 11, color: declared ? "faint" : undefined }}>
             {st.context === undefined ? "—" : ctxLabel(st.context)}
           </Typography>
-          {st.vision === true && <Tag>vision</Tag>}
-          {st.tools === true && <Tag>tools</Tag>}
-          {st.thinking === true && <Tag>thinking</Tag>}
+          {capabilityChips(st).map((c) => <Tag key={c}>{c}</Tag>)}
         </Row>
       </Tooltip>
     );

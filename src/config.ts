@@ -657,7 +657,7 @@ function declaredStats(raw: unknown, id: string): ModelStats | null {
         throw new ConfigError(`${where}.context is "${String(v)}" -- expected a positive whole number of tokens`);
       }
       out.context = v;
-    } else if (k === "vision" || k === "tools" || k === "thinking") {
+    } else if (k === "vision" || k === "tools" || k === "thinking" || k === "effort") {
       if (typeof v !== "boolean") {
         throw new ConfigError(`${where}.${k} is "${String(v)}" -- expected true or false`);
       }
@@ -666,7 +666,7 @@ function declaredStats(raw: unknown, id: string): ModelStats | null {
       out.quant = str(v, `${where}.quant`);
     } else {
       throw new ConfigError(
-        `${where}.${k} is not a model stat -- expected context, vision, tools, thinking or quant`,
+        `${where}.${k} is not a model stat -- expected context, vision, tools, thinking, effort or quant`,
       );
     }
   }
