@@ -1812,9 +1812,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // report.
       if (routed?.rule.queue) {
         const { lane } = routed.rule;
-        // The route's model is the default, not the verdict: two models can
-        // share one routed path, and each has to be queued as itself for its
-        // own ceiling to mean anything.
+        // Two models can share one routed path; each queues as itself.
         const model = pool.routedModel(routed.slot, routed.rule, asked);
         // Recorded like any other local use, because that is what it is.
         //

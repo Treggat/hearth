@@ -141,10 +141,7 @@ export class BackendPool {
           // to a backend that batches; without this the scheduler sees a
           // foreign job and refuses to run them together.
           wire: (m) => this.outboundId(m),
-          // Ollama holds a set of models resident and serves them side by side,
-          // so a model's own `concurrency` has to count that model's jobs. Read
-          // against the backend's total — right for a seat that loads one model
-          // at a time — two embedders at 1 each would share a single stream.
+          // Ollama serves a resident set side by side, so a model's ceiling counts its own jobs.
           coresident: b.kind === "ollama",
           resources: this.arbitrated(b.resources),
           arbiter: this.arbiter,
@@ -401,20 +398,9 @@ export class BackendPool {
   }
 
   /**
-   * The model a request on a declared route is actually running.
-   *
-   * A route names a model because most routed paths carry none: a render, a
-   * transcription. Some do — two embedders share /v1/embeddings — and then the
-   * route's model is only the default. Scheduling every call under it queues,
-   * counts and records `gemma-embed` as `nomic-embed`, which stops being
-   * cosmetic the moment each model has its own ceiling: both then compete for
-   * ONE model's slots.
-   *
-   * The caller's id is taken only when it is this backend's own: pinned to it
-   * in `models:`, declared in its `serves`, or listed in its catalogue.
-   * Anything else keeps the route's model, as before — a routed path's body may
-   * use `model` for something that is not ours to interpret, and an arbitrary
-   * string must not mint a new model in the queue.
+   * The model a routed request is queued as. The route's model is the default;
+   * the caller's id wins only when it is this backend's own (pinned in `models:`,
+   * in `serves`, or in its catalogue), so an arbitrary string never mints a queue entry.
    */
   routedModel(slot: BackendSlot, rule: RouteRule, asked: string | undefined): string {
     if (asked === undefined || asked === rule.model) return rule.model;
@@ -689,11 +675,7 @@ export class BackendPool {
    */
   loadedCapacity(slot: BackendSlot): ReturnType<Scheduler["capacity"]> {
     const base = slot.scheduler.capacity();
-    // "The loaded model" is a one-model idea. Ollama holds a set and serves it
-    // side by side, so narrowing to any ONE member's ceiling draws a two-stream
-    // backend as 0/1 while two calls run on it. There the backend's own number
-    // is the honest one; each model's ceiling still binds at admission and is
-    // reported per model by capacityFor().
+    // Ollama serves a set side by side, so one member's ceiling is not the backend's.
     if (slot.cfg.kind === "ollama") return base;
     const raw = slot.state.resident();
     if (raw === null) return base;

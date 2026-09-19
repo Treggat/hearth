@@ -105,22 +105,14 @@ const pace = (len: number): number =>
 const laneColor = (lane: string): string =>
   lane === "chat" ? "success.main" : lane === "image" || lane === "edit" ? "warning.main" : "text.secondary";
 
-/**
- * One-shot sparks for requests that finished since the last frame.
- *
- * The bookkeeping — and the reason a spark's timer must outlive the frame that
- * lit it — is in sparks.ts, where it can be tested without a DOM. This only
- * feeds it frames and tells it when the page has gone.
- */
+/** Feeds frames to the SparkLedger (sparks.ts) and disposes it on unmount. */
 function useSparks(calls: Call[] | undefined): Spark[] {
   const [sparks, setSparks] = useState<Spark[]>([]);
   const ledger = useRef<SparkLedger | null>(null);
   if (ledger.current === null) ledger.current = new SparkLedger(setSparks);
 
-  // NO cleanup here, deliberately. This runs on every frame, and a cleanup that
-  // cancelled the pending timer is exactly how a spark got stranded.
+  // No per-frame cleanup: cancelling the timer on every frame strands sparks.
   useEffect(() => { ledger.current!.feed(calls); }, [calls]);
-  // Unmount is the one moment a pending timer should be cancelled.
   useEffect(() => () => ledger.current!.dispose(), []);
 
   return sparks;

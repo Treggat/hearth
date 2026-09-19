@@ -1,15 +1,6 @@
 /**
- * Self-check for the one-shot sparks on the graph.
- *
- * A finished request gets one particle, and the edge it travels is drawn lit
- * while it does. The spark is supposed to go out about a second later.
- *
- * The bug this pins: the timer that put a spark out belonged to the effect that
- * lit it, and an effect's cleanup runs whenever its input changes. While the
- * page polled every 3s that could not matter — the timer always fired first.
- * Once frames were PUSHED, a second frame inside that second cancelled the
- * timer, and the spark it was for stayed lit until the page was reloaded. Any
- * back-to-back pair of requests did it, which is what an agent sends.
+ * One-shot sparks on the graph: a finished call lights an edge for about a
+ * second, and a frame arriving inside that second must not strand it.
  *
  *     npx tsx test/sparks.test.ts
  */

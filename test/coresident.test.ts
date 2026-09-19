@@ -1,23 +1,8 @@
 /**
- * Self-check for per-model ceilings on a backend that keeps SEVERAL models
- * resident at once.
+ * Per-model ceilings on a backend that keeps several models resident (ollama):
+ * a model's `concurrency` counts its own jobs, not the backend's.
  *
- * The reason this exists: a model's own `concurrency` was written for
- * llama-swap, where one model is loaded at a time, so "jobs running on this
- * backend" and "jobs running on this model" are the same number and the
- * ceiling was checked against the first. Ollama is not like that. With
- * OLLAMA_MAX_LOADED_MODELS=2 it holds two embedders side by side and serves ONE
- * request per model at a time: backend concurrency 2, each model 1.
- *
- * Read against the backend's total, `concurrency: 1` on each model collapsed
- * the whole backend to a single stream — the second model was refused because
- * the FIRST model's job was counted against it. Left undeclared, two calls to
- * the same model were both dispatched and the second queued inside ollama,
- * where it shows as a slow call instead of a wait, while holding the slot the
- * other model could have used.
- *
- * `coresident` says the backend serves its models side by side, and then a
- * model's ceiling counts that model's own jobs.
+ *     npx tsx test/coresident.test.ts
  */
 import assert from "node:assert/strict";
 import { createServer } from "node:http";

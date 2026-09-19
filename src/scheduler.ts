@@ -95,17 +95,8 @@ export interface SchedulerOptions {
    */
   wire?: (model: string) => string;
   /**
-   * The backend keeps several models resident and serves them side by side.
-   *
-   * A model's own ceiling is normally read against everything running here,
-   * which is right for llama-swap: one model is loaded at a time, so the
-   * backend's jobs ARE that model's jobs. Ollama holds a set resident and
-   * serves one request per model, and there the same reading counts the first
-   * model's job against the second — two embedders declared at 1 each behind a
-   * backend of 2 collapse to a single stream.
-   *
-   * With this set, a model's ceiling counts only that model's jobs. False (the
-   * default) is every backend that predates it, unchanged.
+   * The backend serves several resident models side by side (ollama), so a
+   * model's ceiling counts only its own jobs. Off, it counts everything running.
    */
   coresident?: boolean;
   /** Fires whenever the job list changes, for status surfaces. */
@@ -366,13 +357,7 @@ export class Scheduler {
     return this.slotsOf(model) ?? this.concurrency;
   }
 
-  /**
-   * How many running jobs count against one model's ceiling.
-   *
-   * Everything running here, unless the backend serves its models side by side
-   * — then only this model's own jobs, by the id they occupy the backend under,
-   * so two advertised ids fronting one model still share its slots.
-   */
+  /** Jobs counted against one model's ceiling; by wire id, so aliases share slots. */
   private heldBy(model: string): number {
     if (!this.coresident) return this.running.size;
     const wire = this.wireOf(model);
@@ -483,8 +468,7 @@ export class Scheduler {
       const wire = this.wireOf(model);
       for (const j of this.running) if (this.wireOf(j.model) !== wire) return base;
     }
-    // Counted the way admission counts it, so a side-by-side backend is not
-    // reported full on one model because a different one is busy.
+    // Counted the way admission counts it.
     const held = this.heldBy(model);
     const spare = Math.max(0, limit - held);
     return {
@@ -493,11 +477,8 @@ export class Scheduler {
       // a model can be told it has 2 while 3 of its jobs are still running, if
       // its number arrived (or shrank) after they started.
       slots: Math.max(limit, held),
-      // Same rule as capacity(): a model's own ceiling is still zero while the
-      // card is somebody else's. Side by side, a model's spare slot is also
-      // only as good as the backend's: other models can have filled it. (A
-      // RAISED ceiling is left alone — it is reachable only with nothing
-      // foreign running, which the early return above already settled.)
+      // Zero while the card is somebody else's; side by side, also bounded by
+      // the backend's free slots unless the ceiling is raised.
       free: !this.hardwareFree()
         ? 0
         : this.coresident && limit < this.concurrency
@@ -597,19 +578,10 @@ export class Scheduler {
   }
 
   /**
-   * The job to start now, or null when nothing may.
-   *
-   * Strictly the best-scoring job, even when a lower-ranked one could batch
-   * with what is running. Letting it jump would invert priority: the batched
-   * model already gets the warm bonus, so if something still outranks it, that
-   * something genuinely should go next.
-   *
-   * One exception, and only where models are served side by side: a job held
-   * back by its OWN model's ceiling is not waiting for this backend, so it does
-   * not get to make the other models wait with it. Passing it costs it nothing
-   * — it becomes runnable the moment one of its model's jobs ends, and that
-   * same moment frees the backend slot it needs, with it still ranked first.
-   * Anything blocked for another reason stops the search exactly as before.
+   * The job to start now, or null. Strictly the best-scoring job: letting a
+   * lower-ranked one batch ahead would invert priority. One exception on a
+   * coresident backend: a job blocked only by its own model's ceiling is passed
+   * over, since it is not waiting for the backend. Any other block stops the search.
    */
   private next(): Job | null {
     const now = Date.now();

@@ -1,13 +1,7 @@
 /**
- * One-shot sparks for requests that finished since the last frame.
- *
- * Running jobs already draw themselves, and at a homelab's duty cycle most
- * requests begin and end between two frames — the queue is empty every time you
- * look, and the graph would sit dead while the box was busy. `calls` is the
- * record of exactly those, so a finished call gets one particle.
- *
- * Plain, with its clock handed in, so it can be tested without a DOM: the hook
- * in graph.tsx only feeds it frames and tells it when the page has gone.
+ * One-shot sparks for calls that finished between frames. Most requests begin
+ * and end between two frames, so this is what keeps a busy graph from looking idle.
+ * The clock is injected so it tests without a DOM.
  */
 import type { Call } from "./types.js";
 
@@ -32,15 +26,7 @@ const keyOf = (c: Call) => `${c.t}:${c.model}:${c.backend}`;
 export class SparkLedger {
   private seen: Set<string> | null = null;
   private live: Spark[] = [];
-  /**
-   * Every timer still owed, not just the latest.
-   *
-   * A spark's timer is the spark's, not the frame's. It used to belong to the
-   * effect that lit it, whose cleanup runs whenever a new frame arrives — fine
-   * while the page polled every 3s, since the timer always fired first. Once
-   * frames were pushed, a second one inside that second cancelled it, and the
-   * spark it was for stayed lit until the page was reloaded.
-   */
+  /** A spark's timer belongs to the spark, not the frame: a new frame never cancels one. */
   private readonly pending = new Set<unknown>();
 
   constructor(
@@ -51,17 +37,14 @@ export class SparkLedger {
   /** Every frame, whether or not anything in it is new. */
   feed(calls: Call[] | undefined): void {
     if (!calls) return;
-    // The first payload carries up to ten minutes of calls and fires NONE:
-    // seeding the seen-set is the whole reason this keeps one.
+    // The first payload is history, not traffic: seed the seen-set and fire nothing.
     if (this.seen === null) { this.seen = new Set(calls.map(keyOf)); return; }
     const fresh = calls.filter((c) => !this.seen!.has(keyOf(c)));
-    // The set grows with a bounded 10-minute window, so it cannot run away — but
-    // a long-lived tab still trims it against the window it is given.
+    // Bounded by the 10-minute window; trim a long-lived tab against it.
     if (this.seen.size >= 2000) this.seen = new Set(calls.map(keyOf));
     if (!fresh.length) return;
     for (const c of fresh) this.seen.add(keyOf(c));
-    // A burst of fifty would be a smear, not information. The newest few carry
-    // the same message: that backend is working.
+    // A burst is a few sparks, not a smear.
     const add = fresh.slice(-6).map((c) => ({
       key: `${keyOf(c)}:${Math.random().toString(36).slice(2, 7)}`,
       backend: c.backend,
@@ -77,7 +60,7 @@ export class SparkLedger {
     this.pending.add(handle);
   }
 
-  /** The page has gone — the one moment a pending timer should be cancelled. */
+  /** Unmount: the only time a pending timer is cancelled. */
   dispose(): void {
     for (const h of this.pending) this.timer.clear(h);
     this.pending.clear();

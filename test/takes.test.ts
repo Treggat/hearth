@@ -1,9 +1,5 @@
 /**
- * Self-check for the capability chips under a model's name.
- *
- * Two views draw them — the models table and the inspect panel — and each had
- * its own copy of the list, which is how one word came to cover two facts on
- * both. The list lives in one place now, and this pins what it says.
+ * The capability chips under a model's name.
  *
  *     npx tsx test/takes.test.ts
  */

@@ -34,20 +34,15 @@ export interface ModelStats {
   /** Its chat template can express tool calls. */
   tools?: boolean;
   /**
-   * It reasons before it answers.
-   *
-   * Only ever OBSERVED as true. Nothing a server reports can prove a model does
-   * not think — one can reason on every turn behind a template that never
-   * mentions it — so no sign of it is no claim, and `false` is something only
-   * an operator who knows the model can declare.
+   * It reasons before it answers. Only ever observed as true: no sign of it is
+   * no claim, and `false` is something only an operator can declare.
    */
   thinking?: boolean;
   /**
    * Its chat template takes a `reasoning_effort`, so asking for more or less
    * thinking reaches the model instead of being dropped.
    *
-   * Apart from `thinking` because they are two facts: a model can reason with
-   * no dial to turn, and one word covering both only ever meant this one. A
+   * Separate from `thinking`: a model can reason with no dial to turn. A
    * capability, not a setting: llama.cpp does not report the launch-time
    * budget, so this says the lever EXISTS, never where it is set. Whether the
    * model then obeys the level is a question about the model, and not one a
@@ -87,10 +82,7 @@ export function statsFromProps(props: unknown): ModelStats {
   } | undefined;
   if (typeof caps?.supports_tools === "boolean") out.tools = caps.supports_tools;
   if (typeof caps?.supports_reasoning_effort === "boolean") out.effort = caps.supports_reasoning_effort;
-  // Any ONE sign is enough, and the absence of all of them is not a "no" (see
-  // ModelStats.thinking): a dial implies the engine, a template that carries
-  // reasoning through the history has reasoning to carry, and an R1-style
-  // template reports neither cap but handles the think block in its own text.
+  // Any one sign is enough; none is not a "no" (see ModelStats.thinking).
   if (
     caps?.supports_reasoning_effort === true
     || caps?.supports_preserve_reasoning === true
@@ -250,10 +242,7 @@ export function unfit(stats: ModelStats | undefined | null, need: Need): string 
   if (need.images && stats.vision === false) return "does not accept images";
   if (need.tools && stats.tools === false) return "does not support tool calls";
   if (stats.context !== undefined && need.tokens > stats.context) {
-    // The trailing phrase is the one every agent harness already classifies as a
-    // context overflow (OpenAI's "context_length_exceeded" family), so the client
-    // compacts and retries instead of surfacing a dead turn. Keep the numbers first:
-    // they are what a human reads.
+    // Agent harnesses key on the trailing phrase to compact and retry; the numbers stay first for people.
     return `needs about ${need.tokens} tokens, its context window is ${stats.context} (context length exceeded)`;
   }
   return null;
