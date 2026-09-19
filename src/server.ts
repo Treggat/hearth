@@ -1811,7 +1811,11 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // make a progress bar that only moves once there is nothing left to
       // report.
       if (routed?.rule.queue) {
-        const { lane, model } = routed.rule;
+        const { lane } = routed.rule;
+        // The route's model is the default, not the verdict: two models can
+        // share one routed path, and each has to be queued as itself for its
+        // own ceiling to mean anything.
+        const model = pool.routedModel(routed.slot, routed.rule, asked);
         // Recorded like any other local use, because that is what it is.
         //
         // A declared route already went through the scheduler — it waited its

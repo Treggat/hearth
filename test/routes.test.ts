@@ -456,4 +456,104 @@ assert.throws(
   backend.close();
 }
 
+// --- one routed path, two models: scheduled as the one that was asked for ---
+// A route names a model because most routed paths carry none — a render, a
+// transcription. /v1/embeddings does: two embedders share that one path, and
+// scheduling every call as the route's model meant `gemma-embed` was queued,
+// counted and recorded as `nomic-embed`. Harmless while a backend had one
+// number; wrong the moment each model has its own ceiling, because the two then
+// share ONE model's slot instead of having one each.
+{
+  const wires: Record<string, string> = {
+    "nomic-embed": "nomic-embed-text-v2-moe:latest",
+    "gemma-embed": "embeddinggemma:latest",
+  };
+  const inFlight: string[] = [];
+  const held: (() => void)[] = [];
+  const backend = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.url !== "/v1/embeddings") {
+        // /api/ps and friends: a quiet ollama with nothing to report.
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ models: [], data: [] }));
+        return;
+      }
+      inFlight.push((JSON.parse(body) as { model: string }).model);
+      held.push(() => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ data: [{ embedding: [0.1] }] }));
+      });
+    });
+  });
+  await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
+
+  const node = createNode(
+    parseConfig({
+      name: "two-embedders",
+      backends: [{
+        name: "ollama", url, kind: "ollama", concurrency: 2,
+        routes: [{ path: "/v1/embeddings", model: "nomic-embed", lane: "chat" }],
+      }],
+      models: {
+        "nomic-embed": { backend: "ollama", as: wires["nomic-embed"], concurrency: 1 },
+        "gemma-embed": { backend: "ollama", as: wires["gemma-embed"], concurrency: 1 },
+      },
+    }),
+    silentLogger,
+  );
+  node.start();
+  const base = await new Promise<string>((ready) =>
+    node.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(node.server.address() as AddressInfo).port}`)),
+  );
+  const embed = (model: string) =>
+    fetch(`${base}/v1/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, input: "hi" }),
+    });
+  const settle = () => new Promise((r) => setTimeout(r, 60));
+
+  const first = embed("nomic-embed");
+  await settle();
+  const second = embed("nomic-embed");
+  const gemma = embed("gemma-embed");
+  await settle();
+  assert.deepEqual(
+    inFlight,
+    [wires["nomic-embed"], wires["gemma-embed"]],
+    "gemma runs beside nomic, and the second nomic call waits its turn",
+  );
+
+  held.shift()!();
+  await first;
+  await settle();
+  assert.equal(inFlight.length, 3, "the second nomic call goes once the first is done");
+  for (const release of held.splice(0)) release();
+  await Promise.all([second, gemma]);
+
+  const d = (await (await fetch(`${base}/ui/data`)).json()) as { calls?: { model: string }[] };
+  assert.deepEqual(
+    d.calls?.map((c) => c.model).sort(),
+    ["gemma-embed", "nomic-embed", "nomic-embed"],
+    "and each call is recorded as the model it actually ran",
+  );
+
+  // An id this backend does not serve is NOT taken on the caller's say-so: the
+  // route's own model still stands, as it always did.
+  const stranger = embed("not-a-model-here");
+  await settle();
+  held.shift()!();
+  await stranger;
+  const after = (await (await fetch(`${base}/ui/data`)).json()) as { calls?: { model: string }[] };
+  assert.equal(after.calls?.at(-1)?.model, "nomic-embed", "an unknown id falls back to the route's model");
+
+  await node.close();
+  backend.closeAllConnections();
+  backend.close();
+}
+
 console.log("routes.test.ts alias ok");
