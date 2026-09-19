@@ -30,7 +30,10 @@ export interface ModelStats {
   context?: number;
   vision?: boolean;
   tools?: boolean;
+  /** It reasons before it answers. */
   thinking?: boolean;
+  /** Its template takes a `reasoning_effort` — a dial, apart from `thinking`. */
+  effort?: boolean;
   quant?: string;
   /** Where the record came from. "declared" is the operator's word about a
    *  model nothing has loaded yet, and the page must not draw it as measured. */

@@ -983,10 +983,11 @@ numbers and on the same poll:
 | `context` | the window the process was launched with (`-c`) | an oversized request never goes there |
 | `vision` | whether it accepts images | an image request never goes there |
 | `tools` | whether its chat template can express tool calls | a request carrying `tools` never goes there |
-| `thinking` | whether its chat template takes a `reasoning_effort` | nothing — see below |
+| `thinking` | whether it reasons before it answers | nothing — see below |
+| `effort` | whether its chat template takes a `reasoning_effort` | nothing — see below |
 | `quant` | e.g. `Q5_K - Medium` | nothing — it is the only quality signal you get about hardware you do not own |
 
-All five come from one `/props` call that already happens the first time a model
+All six come from one `/props` call that already happens the first time a model
 is loaded, so this costs no extra traffic. They appear on `/ui` under **takes**,
 and the window has been on `/v1/models` as `context_length` all along.
 
@@ -1001,7 +1002,15 @@ it, you get a `400` naming both numbers before anything is queued or evicted —
 and a borrower who asks anyway gets the same `400` from the lender, rather than a
 swap and a wasted load.
 
-`thinking` is reported and never enforced, and the difference is the point. A
+`thinking` and `effort` are two facts, and one word used to cover both. A model
+can reason on every turn with no dial to turn, so "it thinks" and "you can tell
+it how hard" get a chip each. `thinking` is read from any one sign: an effort
+dial, a template that carries reasoning through the history, or a template that
+handles a think block itself (`<think>`, `enable_thinking`, `reasoning_content`).
+No sign is no claim — nothing a server reports can prove a model does *not*
+think — so only an operator can declare `thinking: false`.
+
+Both are reported and never enforced, and the difference is the point. A
 `reasoning_effort` a template cannot express is dropped by the backend and the
 request still answers — refusing it would break work that would have succeeded
 in order to protect nobody. The cost is a shallower answer than you asked for,
@@ -1040,7 +1049,7 @@ models:
   video-wan: { stats: { context: 8192, vision: true } }
 ```
 
-`context`, `vision`, `tools`, `thinking`, `quant` — all optional, and a typo is
+`context`, `vision`, `tools`, `thinking`, `effort`, `quant` — all optional, and a typo is
 a startup error rather than a field that quietly does nothing. A declaration is
 a *prediction of how the process will be launched*, so the moment the real thing
 loads, its own answer wins, field by field. The console draws a declared value

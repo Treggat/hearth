@@ -44,8 +44,46 @@ import { cleanStats, mergeStats, needsOf, statsFromProps, unfit } from "../src/s
     total_slots: 4,
   });
   assert.deepEqual(s, {
-    context: 131072, vision: true, tools: true, thinking: true, quant: "Q5_K - Medium",
+    context: 131072, vision: true, tools: true, thinking: true, effort: true, quant: "Q5_K - Medium",
   });
+}
+
+// "Can it think" and "can you tell it how hard" are two facts. One word used to
+// cover both, and it only ever meant the second: a model that reasons on every
+// turn but takes no `reasoning_effort` drew no chip at all, and the chip that
+// WAS drawn said "thinking" for what is really a dial.
+{
+  const caps = (c: Record<string, boolean>, chat_template?: string) =>
+    statsFromProps({ chat_template_caps: c, ...(chat_template === undefined ? {} : { chat_template }) });
+
+  // The dial implies the engine: a template that takes an effort is a
+  // reasoning model's template.
+  assert.deepEqual(caps({ supports_reasoning_effort: true }), { thinking: true, effort: true });
+
+  // Reasons, no dial: the template carries reasoning through the history, but
+  // there is no effort to set.
+  assert.deepEqual(
+    caps({ supports_reasoning_effort: false, supports_preserve_reasoning: true }),
+    { thinking: true, effort: false },
+  );
+
+  // R1-style: neither cap, but the template itself handles a think block.
+  for (const marker of ["<think>", "</think>", "enable_thinking", "reasoning_content"]) {
+    assert.deepEqual(
+      caps({ supports_reasoning_effort: false, supports_preserve_reasoning: false }, `{{ x }}${marker}{{ y }}`),
+      { thinking: true, effort: false },
+      `a template that names ${marker} belongs to a model that thinks`,
+    );
+  }
+
+  // No sign of it is NOT a claim that it cannot: a model can reason behind a
+  // template that never mentions it, and silence is never a limit. The dial is
+  // different — the server answered that one, so its "no" is a fact.
+  assert.deepEqual(
+    caps({ supports_reasoning_effort: false, supports_preserve_reasoning: false }, "{{ messages }}"),
+    { effort: false },
+    "no sign of thinking is no claim either way",
+  );
 }
 
 // An older build answers with the window and nothing else. Each field stands
@@ -177,8 +215,11 @@ import { cleanStats, mergeStats, needsOf, statsFromProps, unfit } from "../src/s
   // Thinking is reported and never enforced. A reasoning_effort a template
   // cannot express is ignored downstream and the request still answers, so
   // refusing it would break working traffic to protect nobody.
-  assert.equal(unfit({ thinking: false }, tiny), null, "a model with no thinking lever refuses nothing");
+  assert.equal(unfit({ thinking: false }, tiny), null, "a model that does not think refuses nothing");
+  assert.equal(unfit({ effort: false }, tiny), null, "and neither does one with no effort dial");
   assert.deepEqual(cleanStats({ thinking: false }), { thinking: false }, "but it is still reported");
+  assert.deepEqual(cleanStats({ effort: true }), { effort: true }, "the dial crosses the peer hop on its own");
+  assert.deepEqual(cleanStats({ effort: "yes" }), undefined, "and only as a boolean");
 }
 
 /* ------------------------------------------------------------------ routing */
@@ -531,6 +572,14 @@ function listen(node: HearthNode): Promise<string> {
   const ok = withStats({ context: 8192, vision: true, quant: "Q4_K" })();
   assert.deepEqual(ok.models.m!.stats, { context: 8192, vision: true, quant: "Q4_K" });
   assert.equal(withStats({})().models.m!.stats, null, "an empty block is no claim");
+  // A vLLM seat answers no /props, so both halves have to be declarable — and
+  // separately: "it thinks" is true of plenty of models with no dial to turn.
+  assert.deepEqual(
+    withStats({ thinking: true, effort: false })().models.m!.stats,
+    { thinking: true, effort: false },
+  );
+  assert.throws(withStats({ effort: "high" }), /expected true or false/, "the dial EXISTS or not; its level is not a stat");
+  assert.throws(withStats({ efort: true }), /effort/, "and the hint for a typo names it");
 }
 
 console.log("stats ok");
