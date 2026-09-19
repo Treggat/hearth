@@ -27,6 +27,7 @@ import { CopyButton, Legend, Pre, Row, Vitals, Why } from "./bits.js";
 import { Graph, type Sel } from "./graph.js";
 import { backendIcon, resourceIcon, TypeIcon, type IconKind } from "./icons.js";
 import { clock, ctxLabel, displayId, postWrite, since } from "./lib.js";
+import { capabilityChips } from "./takes.js";
 import { MONO } from "./theme.js";
 import { blockers } from "./why.js";
 import { yamlScalar as yq } from "../yamlq.js";
@@ -809,9 +810,7 @@ export function BackendPanel({ b, d, ctx }: { b: Backend; d: UiData; ctx: Ctx })
             const st = self?.stats?.[m];
             const takes = st && [
               st.context !== undefined ? ctxLabel(st.context) : null,
-              st.vision === true ? "vision" : null,
-              st.tools === true ? "tools" : null,
-              st.thinking === true ? "thinking" : null,
+              ...capabilityChips(st),
               // The panel has room for the word, and a cold model's whole
               // subtitle can be a declaration nothing has confirmed.
               st.from === "declared" ? "declared" : null,
