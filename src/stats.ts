@@ -34,15 +34,26 @@ export interface ModelStats {
   /** Its chat template can express tool calls. */
   tools?: boolean;
   /**
+   * It reasons before it answers.
+   *
+   * Only ever OBSERVED as true. Nothing a server reports can prove a model does
+   * not think — one can reason on every turn behind a template that never
+   * mentions it — so no sign of it is no claim, and `false` is something only
+   * an operator who knows the model can declare.
+   */
+  thinking?: boolean;
+  /**
    * Its chat template takes a `reasoning_effort`, so asking for more or less
    * thinking reaches the model instead of being dropped.
    *
-   * A capability, not a setting: llama.cpp does not report the launch-time
+   * Apart from `thinking` because they are two facts: a model can reason with
+   * no dial to turn, and one word covering both only ever meant this one. A
+   * capability, not a setting: llama.cpp does not report the launch-time
    * budget, so this says the lever EXISTS, never where it is set. Whether the
    * model then obeys the level is a question about the model, and not one a
    * status page should pretend to answer.
    */
-  thinking?: boolean;
+  effort?: boolean;
   /** e.g. "Q5_K - Medium". Cosmetic, but it is the only quality signal you get
    *  about a model running on hardware you do not own. */
   quant?: string;
@@ -59,6 +70,9 @@ export interface ModelStats {
   from?: "declared" | "observed" | "both";
 }
 
+/** What a chat template says when the model behind it reasons. */
+const THINKS = /<\/?think>|enable_thinking|reasoning_content/;
+
 /** llama.cpp /props -> stats. Every field independently optional: builds differ,
  *  and one missing key must not cost us the others. */
 export function statsFromProps(props: unknown): ModelStats {
@@ -68,10 +82,20 @@ export function statsFromProps(props: unknown): ModelStats {
   if (typeof gen?.n_ctx === "number" && gen.n_ctx > 0) out.context = gen.n_ctx;
   const mods = p.modalities as { vision?: unknown } | undefined;
   if (typeof mods?.vision === "boolean") out.vision = mods.vision;
-  const caps = p.chat_template_caps as
-    { supports_tools?: unknown; supports_reasoning_effort?: unknown } | undefined;
+  const caps = p.chat_template_caps as {
+    supports_tools?: unknown; supports_reasoning_effort?: unknown; supports_preserve_reasoning?: unknown;
+  } | undefined;
   if (typeof caps?.supports_tools === "boolean") out.tools = caps.supports_tools;
-  if (typeof caps?.supports_reasoning_effort === "boolean") out.thinking = caps.supports_reasoning_effort;
+  if (typeof caps?.supports_reasoning_effort === "boolean") out.effort = caps.supports_reasoning_effort;
+  // Any ONE sign is enough, and the absence of all of them is not a "no" (see
+  // ModelStats.thinking): a dial implies the engine, a template that carries
+  // reasoning through the history has reasoning to carry, and an R1-style
+  // template reports neither cap but handles the think block in its own text.
+  if (
+    caps?.supports_reasoning_effort === true
+    || caps?.supports_preserve_reasoning === true
+    || (typeof p.chat_template === "string" && THINKS.test(p.chat_template))
+  ) out.thinking = true;
   if (typeof p.model_ftype === "string" && p.model_ftype !== "") out.quant = p.model_ftype;
   return out;
 }
@@ -79,7 +103,7 @@ export function statsFromProps(props: unknown): ModelStats {
 /** Anything at all learned? An empty object is not worth caching or sending. */
 export function known(s: ModelStats): boolean {
   return s.context !== undefined || s.vision !== undefined || s.tools !== undefined
-    || s.thinking !== undefined || s.quant !== undefined;
+    || s.thinking !== undefined || s.effort !== undefined || s.quant !== undefined;
 }
 
 /** Drop anything that is not the type it claims to be. Peer input: a field that
@@ -93,6 +117,7 @@ export function cleanStats(v: unknown): ModelStats | undefined {
   if (typeof s.vision === "boolean") out.vision = s.vision;
   if (typeof s.tools === "boolean") out.tools = s.tools;
   if (typeof s.thinking === "boolean") out.thinking = s.thinking;
+  if (typeof s.effort === "boolean") out.effort = s.effort;
   if (typeof s.quant === "string") out.quant = s.quant.slice(0, 40);
   if (!known(out)) return undefined;
   // Provenance survives the peer hop: a lender that DECLARED a window rather
@@ -212,7 +237,7 @@ export function needsOf(payload: Record<string, unknown>): Need {
  * somewhere else instead.
  */
 /**
- * Note what is NOT here: thinking.
+ * Note what is NOT here: thinking, or the effort dial.
  *
  * A `reasoning_effort` a template cannot express is ignored by the backend, and
  * the request runs and answers. Refusing it would break work that would have
