@@ -131,7 +131,8 @@ for (const height of [640, 795, 900, 1100, 1400]) {
   ];
   const scene = layout(1200, 740, [], orderBackends(backends, resources), resources);
   const x = (id: string) => scene.nodes.get(`resource:${id}`)!.x;
-  const [lo, hi] = [x("b60"), x("b70")].sort((a, b) => a - b);
+  const lo = Math.min(x("b60"), x("b70"));
+  const hi = Math.max(x("b60"), x("b70"));
   assert.ok(x("host") > lo && x("host") < hi, "the host sits between its two cards");
   assert.equal(countNodeHits(scene), 0, "so neither pair line crosses the other card");
 }
