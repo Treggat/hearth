@@ -109,6 +109,34 @@ for (const height of [640, 795, 900, 1100, 1400]) {
     "and the tier below starts past all of them");
 }
 
+// --- the host sits between the cards it completes ---------------------------
+// A model split across two cards and the host draws a pair line from each card
+// to the host. Placed by its backend, the host tied with that backend's own
+// card and landed beside it, so the line from the other card ran straight
+// through the near one. web's real shape, in web's real declared order.
+{
+  const spec: [string, string[]][] = [
+    ["swap-image", ["b60"]], ["video", ["b60"]], ["swap", ["b70"]], ["swap-deep", ["b70", "b60"]],
+    ["guard", ["cpu"]], ["judge", ["cpu"]], ["expander", ["cpu"]],
+    ["embed", ["cpu"]], ["classifier", ["cpu"]], ["tts", ["cpu"]],
+  ];
+  const backends: Backend[] = spec.map(([name, resources]) => ({ name, resources }));
+  const resources: Resource[] = [
+    ...["b60", "b70", "cpu"].map((name) => ({
+      name, kind: name === "cpu" ? ("cpu" as const) : ("gpu" as const), holder: null,
+      backends: spec.filter(([, rs]) => rs.includes(name)).map(([n]) => n),
+    })),
+    { name: "host", kind: "other", shared: true, holder: null, backends: ["swap-deep"],
+      host: { cards: ["b70", "b60"], detail: "deep · 27 layers" } } as Resource,
+  ];
+  const scene = layout(1200, 740, [], orderBackends(backends, resources), resources);
+  const x = (id: string) => scene.nodes.get(`resource:${id}`)!.x;
+  const lo = Math.min(x("b60"), x("b70"));
+  const hi = Math.max(x("b60"), x("b70"));
+  assert.ok(x("host") > lo && x("host") < hi, "the host sits between its two cards");
+  assert.equal(countNodeHits(scene), 0, "so neither pair line crosses the other card");
+}
+
 console.log("layout.test.ts ok");
 
 // --- wires that do not cross each other ------------------------------------

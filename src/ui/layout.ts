@@ -443,15 +443,27 @@ export function layout(width: number, height: number, peers: Node[],
   // actually shares the row with.
   {
     const rw = rPlan.w;
-    const wanted = resources.map((r) => {
+    const want = new Map<string, number>();
+    for (const r of resources.filter((r) => !r.host)) {
       const members = r.backends
         .map((b) => nodes.get(`backend:${b}`))
         .filter((p): p is Placed => !!p);
-      const mid = members.length
+      want.set(r.name, members.length
         ? members.reduce((s, p) => s + p.x + p.w / 2, 0) / members.length
-        : PAD + inner / 2;
-      return { r, x: mid - rw / 2 };
-    }).sort((a, b) => a.x - b.x);
+        : PAD + inner / 2);
+    }
+    // The host goes by its CARDS, not its backend: it is drawn paired with each
+    // card it completes, and a pair line only stays clear of the other cards if
+    // the host sits between the ones it pairs with. By its backend it ties with
+    // that backend's own card and lands beside it — and the line from the far
+    // card then runs straight through the near one.
+    for (const r of resources.filter((r) => r.host)) {
+      const cards = r.host!.cards.map((c) => want.get(c)).filter((x): x is number => x !== undefined);
+      want.set(r.name, cards.length ? cards.reduce((s, x) => s + x, 0) / cards.length : PAD + inner / 2);
+    }
+    const wanted = resources
+      .map((r) => ({ r, x: (want.get(r.name) ?? PAD + inner / 2) - rw / 2 }))
+      .sort((a, b) => a.x - b.x);
 
     let i = 0;
     rPlan.sizes.forEach((count, row) => {
