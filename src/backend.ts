@@ -299,27 +299,33 @@ export class BackendState {
    * own keep_alive and `single` has nothing to unload by definition, so for
    * those this is honestly a no-op rather than a pretend one.
    *
-   * Never throws. The caller is trying to free a card before using it, and a
-   * backend that is already down — the common case, since down is exactly when
-   * nothing is loaded — has given us what we wanted. Failing the job over it
-   * would turn a successful outcome into an error.
+   * A backend that is down has nothing loaded, so a transport error is a no-op.
+   * A backend that answers and refuses still holds the weights: this throws so
+   * the job fails instead of loading on top of them.
    */
   async unload(): Promise<void> {
     if (this.kind !== "llama-swap") return;
+    const url = `${this.url}/api/models/unload`;
+    let res;
     try {
-      const res = await send(`${this.url}/unload`, { method: "POST", headersTimeoutMs: 30_000 });
-      res.body.resume();
-      // Warm state is now stale in a way the event stream may take a moment to
-      // tell us. Say so ourselves rather than scoring the next job against a
-      // model we just evicted.
-      this.loadedIds = [];
-      this.lastUpdateAt = Date.now();
+      res = await send(url, { method: "POST", headersTimeoutMs: 30_000 });
     } catch (e) {
       this.log.warn("backend.unload_failed", {
-        url: this.url,
+        url,
         detail: e instanceof Error ? e.message : String(e),
       });
+      return;
     }
+    res.body.resume();
+    if (!res.ok) {
+      this.log.warn("backend.unload_refused", { url, status: res.status });
+      throw new Error(`${url} answered ${res.status}: the card was not cleared`);
+    }
+    // Warm state is now stale in a way the event stream may take a moment to
+    // tell us. Say so ourselves rather than scoring the next job against a
+    // model we just evicted.
+    this.loadedIds = [];
+    this.lastUpdateAt = Date.now();
   }
 
   /** Can this backend tell us what is loaded at all? */
