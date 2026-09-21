@@ -25,6 +25,7 @@ import type { AddressInfo } from "node:net";
 
 import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
+import { BackendState } from "../src/backend.js";
 import { BackendPool } from "../src/pool.js";
 import { ResourceArbiter } from "../src/resources.js";
 import { Scheduler } from "../src/scheduler.js";
@@ -285,7 +286,7 @@ function pool(concurrency = 1) {
 {
   let unloaded = 0;
   const backend = createServer((req, res) => {
-    if (req.url === "/unload") {
+    if (req.url === "/api/models/unload") {
       unloaded++;
       res.end("ok");
       return;
@@ -335,6 +336,27 @@ function pool(concurrency = 1) {
   node.server.closeAllConnections();
   node.server.close();
   backend.close();
+}
+
+// --- a backend that answers the unload with a refusal has NOT cleared the card
+// llama-swap v255 answers 405 to the old POST /unload. Treating that as "done"
+// once loaded a 20 GiB model onto a card still holding 17 GiB and hung the
+// host. A refusal must surface as a failed eviction, never a silent success.
+{
+  const refusing = createServer((req, res) => {
+    if (req.url === "/api/models/unload") {
+      res.statusCode = 405;
+      res.end("method not allowed");
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise<void>((r) => refusing.listen(0, "127.0.0.1", () => r()));
+  const url = `http://127.0.0.1:${(refusing.address() as AddressInfo).port}`;
+  const b = new BackendState(url, "llama-swap", silentLogger);
+  await assert.rejects(b.unload(), /405/, "a refused unload throws");
+  refusing.close();
 }
 
 console.log("resources.test.ts ok");

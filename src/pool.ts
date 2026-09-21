@@ -233,8 +233,10 @@ export class BackendPool {
    * something on it. In practice it is one or two calls that are usually
    * no-ops.
    *
-   * `unload()` never throws and caps its own wait, so this cannot fail — but it
-   * CAN be slow, and everything queued for this card is waiting behind it. The
+   * `unload()` throws only when a backend answers and REFUSES — then the job
+   * fails rather than load onto weights still on the card. A backend that is
+   * down is a no-op, and each call caps its own wait — but the sequence CAN be
+   * slow, and everything queued for this card is waiting behind it. The
    * whole sequence is therefore bounded as well as each call in it: past the
    * deadline we stop asking and let the job proceed, because a neighbour that
    * will not answer an unload is not going to start answering, and holding the
