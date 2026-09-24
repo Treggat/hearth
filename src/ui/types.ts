@@ -35,6 +35,8 @@ export interface ModelStats {
   /** Its template takes a `reasoning_effort` — a dial, apart from `thinking`. */
   effort?: boolean;
   quant?: string;
+  /** The lender's own words on what the model is for. */
+  note?: string;
   /** Where the record came from. "declared" is the operator's word about a
    *  model nothing has loaded yet, and the page must not draw it as measured. */
   from?: "declared" | "observed" | "both";

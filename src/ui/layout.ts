@@ -78,7 +78,9 @@ export function grid(
     left -= take;
   }
   const per = Math.max(...sizes);
-  return { sizes, w: Math.max(cell.min, Math.min(cell.max, (inner - (per - 1) * GAP) / per)) };
+  // Two rows keep half a cell spare so they can be staggered (see layout).
+  const w = k === 2 ? (inner - (per - 0.5) * GAP) / (per + 0.5) : fits(k);
+  return { sizes, w: Math.max(cell.min, Math.min(cell.max, w)) };
 }
 
 /**
@@ -291,7 +293,8 @@ function curve(a: Placed, b: Placed, dir: "across" | "down", lift = 0): {
  * the column instead and turns into the node's side. The gap is empty by
  * construction, which is what makes this safe rather than lucky.
  */
-const corridorFor = (p: Placed): number => Math.max(2, p.x - GAP / 2);
+const corridorFor = (p: Placed, lane: "in" | "out"): number =>
+  Math.max(2, p.x - (lane === "in" ? GAP * 2 / 3 : GAP / 3));
 
 /** Is anything in this column between `p` and the tier it is reaching for? */
 function blocked(p: Placed, others: Placed[], above: boolean): boolean {
@@ -417,17 +420,24 @@ export function layout(width: number, height: number, peers: Node[],
     // short last row leaves the right-hand columns one shallower rather than
     // leaving a hole in the middle of the grid.
     const depth = (c: number): number => bPlan.sizes.filter((n) => n > c).length;
+    // Two rows holding the same count line up column for column, so a quarter
+    // pitch each way puts the lower row in the gaps of the upper one. Three or
+    // more cannot all be staggered; those wires take the corridors instead.
+    const pitch = bPlan.w + GAP;
+    const aligned = bPlan.sizes.length === 2 && bPlan.sizes[0] === bPlan.sizes[1];
+    const starts = bPlan.sizes.map((count, row) => {
+      const span = count * bPlan.w + (count - 1) * GAP;
+      const centred = PAD + (inner - span) / 2 + (aligned ? (row ? 1 : -1) * pitch / 4 : 0);
+      return Math.max(PAD, Math.min(centred, PAD + inner - span));
+    });
     let i = 0;
     for (let c = 0; c < cols; c++) {
       for (let row = 0; row < depth(c); row++, i++) {
         const b = backends[i];
         if (!b) break;
-        const count = bPlan.sizes[row]!;
-        const span = count * bPlan.w + (count - 1) * GAP;
-        const start = PAD + Math.max(0, (inner - span) / 2);
         nodes.set(`backend:${b.name}`, {
           id: `backend:${b.name}`, kind: "backend",
-          x: start + c * (bPlan.w + GAP),
+          x: starts[row]! + c * pitch,
           y: Y.backends + row * (H.backend + STACK),
           w: bPlan.w, h: H.backend,
         });
@@ -545,7 +555,7 @@ export function layout(width: number, height: number, peers: Node[],
         if (!to) continue;
         // Straight onto its top where the column above it is clear, down the
         // gap beside it and in through the side where it is not.
-        const enter = blocked(to, all, true) ? corridorFor(to) : undefined;
+        const enter = blocked(to, all, true) ? corridorFor(to, "in") : undefined;
         const { d, mid, poly } = elbow(from, to, channelY, { enter });
         edges.push({
           id: `self>backend:${b.name}`,
@@ -594,7 +604,7 @@ export function layout(width: number, height: number, peers: Node[],
         if (!a) continue;
         // Out through the side where its own column continues below it, so the
         // descent goes down the gap rather than through its neighbours.
-        const exit = blocked(a, allBackends, false) ? corridorFor(a) : undefined;
+        const exit = blocked(a, allBackends, false) ? corridorFor(a, "out") : undefined;
         const { d, mid, poly } = elbow(a, p, channelY, { exit });
         edges.push({
           id: `backend:${b}>resource:${r.name}`,
@@ -709,6 +719,28 @@ export function countNodeHits(scene: Scene): number {
     for (const [id, p] of scene.nodes) {
       if (id === e.from || id === e.to) continue;
       if (polyHitsBox(e.poly, p)) n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * How many pairs of unrelated wires run down the same line. Crossings and node
+ * hits both miss this: two wires sharing a corridor read as one wire.
+ */
+export function countOverlaps(scene: Scene): number {
+  const runs = scene.edges.flatMap((e) => e.poly.slice(1).flatMap((b, i) => {
+    const a = e.poly[i]!;
+    return Math.abs(a.x - b.x) < 0.5 && Math.abs(a.y - b.y) > 2
+      ? [{ e, x: a.x, y1: Math.min(a.y, b.y), y2: Math.max(a.y, b.y) }] : [];
+  }));
+  let n = 0;
+  for (let i = 0; i < runs.length; i++) {
+    for (let j = i + 1; j < runs.length; j++) {
+      const p = runs[i]!, q = runs[j]!;
+      // A shared end is a trunk, not an overlap.
+      if (p.e.from === q.e.from || p.e.to === q.e.to) continue;
+      if (Math.abs(p.x - q.x) < 3 && Math.min(p.y2, q.y2) - Math.max(p.y1, q.y1) > 4) n++;
     }
   }
   return n;

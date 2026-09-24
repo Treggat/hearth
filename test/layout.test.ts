@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 
 import {
-  CELL, countCrossings, countNodeHits, GAP, grid, H, layout, MIN_GAP, orderBackends,
+  CELL, countCrossings, countNodeHits, countOverlaps, GAP, grid, H, layout, MIN_GAP, orderBackends,
   PAD, polyLength, STACK, stitch, tiers,
 } from "../src/ui/layout.js";
 import type { Backend, Node, Resource } from "../src/ui/types.js";
@@ -227,6 +227,27 @@ console.log("layout.test.ts ok");
     }
   }
   assert.ok(checked > 1500, `the sweep must actually run (${checked} layouts)`);
+
+  // Ten backends wrap 5/5, the columns line up, and a wire into the lower row
+  // used to share its corridor with one leaving the upper row.
+  {
+    const resources = [
+      { name: "b60", backends: ["swap-image", "swap-deep", "video"] },
+      { name: "b70", backends: ["swap", "swap-deep"] },
+      { name: "cpu", backends: ["guard", "judge", "expander", "embed", "classifier", "tts"] },
+    ] as Resource[];
+    const backends = ["swap", "swap-image", "swap-deep", "video", "guard", "judge", "expander",
+      "embed", "classifier", "tts"].map((name) => ({
+      name, resources: resources.filter((r) => r.backends.includes(name)).map((r) => r.name),
+    })) as Backend[];
+    const ordered = orderBackends(backends, resources);
+    for (let w = 660; w <= 2000; w += 40) {
+      for (const h of [600, 800, 1000, 1200]) {
+        const scene = layout(w, h, peerSets[1]!, ordered, resources);
+        assert.equal(countOverlaps(scene), 0, `live at ${w}x${h} runs two wires down one line`);
+      }
+    }
+  }
 
   // The shape itself, not just its outcome: right angles with rounded corners,
   // and one shared channel per card so a group of sidecars arrives as one trunk

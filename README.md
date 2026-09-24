@@ -82,6 +82,7 @@ Every key with its default. Only `backend.url` is required.
 | `uiListen` | unset | give the status page its own `{host, port}`. Unset keeps it on the main port, loopback-only |
 | `maxBodyBytes` | `33554432` | largest accepted request body |
 | `share` | `[]` | models you'll run for a peer. Empty lends nothing |
+| `notes` | `{}` | `model: text` telling borrowers what a model is for. Shown on their `/ui` and as `description` on `/v1/models` |
 | `peerTokens` | `{}` | `name: token` a peer presents to you |
 | `peerLane` | lowest-priority lane | which lane borrowed work enters |
 | `peerMaxConcurrent` | `2` | jobs one peer may have in flight |
@@ -956,6 +957,8 @@ Theirs, to accept it:
 peerTokens:
   you: env:HEARTH_PEER_YOU
 share: [their-big-model]   # empty by default, since lending is opt-in per model
+notes:
+  their-big-model: "Agent/coding work. 128k context; send reasoning_effort for harder tasks."
 ```
 
 Both blocks can also be edited from `/ui` or `curl` while it runs, which is

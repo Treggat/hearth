@@ -1451,7 +1451,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // see, and a client that loses this field loses any idea of which model
       // answers now and which one costs a load first.
       const warm = new Set(pool.loaded());
-      type Entry = { id: string; status?: { value: string }; context_length?: number };
+      type Entry = { id: string; status?: { value: string }; context_length?: number; description?: string };
       const upstream: { data?: Entry[] } = {
         data: pool.catalog().map((id) => {
           // A backend that cannot report warm state must not be flattened
@@ -1465,6 +1465,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           entry.status = { value: warm.has(id) ? "loaded" : "unloaded" };
           const ctx = pool.contextLength(id);
           if (ctx !== null) entry.context_length = ctx;
+          const note = pool.statsFor(id)?.note;
+          if (note) entry.description = note;
           return entry;
         }),
       };
@@ -1483,6 +1485,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           const per = p.capacity?.models?.[theirs];
           if (per) entry.status = { value: per.warm ? "loaded" : "unloaded" };
           if (per?.stats?.context !== undefined) entry.context_length = per.stats.context;
+          if (per?.stats?.note) entry.description = per.stats.note;
           upstream.data!.push(entry);
         }
       }
