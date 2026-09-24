@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 
 import { parse as parseYaml } from "yaml";
 
-import { known, type ModelStats } from "./stats.js";
+import { known, NOTE_MAX, type ModelStats } from "./stats.js";
 
 export type RoutePolicy = "local" | "peer" | "spillover" | "fastest";
 
@@ -460,6 +460,8 @@ export interface HearthConfig {
   peerTokens: Record<string, string>;
   /** Models we'll serve to peers. Empty means none, since lending is opt-in. */
   share: string[];
+  /** What each model is for, shown to peers beside it. */
+  notes?: Record<string, string>;
   /** Requests per hour one peer may send us. */
   peerRateLimit: number;
   /**
@@ -1303,6 +1305,18 @@ export function parseConfig(raw: unknown): HearthConfig {
     apiKeyModels,
     peerTokens,
     share: strList(root.share, "share"),
+    notes: (() => {
+      const raw = root.notes === undefined ? {} : asRecord(root.notes, "notes");
+      const out: Record<string, string> = {};
+      for (const [id, v] of Object.entries(raw)) {
+        const note = str(v, `notes.${id}`).trim();
+        if (note.length > NOTE_MAX) {
+          throw new ConfigError(`notes.${id} is ${note.length} characters -- keep it under ${NOTE_MAX}`);
+        }
+        if (note !== "") out[id] = note;
+      }
+      return out;
+    })(),
     peerRateLimit: count(root.peerRateLimit, "peerRateLimit", 600, 1),
     peerLane: (() => {
       const named = str(root.peerLane, "peerLane", "");

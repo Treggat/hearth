@@ -52,6 +52,8 @@ export interface ModelStats {
   /** e.g. "Q5_K - Medium". Cosmetic, but it is the only quality signal you get
    *  about a model running on hardware you do not own. */
   quant?: string;
+  /** The operator's own words on what the model is for and how to use it. */
+  note?: string;
   /**
    * Where this came from. Not a stat — provenance, and it is load-bearing.
    *
@@ -64,6 +66,9 @@ export interface ModelStats {
    */
   from?: "declared" | "observed" | "both";
 }
+
+/** A note is a sentence or two, not a manual. */
+export const NOTE_MAX = 500;
 
 /** What a chat template says when the model behind it reasons. */
 const THINKS = /<\/?think>|enable_thinking|reasoning_content/;
@@ -95,7 +100,8 @@ export function statsFromProps(props: unknown): ModelStats {
 /** Anything at all learned? An empty object is not worth caching or sending. */
 export function known(s: ModelStats): boolean {
   return s.context !== undefined || s.vision !== undefined || s.tools !== undefined
-    || s.thinking !== undefined || s.effort !== undefined || s.quant !== undefined;
+    || s.thinking !== undefined || s.effort !== undefined || s.quant !== undefined
+    || s.note !== undefined;
 }
 
 /** Drop anything that is not the type it claims to be. Peer input: a field that
@@ -111,6 +117,7 @@ export function cleanStats(v: unknown): ModelStats | undefined {
   if (typeof s.thinking === "boolean") out.thinking = s.thinking;
   if (typeof s.effort === "boolean") out.effort = s.effort;
   if (typeof s.quant === "string") out.quant = s.quant.slice(0, 40);
+  if (typeof s.note === "string" && s.note !== "") out.note = s.note.slice(0, NOTE_MAX);
   if (!known(out)) return undefined;
   // Provenance survives the peer hop: a lender that DECLARED a window rather
   // than measuring it is telling the borrower something real about how much to

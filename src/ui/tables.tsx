@@ -284,6 +284,15 @@ export function ModelsTable({ d, ctx, onSelect }: { d: UiData; ctx: Ctx; onSelec
     );
   };
 
+  const Note = ({ r }: { r: ModelRow }) => {
+    const note = r.on.map((n) => n.stats?.[r.model]?.note).find(Boolean);
+    return note ? (
+      <Typography sx={{ fontSize: 11, color: "text.secondary", whiteSpace: "normal", maxWidth: 360, mt: 0.25 }}>
+        {note}
+      </Typography>
+    ) : null;
+  };
+
   const State = ({ r }: { r: ModelRow }) => (
     <Tooltip title={
       r.route ? "a path, not a model id — this backend does not report what it holds, so neither can we"
@@ -330,6 +339,7 @@ export function ModelsTable({ d, ctx, onSelect }: { d: UiData; ctx: Ctx; onSelec
                         </Box>
                       </Box>
                     ) : r.model}
+                    <Note r={r} />
                   </TableCell>
                   <TableCell sx={{ ...mono, color: "text.secondary" }}><Where r={r} /></TableCell>
                   <TableCell><State r={r} /></TableCell>
