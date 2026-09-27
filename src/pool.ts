@@ -339,14 +339,24 @@ export class BackendPool {
 
   /** The id to put on the wire for an advertised id (`as`), used by every dispatch path and catalogue comparison. */
   outboundId(model: string): string {
-    return this.cfg.models[model]?.as ?? model;
+    const r = this.cfg.models[model];
+    if (r?.follow && r.backend !== null) {
+      const resident = this.byName.get(r.backend)?.state.resident() ?? null;
+      if (resident !== null) return resident;
+    }
+    return r?.as ?? model;
+  }
+
+  /** The ids configured with `follow`. */
+  private followIds(): string[] {
+    return Object.entries(this.cfg.models).filter(([, r]) => r.follow).map(([id]) => id);
   }
 
   /** A model's shared-context pool, inherited from the seat it fronts like its slots. */
   private poolOf(model: string): ModelRoute["pool"] {
     const r = this.cfg.models[model];
     if (!r) return null;
-    return r.pool ?? (r.as === null ? null : this.cfg.models[r.as]?.pool ?? null);
+    return r.pool ?? (r.as === null ? null : this.cfg.models[this.outboundId(model)]?.pool ?? null);
   }
 
   /** What a request holds of its model's pool while it runs, or undefined without one. */
@@ -362,7 +372,7 @@ export class BackendPool {
     const r = this.cfg.models[model];
     if (!r) return null;
     if (r.as === null) return r.concurrency;
-    return r.concurrency ?? this.cfg.models[r.as]?.concurrency ?? null;
+    return r.concurrency ?? this.cfg.models[this.outboundId(model)]?.concurrency ?? null;
   }
 
   /**
@@ -383,7 +393,7 @@ export class BackendPool {
   private advertisedIds(raw: string): string[] {
     const ids: string[] = [];
     for (const [id, route] of Object.entries(this.cfg.models)) {
-      if (route.as === raw) ids.push(id);
+      if (route.as === raw && !route.follow) ids.push(id);
     }
     if (ids.length === 0 || this.cfg.models[raw] !== undefined) ids.push(raw);
     return ids;
@@ -400,7 +410,7 @@ export class BackendPool {
     // Built per call rather than cached: `models` is small, and a cache here
     // would need invalidating on any future config reload.
     for (const [id, route] of Object.entries(this.cfg.models)) {
-      if (route.as === raw) return id;
+      if (route.as === raw && !route.follow) return id;
     }
     return raw;
   }
@@ -413,6 +423,9 @@ export class BackendPool {
         // Advertise our names, never the backend's raw id behind an alias.
         for (const id of this.advertisedIds(m)) out.add(id);
       }
+    }
+    for (const id of this.followIds()) {
+      if (out.has(this.cfg.models[id]!.as!)) out.add(id);
     }
     return [...out];
   }
@@ -452,6 +465,11 @@ export class BackendPool {
       // scheduler's warm bonus and the "ready now" set. Left raw, an aliased
       // model would read as permanently cold and quietly lose its priority.
       for (const m of s.state.loaded()) for (const id of this.advertisedIds(m)) out.add(id);
+    }
+    // A follow id goes out as whatever is resident, so it costs no load while
+    // anything is.
+    for (const id of this.followIds()) {
+      if (this.byName.get(this.cfg.models[id]!.backend!)?.state.resident()) out.add(id);
     }
     return [...out];
   }
