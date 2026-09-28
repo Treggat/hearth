@@ -171,6 +171,35 @@ import { cleanStats, fitOutput, mergeStats, needsOf, statsFromModels, statsFromP
   assert.equal(withImage.images, true);
   assert.ok(withImage.tokens < 5_000, `an image is charged flat, got ${withImage.tokens}`);
 
+  // A video rides an image_url whose data URL is a video container, and it
+  // costs its sender's whole frame budget. Charged as one image it would be
+  // under-counted some thirty times over — and under-counting costs the window.
+  const clip = (mediaType: string) => ({
+    type: "image_url",
+    image_url: { url: `data:${mediaType};base64,${"A".repeat(200_000)}` },
+  });
+  const say = (...content: unknown[]) => needsOf({ messages: [{ role: "user", content }] });
+  const withVideo = say(clip("video/mp4"));
+  assert.ok(withVideo.tokens >= 40_000, `a video is charged as a video, got ${withVideo.tokens}`);
+  assert.equal(withVideo.images, true, "a video needs a model that sees, same as an image");
+  assert.ok(say(clip("video/webm")).tokens >= 40_000, "any video container, not only mp4");
+  assert.ok(
+    say({ type: "input_image", image_url: "data:video/mp4;base64,AAAA" }).tokens >= 40_000,
+    "and the responses-style spelling, whose image_url is the bare URL",
+  );
+  assert.ok(
+    say({ type: "video_url", video_url: { url: "https://example.test/clip.mp4" } }).tokens >= 40_000,
+    "and a video_url part, which is a video whatever its URL says",
+  );
+  assert.ok(say(clip("image/png")).tokens < 5_000, "an image data URL keeps the image price");
+  // One of each costs one video plus one image: the video is not ALSO an image.
+  const image = clip("image/png");
+  assert.equal(
+    say(clip("video/mp4"), image).tokens - withVideo.tokens,
+    say(image).tokens - say().tokens,
+    "a video is never counted twice",
+  );
+
   const withTools = needsOf({
     messages: [{ role: "user", content: "go" }],
     tools: [{ type: "function", function: { name: "read_file" } }],
