@@ -172,7 +172,8 @@ export interface HearthConfig {
     concurrency: number;
     agePerSecond: number;
     warmBonus: number;
-    lanes: Record<string, { priority: number }>;
+    /** `concurrency` is the most of a backend's slots the lane may hold at once; unset is no ceiling. */
+    lanes: Record<string, { priority: number; concurrency?: number }>;
     /** How long one lane's queue may get before we start refusing. Someone told
      *  "full" can retry. Someone queued behind 400 jobs just waits. */
     maxPerLane: number;
@@ -670,10 +671,14 @@ export function parseConfig(raw: unknown): HearthConfig {
   }
 
   const lanesRaw = sched.lanes === undefined ? DEFAULT_LANES : asRecord(sched.lanes, "scheduler.lanes");
-  const lanes: Record<string, { priority: number }> = {};
+  const lanes: Record<string, { priority: number; concurrency?: number }> = {};
   for (const [lane, v] of Object.entries(lanesRaw)) {
     const entry = asRecord(v, `scheduler.lanes.${lane}`);
     lanes[lane] = { priority: num(entry.priority, `scheduler.lanes.${lane}.priority`, 0) };
+    // Left off when unset rather than defaulted: no number here means the lane has no ceiling of its own.
+    if (entry.concurrency !== undefined) {
+      lanes[lane].concurrency = count(entry.concurrency, `scheduler.lanes.${lane}.concurrency`, 1);
+    }
   }
   // BEFORE the warm lane is added, or `lanes: {}` would quietly become a valid
   // config with one lane nobody asked for. An empty lanes block is a mistake and

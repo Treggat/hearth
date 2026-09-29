@@ -4,6 +4,8 @@
  *
  * A model's declared slot count overrides the backend's `concurrency` either way; a raise
  * above it only admits more of the model already running, so a swap stays serialized.
+ * A lane's `concurrency` caps how many slots that lane holds at once, and a job blocked
+ * only by it is passed over, since the slots it may not take are free to the other lanes.
  * `offbox` jobs hold no slot but still count against the caller's cap.
  */
 import { randomUUID } from "node:crypto";
@@ -13,6 +15,9 @@ import type { ResourceArbiter } from "./resources.js";
 export interface LaneConfig {
   /** Lower goes first. Put interactive lanes near zero. */
   priority: number;
+  /** Slots this lane may hold at once on one backend; unset is no ceiling. Priority orders
+   *  the queue and nothing is preempted, so this is what keeps bulk work off a busy seat. */
+  concurrency?: number;
 }
 
 export interface SchedulerOptions {
@@ -314,13 +319,23 @@ export class Scheduler {
     return sharing && used + job.tokens > pool;
   }
 
+  /** Is this job's lane at its own ceiling? Counts what holds a slot here, so not off-box work. */
+  private laneFull(job: Job): boolean {
+    const ceiling = this.lanes[job.lane]?.concurrency;
+    if (ceiling === undefined) return false;
+    let held = 0;
+    for (const j of this.running) if (j.lane === job.lane) held++;
+    return held >= ceiling;
+  }
+
   /**
-   * May this job start now? Its model's ceiling first, then the backend's; above
+   * May this job start now? Its lane's ceiling, its model's, then the backend's; above
    * `concurrency` only alongside jobs of the same model.
    */
   private canAdmit(job: Job): boolean {
     // Hardware first; our own hold never blocks us.
     if (!this.hardwareFree()) return false;
+    if (this.laneFull(job)) return false;
     if (this.heldBy(job.model) >= this.limitFor(job.model)) return false;
     if (this.overPool(job)) return false;
     if (this.running.size < this.concurrency) return true;
@@ -450,8 +465,8 @@ export class Scheduler {
   }
 
   /**
-   * The best-scoring job if it can start, else null. On a coresident backend a job blocked
-   * only by its own model's ceiling is passed over.
+   * The best-scoring job if it can start, else null. A job blocked by its lane's ceiling is
+   * passed over, and on a coresident backend so is one blocked only by its own model's.
    */
   private next(): Job | null {
     const now = Date.now();
@@ -470,7 +485,9 @@ export class Scheduler {
       }
       if (!best) return null;
       if (this.canAdmit(best)) return best;
-      if (!this.coresident || this.heldBy(best.model) < this.limitFor(best.model)) return null;
+      const ownCeiling =
+        this.laneFull(best) || (this.coresident && this.heldBy(best.model) >= this.limitFor(best.model));
+      if (!ownCeiling) return null;
       passed.add(best);
     }
   }

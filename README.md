@@ -58,6 +58,31 @@ Peers don't get to choose. Borrowed work is pinned to `peerLane`, which defaults
 to your lowest-priority lane. Lanes express the host's priorities, and a guest
 doesn't get a vote in them.
 
+### A ceiling for a lane
+
+Priority orders the queue. It does nothing about a slot that is free, and
+nothing is ever preempted, so on a seat that batches a low-priority lane takes
+every slot nobody is using right now and keeps it until its call ends. Work that
+arrives in bulk — a memory service summarising each finished chat, a nightly
+re-index — ends up sharing the card with the people it was ranked below.
+
+`concurrency` on a lane is the most of a backend's slots that lane may hold at
+once:
+
+```yaml
+scheduler:
+  lanes:
+    chat:   { priority: 0 }
+    memory: { priority: 100, concurrency: 2 }   # never more than 2 slots of any backend
+```
+
+It is a maximum, not a reservation: sixteen chat turns still take all sixteen
+slots, and `memory` waits for one like anybody else. A job held back by its
+lane's ceiling is passed over rather than waited on, so it never holds up the
+lanes behind it, however long it has aged. Leave it off and the lane has no
+ceiling of its own, which is how every lane behaved before. Off-box jobs hold no
+local slot and are not counted.
+
 ## Configuration
 
 Every key with its default. Only `backend.url` is required.
@@ -74,6 +99,7 @@ Every key with its default. Only `backend.url` is required.
 | `backends[].activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
 | `scheduler.concurrency` | `1` | default jobs-at-once per backend; a backend can override it |
 | `scheduler.lanes` | `chat`, `batch` | named lanes and their base priority |
+| `scheduler.lanes.<lane>.concurrency` | unset | the most slots of one backend this lane may hold at once. Unset is no ceiling. See Lanes |
 | `scheduler.agePerSecond` | `1` | priority earned per second waited, which is also the starvation bound |
 | `scheduler.warmBonus` | `40` | priority discount for a model already loaded |
 | `scheduler.maxPerLane` | `100` | how long one lane's queue may get before new work is refused. Off-box jobs are bounded separately, on their own count |
