@@ -341,8 +341,9 @@ export class BackendPool {
   outboundId(model: string): string {
     const r = this.cfg.models[model];
     if (r?.follow && r.backend !== null) {
-      const resident = this.byName.get(r.backend)?.state.resident() ?? null;
-      if (resident !== null) return resident;
+      // `as` when it is among what is loaded, so several resident models never make this arbitrary.
+      const loaded = this.byName.get(r.backend)?.state.loaded() ?? [];
+      if (loaded.length > 0 && !loaded.includes(r.as!)) return loaded[0]!;
     }
     return r?.as ?? model;
   }

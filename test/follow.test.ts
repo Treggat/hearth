@@ -46,8 +46,8 @@ function fakeSwap(ids: string[]) {
   });
   return {
     seen,
-    load: (model: string | null) => {
-      running = model === null ? [] : [{ model, state: "ready" }];
+    load: (model: string | string[] | null) => {
+      running = (model === null ? [] : [model].flat()).map((m) => ({ model: m, state: "ready" }));
     },
     listen: () => new Promise<void>((r) => server.listen(0, "127.0.0.1", r)),
     url: () => `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
@@ -120,6 +120,12 @@ try {
   // --- and back again: the default seat is followed too ------------------------
   card.load("main");
   assert.equal((await send("loaded")).model, "main");
+
+  // --- several loaded: `as` wins when it is one of them, so the pick is never arbitrary ---
+  card.load(["trial", "main"]);
+  assert.equal((await send("loaded")).model, "main", "`as` is preferred among several resident models");
+  card.load(["trial"]);
+  assert.equal((await send("loaded")).model, "trial");
 
   // --- a plain id is unaffected: asking for `trial` by name still means trial ---
   assert.equal((await send("trial")).model, "trial");
