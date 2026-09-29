@@ -81,7 +81,8 @@ slots, and `memory` waits for one like anybody else. A job held back by its
 lane's ceiling is passed over rather than waited on, so it never holds up the
 lanes behind it, however long it has aged. Leave it off and the lane has no
 ceiling of its own, which is how every lane behaved before. Off-box jobs hold no
-local slot and are not counted.
+local slot and are not counted. The ceiling is per backend: `concurrency: 2` on a
+node with two backends lets the lane hold two slots on each.
 
 ## Configuration
 
