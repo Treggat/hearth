@@ -11,7 +11,7 @@ import { dirname } from "node:path";
 
 import { parseDocument } from "yaml";
 
-import { ConfigError, parseConfig, type HearthConfig, type ModelRoute, type RoutePolicy } from "./config.js";
+import { ConfigError, parseConfig, peersMapping, type HearthConfig, type ModelRoute, type RoutePolicy } from "./config.js";
 import type { Logger } from "./log.js";
 import { yamlScalar as y } from "./yamlq.js";
 
@@ -117,6 +117,7 @@ export function writeState(path: string, state: SavedState): void {
 const DEFAULT_ROUTE: ModelRoute = {
   backend: null,
   as: null,
+  follow: false,
   policy: "local",
   peers: [],
   spilloverAt: 1,
@@ -421,9 +422,7 @@ export class Overrides {
   private pruneDeadRoutes(): void {
     for (const [id, route] of Object.entries(this.cfg.models)) {
       if (route.policy === "local") continue;
-      const named = route.peers.length > 0 ? route.peers : this.cfg.peers.map((p) => p.name);
-      const able = named.some((n) => this.cfg.peers.find((p) => p.name === n)?.models[id] !== undefined);
-      if (!able) this.retireRoute(id);
+      if (peersMapping(id, route.peers, this.cfg.peers).length === 0) this.retireRoute(id);
     }
   }
 

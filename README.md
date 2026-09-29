@@ -58,6 +58,32 @@ Peers don't get to choose. Borrowed work is pinned to `peerLane`, which defaults
 to your lowest-priority lane. Lanes express the host's priorities, and a guest
 doesn't get a vote in them.
 
+### A ceiling for a lane
+
+Priority orders the queue. It does nothing about a slot that is free, and
+nothing is ever preempted, so on a seat that batches a low-priority lane takes
+every slot nobody is using right now and keeps it until its call ends. Work that
+arrives in bulk — a memory service summarising each finished chat, a nightly
+re-index — ends up sharing the card with the people it was ranked below.
+
+`concurrency` on a lane is the most of a backend's slots that lane may hold at
+once:
+
+```yaml
+scheduler:
+  lanes:
+    chat:   { priority: 0 }
+    memory: { priority: 100, concurrency: 2 }   # never more than 2 slots of any backend
+```
+
+It is a maximum, not a reservation: sixteen chat turns still take all sixteen
+slots, and `memory` waits for one like anybody else. A job held back by its
+lane's ceiling is passed over rather than waited on, so it never holds up the
+lanes behind it, however long it has aged. Leave it off and the lane has no
+ceiling of its own, which is how every lane behaved before. Off-box jobs hold no
+local slot and are not counted. The ceiling is per backend: `concurrency: 2` on a
+node with two backends lets the lane hold two slots on each.
+
 ## Configuration
 
 Every key with its default. Only `backend.url` is required.
@@ -74,6 +100,7 @@ Every key with its default. Only `backend.url` is required.
 | `backends[].activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
 | `scheduler.concurrency` | `1` | default jobs-at-once per backend; a backend can override it |
 | `scheduler.lanes` | `chat`, `batch` | named lanes and their base priority |
+| `scheduler.lanes.<lane>.concurrency` | unset | the most slots of one backend this lane may hold at once. Unset is no ceiling. See Lanes |
 | `scheduler.agePerSecond` | `1` | priority earned per second waited, which is also the starvation bound |
 | `scheduler.warmBonus` | `40` | priority discount for a model already loaded |
 | `scheduler.maxPerLane` | `100` | how long one lane's queue may get before new work is refused. Off-box jobs are bounded separately, on their own count |
@@ -98,7 +125,9 @@ Every key with its default. Only `backend.url` is required.
 | `peers` | `[]` | nodes you can send work to |
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
 | `stateFile` | `null` | fallback for Save when the config file itself cannot be written. Null unless you need it |
+| `models.<id>.follow` | `false` | go out as whatever the pinned backend has loaded, and as `as` when nothing is (or when `as` is among several loaded). Needs `backend` and `as`. It follows any model, a non-chat one included, so pin it to a backend that serves one kind |
 | `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. `batch` is the older name for it. See below |
+| `models.<id>.videoTokens` | `49152` | what one video costs this model when checking a request fits its context window. Size it from the seat: frames sampled per clip × tokens per frame |
 | `models` | `{}` | routing policy per model. Anything unlisted stays local |
 
 Tokens accept `env:NAME`, so the config stays committable.
@@ -1231,10 +1260,10 @@ cannot quietly eat a job every five seconds.
 
 Better to know this before you deploy it than after.
 
-- The queue lives in memory, and a restart cuts running work off with it.
-  SIGTERM closes connections rather than draining them, so a generation in
-  flight dies along with the queue behind it. Whatever supervises the process is
-  responsible for not restarting it constantly.
+- The queue lives in memory. SIGTERM drains in-flight requests, queued ones
+  included, for up to `shutdownGraceMs` (30 s by default); whatever the grace
+  does not cover is lost. Whatever supervises the process is responsible for not
+  restarting it constantly.
 - Retries only happen before the first byte. If a peer dies mid-stream the
   request fails, because the client already has half an answer and replaying
   would corrupt it. Before any bytes reach the client, failover is invisible.

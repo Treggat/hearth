@@ -120,6 +120,12 @@ export interface ModelRoute {
   backend: string | null;
   /** The id sent to the backend when it differs from the advertised one; null when they match. */
   as: string | null;
+  /**
+   * Go out as whatever `backend` has resident right now, and as `as` only when
+   * nothing is loaded there. For clients pinned to one id on a card whose seat
+   * gets swapped by hand: a fixed id would swap the card back on every request.
+   */
+  follow: boolean;
   policy: RoutePolicy;
   /** Who may serve it, in preference order. Empty means anyone that maps it. */
   peers: string[];
@@ -147,6 +153,8 @@ export interface ModelRoute {
    * this model is the only one running. `batch:` is the older name.
    */
   concurrency: number | null;
+  /** Tokens one video costs this model when sizing a request; unset uses the flat default. */
+  videoTokens?: number;
 }
 
 export interface HearthConfig {
@@ -172,7 +180,8 @@ export interface HearthConfig {
     concurrency: number;
     agePerSecond: number;
     warmBonus: number;
-    lanes: Record<string, { priority: number }>;
+    /** `concurrency` is the most of a backend's slots the lane may hold at once; unset is no ceiling. */
+    lanes: Record<string, { priority: number; concurrency?: number }>;
     /** How long one lane's queue may get before we start refusing. Someone told
      *  "full" can retry. Someone queued behind 400 jobs just waits. */
     maxPerLane: number;
@@ -565,6 +574,12 @@ function trimUrl(u: string, where: string): string {
   return u.replace(/\/+$/, "");
 }
 
+/** Peers a route may use that map `id`, in preference order; an empty `named` means every peer. */
+export function peersMapping(id: string, named: readonly string[], peers: readonly PeerConfig[]): string[] {
+  const order = named.length > 0 ? named : peers.map((p) => p.name);
+  return order.filter((n) => peers.find((p) => p.name === n)?.models[id] !== undefined);
+}
+
 export function parseConfig(raw: unknown): HearthConfig {
   const root = asRecord(raw, "config");
 
@@ -670,10 +685,14 @@ export function parseConfig(raw: unknown): HearthConfig {
   }
 
   const lanesRaw = sched.lanes === undefined ? DEFAULT_LANES : asRecord(sched.lanes, "scheduler.lanes");
-  const lanes: Record<string, { priority: number }> = {};
+  const lanes: Record<string, { priority: number; concurrency?: number }> = {};
   for (const [lane, v] of Object.entries(lanesRaw)) {
     const entry = asRecord(v, `scheduler.lanes.${lane}`);
     lanes[lane] = { priority: num(entry.priority, `scheduler.lanes.${lane}.priority`, 0) };
+    // Left off when unset rather than defaulted: no number here means the lane has no ceiling of its own.
+    if (entry.concurrency !== undefined) {
+      lanes[lane].concurrency = count(entry.concurrency, `scheduler.lanes.${lane}.concurrency`, 1);
+    }
   }
   // BEFORE the warm lane is added, or `lanes: {}` would quietly become a valid
   // config with one lane nobody asked for. An empty lanes block is a mistake and
@@ -724,6 +743,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     const map: Record<string, string> = {};
     for (const [mine, theirs] of Object.entries(models)) {
       map[mine] = str(theirs, `peers[${i}].models.${mine}`);
+      if (map[mine] === "") throw new ConfigError(`peers[${i}].models.${mine} is empty: name the peer's id for it`);
     }
     // A peer mapping nothing is valid: the state between trusting someone and borrowing from them.
     peers.push({
@@ -759,9 +779,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     // Catching it here instead of at request time is the reason this validation
     // exists at all. A policy that can never fire is a typo.
     if (policy !== "local") {
-      const candidates = named.length > 0 ? named : peers.map((p) => p.name);
-      const able = candidates.filter((n) => peers.find((p) => p.name === n)?.models[id]);
-      if (able.length === 0) {
+      if (peersMapping(id, named, peers).length === 0) {
         throw new ConfigError(
           `models.${id}.policy is "${policy}" but no peer maps "${id}" — ` +
             `add it to a peer's models mapping, or set policy: local`,
@@ -776,6 +794,13 @@ export function parseConfig(raw: unknown): HearthConfig {
       );
     }
     const alias = str(entry.as, `models.${id}.as`, "");
+    const follow = bool(entry.follow, `models.${id}.follow`, false);
+    if (follow && pinned === "") {
+      throw new ConfigError(`models.${id}.follow needs models.${id}.backend: the backend whose resident model it follows`);
+    }
+    if (follow && alias === "") {
+      throw new ConfigError(`models.${id}.follow needs models.${id}.as: the model to load when nothing is resident`);
+    }
     const params = modelParams(entry.params, id);
     const emulate = str(entry.emulate, `models.${id}.emulate`, "");
     if (emulate !== "" && !(EMULATIONS as readonly string[]).includes(emulate)) {
@@ -791,6 +816,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     models[id] = {
       backend: pinned === "" ? null : pinned,
       as: alias === "" ? null : alias,
+      follow,
       policy,
       peers: named,
       spilloverAt: count(entry.spilloverAt, `models.${id}.spilloverAt`, 1, 1),
@@ -802,6 +828,9 @@ export function parseConfig(raw: unknown): HearthConfig {
       emulate: emulate === "" ? null : (emulate as Emulation),
       pool: modelPool(entry.pool, id),
     };
+    if (entry.videoTokens !== undefined) {
+      models[id].videoTokens = count(entry.videoTokens, `models.${id}.videoTokens`, 1);
+    }
   }
 
   const { keys: apiKeys, labels: apiKeyLabels, models: apiKeyModels } =
