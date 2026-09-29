@@ -127,10 +127,7 @@ const CHARS_PER_TOKEN = 3.5;
 const PER_MESSAGE = 4;
 /** One image, flat, sized high: counting its base64 would put every vision request over every window. */
 const TOKENS_PER_IMAGE = 1600;
-/**
- * One video, flat. A client spends a whole frame budget on each clip, tens of thousands of
- * tokens; keep this at or above the largest budget any client sends, or the under-count returns.
- */
+/** One video, flat, unless the model sets `videoTokens`: a client spends a whole frame budget per clip. */
 const TOKENS_PER_VIDEO = 49_152;
 
 const chars = (v: unknown): number => (typeof v === "string" ? v.length : 0);
@@ -146,7 +143,7 @@ const isVideo = (part: Record<string, unknown>): boolean => {
 };
 
 /** What this chat payload needs, without tokenizing: prompt plus reserved `max_tokens`. */
-export function needsOf(payload: Record<string, unknown>): Need {
+export function needsOf(payload: Record<string, unknown>, videoTokens = TOKENS_PER_VIDEO): Need {
   let text = 0;
   let images = 0;
   let videos = 0;
@@ -182,7 +179,7 @@ export function needsOf(payload: Record<string, unknown>): Need {
       ? payload.max_completion_tokens
       : 0;
   return {
-    tokens: Math.ceil(text / CHARS_PER_TOKEN) + images * TOKENS_PER_IMAGE + videos * TOKENS_PER_VIDEO
+    tokens: Math.ceil(text / CHARS_PER_TOKEN) + images * TOKENS_PER_IMAGE + videos * videoTokens
       + Math.max(0, reserve),
     output: Math.max(0, reserve),
     // A video needs a model that sees, the same as an image does.

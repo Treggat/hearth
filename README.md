@@ -99,6 +99,7 @@ Every key with its default. Only `backend.url` is required.
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
 | `stateFile` | `null` | fallback for Save when the config file itself cannot be written. Null unless you need it |
 | `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. `batch` is the older name for it. See below |
+| `models.<id>.videoTokens` | `49152` | what one video costs this model when checking a request fits its context window. Size it from the seat: frames sampled per clip × tokens per frame |
 | `models` | `{}` | routing policy per model. Anything unlisted stays local |
 
 Tokens accept `env:NAME`, so the config stays committable.

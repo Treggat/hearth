@@ -22,7 +22,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
+import { ConfigError, parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { PeerRegistry, type PeerCapacity } from "../src/peers.js";
 import { decide } from "../src/route.js";
@@ -199,6 +199,18 @@ import { cleanStats, fitOutput, mergeStats, needsOf, statsFromModels, statsFromP
     say(image).tokens - say().tokens,
     "a video is never counted twice",
   );
+
+  // A model that sets its own clip price fits a video the flat default would refuse on a 32k window.
+  const cheap = needsOf({ messages: [{ role: "user", content: [clip("video/mp4")] }] }, 8192);
+  assert.ok(cheap.tokens < 10_000, `videoTokens replaces the flat price, got ${cheap.tokens}`);
+  assert.equal(unfit({ context: 32_768 }, cheap), null);
+  assert.match(unfit({ context: 32_768 }, withVideo) ?? "", /context length exceeded/);
+  const vcfg = parseConfig({ backend: { url: "http://127.0.0.1:9292" }, models: { v: { videoTokens: 8192 }, w: {} } });
+  assert.equal(vcfg.models["v"]!.videoTokens, 8192);
+  assert.equal(vcfg.models["w"]!.videoTokens, undefined, "unset means the flat default");
+  for (const bad of [0, 1.5, "8192"]) {
+    assert.throws(() => parseConfig({ backend: { url: "http://127.0.0.1:9292" }, models: { v: { videoTokens: bad } } }), ConfigError);
+  }
 
   const withTools = needsOf({
     messages: [{ role: "user", content: "go" }],
