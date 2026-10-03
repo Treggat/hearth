@@ -120,8 +120,9 @@ export interface BackendConfig {
  * that card hearth POSTs `yield` (`{"seconds": n}`), then `resume` once the card is free again.
  */
 export interface ResidentDecl {
-  yield: string;
-  resume: string;
+  /** null for a resident with nothing to ask: it shares the card and is never told to move. */
+  yield: string | null;
+  resume: string | null;
 }
 
 export interface ModelRoute {
@@ -550,6 +551,8 @@ function residentDecl(v: unknown, where: string): ResidentDecl | null {
   if (v === undefined || v === null || v === false) return null;
   if (v === true) return { yield: "/yield", resume: "/resume" };
   const o = asRecord(v, where);
+  // `yield: false` is a resident that cannot give memory back (a model inside someone else's llama-swap).
+  if (o.yield === false) return { yield: null, resume: null };
   const out = { yield: str(o.yield, `${where}.yield`, "/yield"), resume: str(o.resume, `${where}.resume`, "/resume") };
   requirePath(out.yield, `${where}.yield`);
   requirePath(out.resume, `${where}.resume`);
