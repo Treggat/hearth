@@ -26,6 +26,8 @@ function fakeSwap(ids: string[]) {
   let running: { model: string; state: string }[] = [];
   let status = 200;
   const seen: Record<string, unknown>[] = [];
+  /** hearth's own calls to a resident, which are not a client's work. */
+  const asked: string[] = [];
   const server = createServer((req, res) => {
     if (req.url === "/running") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -41,14 +43,15 @@ function fakeSwap(ids: string[]) {
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
       const body = JSON.parse(Buffer.concat(chunks).toString() || "{}") as Record<string, unknown>;
-      // Only work: hearth's own yield/resume calls to a resident are not a client's request.
-      if (req.method === "POST" && req.url !== "/yield" && req.url !== "/resume") seen.push(body);
+      if (req.url === "/yield" || req.url === "/resume") asked.push(req.url);
+      else if (req.method === "POST") seen.push(body);
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: status === 200, served: body.model }));
     });
   });
   return {
     seen,
+    asked,
     load: (models: string[]) => { running = models.map((m) => ({ model: m, state: "ready" })); },
     answer: (s: number) => { status = s; },
     listen: () => new Promise<void>((r) => server.listen(0, "127.0.0.1", r)),
@@ -73,7 +76,7 @@ const config = (cardUrl: string) => parseConfig({
       kind: "llama-swap",
       serves: ["rerank-gpu"],
       resources: ["gpu"],
-      resident: true,
+      resident: { yield: false },
       routes: [{ path: "/v1/rerank", lane: "chat", model: "rerank-gpu", fallback: { backend: "cpu", model: "rerank-cpu" } }],
     },
     { name: "cpu", url: cpu.url(), kind: "none", serves: ["rerank-cpu"], resources: ["cpu"] },
@@ -125,6 +128,7 @@ try {
     await refresh();
     assert.equal(await post("/v1/chat/completions", { model: "loaded", messages: [] }), 200);
     assert.equal(card.seen.at(-1)!.model, "main", "only the sidecar loaded means no seat: `as` loads the default");
+    assert.deepEqual(card.asked, [], "`yield: false`: the seat took its turns without asking the sidecar for anything");
   }
 
   // --- the route runs on the sidecar while it answers -----------------------------------
@@ -190,7 +194,9 @@ try {
 
 // --- config ---------------------------------------------------------------------------
 {
-  const [r] = config(card.url()).backends.find((b) => b.name === "side")!.routes;
+  const side = config(card.url()).backends.find((b) => b.name === "side")!;
+  assert.deepEqual(side.resident, { yield: null, resume: null }, "a resident that is never asked to move");
+  const [r] = side.routes;
   assert.deepEqual(r!.fallback, { backend: "cpu", model: "rerank-cpu" });
   const one = (route: Record<string, unknown>) => () => parseConfig({
     name: "t",

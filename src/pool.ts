@@ -177,7 +177,7 @@ export class BackendPool {
       (s) => s.name !== b.name && this.arbitrated(s.cfg.resources).some((r) => mine.includes(r)),
     );
     // Residents first and together: they are small, and their memory is what the load needs.
-    await Promise.all(overlap.filter((s) => s.cfg.resident).map((s) => this.residentCall(s, "yield", b.name)));
+    await Promise.all(overlap.filter((s) => s.cfg.resident?.yield).map((s) => this.residentCall(s, "yield", b.name)));
     const deadline = Date.now() + EVICT_BUDGET_MS;
     for (const s of overlap) {
       if (s.cfg.resident || !s.state.resident()) continue;
@@ -201,6 +201,7 @@ export class BackendPool {
   /** POST a resident's yield or resume path. Best-effort: a resident that does not answer never holds up a turn. */
   private async residentCall(s: BackendSlot, what: "yield" | "resume", forName?: string): Promise<void> {
     const path = s.cfg.resident![what];
+    if (path === null) return;
     try {
       const res = await send(`${s.cfg.url}${path}`, {
         method: "POST",
