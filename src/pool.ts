@@ -75,7 +75,7 @@ export class BackendPool {
   ) {
     this.arbiter.onRelease(() => this.scheduleResume());
     for (const b of cfg.backends) {
-      const state = new BackendState(b.url, b.kind, log);
+      const state = new BackendState(b.url, b.kind, log, this.mineOn(b));
       const slot: BackendSlot = {
         name: b.name,
         cfg: b,
@@ -122,6 +122,17 @@ export class BackendPool {
         }
       }
     }
+  }
+
+  /**
+   * What a backend sees of a URL it shares with another: everything except the ids a sibling
+   * declares it `serves`. Alone on its URL, or beside siblings that declare nothing, everything.
+   */
+  private mineOn(b: BackendConfig): ((id: string) => boolean) | undefined {
+    const theirs = new Set(
+      this.cfg.backends.filter((o) => o.name !== b.name && o.url === b.url).flatMap((o) => o.serves),
+    );
+    return theirs.size === 0 ? undefined : (id) => !theirs.has(id);
   }
 
   /**
@@ -322,10 +333,14 @@ export class BackendPool {
    */
   routedModel(slot: BackendSlot, rule: RouteRule, asked: string | undefined): string {
     if (asked === undefined || asked === rule.model) return rule.model;
-    if (this.cfg.models[asked]?.backend === slot.name) return asked;
-    const wire = this.outboundId(asked);
-    if (slot.cfg.serves.includes(wire) || slot.state.catalog().includes(wire)) return asked;
-    return rule.model;
+    return this.owns(slot, asked) ? asked : rule.model;
+  }
+
+  /** Is this id this backend's own: pinned to it, declared by it, or in its catalogue? */
+  owns(slot: BackendSlot, model: string): boolean {
+    if (this.cfg.models[model]?.backend === slot.name) return true;
+    const wire = this.outboundId(model);
+    return slot.cfg.serves.includes(wire) || slot.state.catalog().includes(wire);
   }
 
   /** True only when every backend declares what it serves and none names this id, so a typo can be refused. */
