@@ -681,10 +681,8 @@ backends:
     kind: llama-swap
     serves: [reranker]
     resources: [gpu1]
-    resident: true
+    resident: { yield: false }      # llama-swap has no yield path, so it is never asked
 ```
-
-llama-swap has no `yield`, so those calls are refused and logged; nothing waits on them.
 
 ### Backends that don't speak the OpenAI API
 
