@@ -49,6 +49,16 @@ export interface RouteRule {
   model: string;
   /** false routes the path here without queueing it: progress and status endpoints. */
   queue: boolean;
+  /**
+   * Where the same request goes when this backend cannot answer it (unreachable, or a 5xx
+   * before any byte): another backend, under the id it serves there. null refuses, as before.
+   */
+  fallback: RouteFallback | null;
+}
+
+export interface RouteFallback {
+  backend: string;
+  model: string;
 }
 
 /**
@@ -542,7 +552,7 @@ function routeList(v: unknown, where: string): RouteRule[] {
   return v.map((raw, i) => {
     const at = `${where}[${i}]`;
     const entry = typeof raw === "string" ? { path: raw } : asRecord(raw, at);
-    only(entry, ["path", "lane", "model", "queue"], at);
+    only(entry, ["path", "lane", "model", "queue", "fallback"], at);
     const path = str(entry.path, `${at}.path`);
     requirePath(path, at);
     // One placeholder, standing for one whole segment. More than one, or one
@@ -568,8 +578,20 @@ function routeList(v: unknown, where: string): RouteRule[] {
       lane: str(entry.lane, `${at}.lane`, ""),
       model: str(entry.model, `${at}.model`, ""),
       queue: bool(entry.queue, `${at}.queue`, true),
+      fallback: routeFallback(entry.fallback, `${at}.fallback`),
     };
   });
+}
+
+/** `fallback: {backend, model}`; that the backend exists is checked once all of them are known. */
+function routeFallback(v: unknown, where: string): RouteFallback | null {
+  if (v === undefined || v === null) return null;
+  const o = asRecord(v, where);
+  const out = { backend: str(o.backend, `${where}.backend`), model: str(o.model, `${where}.model`) };
+  if (out.backend === "" || out.model === "") {
+    throw new ConfigError(where, `${where} needs both backend: and model: — the backend to try, and the id it serves`);
+  }
+  return out;
 }
 
 function trimUrl(u: string, where: string): string {
@@ -735,6 +757,17 @@ export function parseConfig(raw: unknown): HearthConfig {
         );
       }
       claimedPaths.set(r.path, b.name);
+      if (r.fallback) {
+        if (!r.queue) {
+          throw new ConfigError("backends", `backends "${b.name}" route ${r.path} has a fallback but queue: false — only queued work falls back`);
+        }
+        if (r.fallback.backend === b.name || !backendNames.has(r.fallback.backend)) {
+          throw new ConfigError(
+            "backends",
+            `backends "${b.name}" route ${r.path} falls back to "${r.fallback.backend}", which is not another backend`,
+          );
+        }
+      }
     }
   }
 
