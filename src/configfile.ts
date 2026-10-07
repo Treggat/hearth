@@ -276,14 +276,23 @@ export class ConfigFile {
     return { path: this.path, hash: this.hash, savedAt: this.savedAt, restartPending: [...this.pending], error: this.error };
   }
 
-  /** The file's text and hash, for a raw editor; a file that does not load is returned too, to be fixed. */
-  text(): { text: string; hash: string } {
+  /**
+   * The file's text, hash and parsed document (as written: `env:` references unresolved), for editors;
+   * a file that does not load is returned too, to be fixed.
+   */
+  text(): { text: string; hash: string; doc: unknown } {
     try {
       this.syncFromDisk();
     } catch (e) {
       if (this.error === null) throw e;
     }
-    return { text: this.lastText, hash: this.hash };
+    let doc: unknown = null;
+    try {
+      doc = parseDocument(this.lastText).toJS();
+    } catch {
+      // Not YAML at all: the raw text is still there to fix.
+    }
+    return { text: this.lastText, hash: this.hash, doc };
   }
 
   /**
@@ -337,8 +346,15 @@ export class ConfigFile {
       const doc = parseDocument(this.lastText);
       for (const op of ops) {
         if (!Array.isArray(op.path) || op.path.length === 0) throw new ConfigRefusal(400, "each op needs a non-empty path", null);
-        if (op.delete) doc.deleteIn(op.path);
-        else doc.setIn(op.path, doc.createNode(op.value));
+        if (op.delete) {
+          doc.deleteIn(op.path);
+          continue;
+        }
+        // A list or map written inline stays inline when replaced.
+        const old = doc.getIn(op.path, true) as { flow?: boolean } | undefined;
+        const node = doc.createNode(op.value) as { flow?: boolean };
+        if (old && typeof old.flow === "boolean" && node && typeof node === "object") node.flow = old.flow;
+        doc.setIn(op.path, node);
       }
       out = this.render(doc);
     }

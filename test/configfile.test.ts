@@ -193,6 +193,8 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   assert.equal(readFileSync(cfgPath, "utf8"), before, "and the file is untouched");
 
   // A dry run shows the result without writing it.
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["scheduler", "maxPerLane"], value: 9 }], dryRun: true });
+  assert.deepEqual(((await r.json()) as Status).restartPending, ["scheduler"], "a dry run says what its change would need");
   r = await a.patch({ baseHash: out.hash, ops: [{ path: ["share"], value: [] }], dryRun: true });
   assert.match(((await r.json()) as { text: string }).text, /share: \[\]/);
   assert.equal(readFileSync(cfgPath, "utf8"), before, "a dry run writes nothing");

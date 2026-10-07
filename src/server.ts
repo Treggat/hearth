@@ -931,7 +931,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         dryRun: body.dryRun === true,
       });
       if (body.dryRun !== true) log.info("config.patched", { hash: out.hash, restartPending: out.restartPending });
-      json(res, 200, { ...out, ...config.status() });
+      json(res, 200, { ...config.status(), ...out });
     } catch (e) {
       failConfig(res, e);
     }

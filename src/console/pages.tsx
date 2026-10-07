@@ -1,10 +1,10 @@
 /** The pages beside the topology, and the inspector sheet that opens over it. */
-import { Check, RotateCcw, Save, X } from "lucide-react";
+import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import type { UiData } from "../ui/types.js";
-import { control, request, RequestError, select, toast, useStore } from "./store.js";
-import { ago, Button, Card, cx, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
+import { control, select, useStore } from "./store.js";
+import { ago, Card, cx, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
 
 const selfOf = (d: UiData) => d.net.nodes.find((n) => n.self)!;
 const canWrite = (d: UiData) => d.canWarm;
@@ -218,74 +218,55 @@ export function Queue() {
   );
 }
 
-/* ---------------------------------------------------------------- config */
+const pct = (xs: number[], p: number) => {
+  if (xs.length === 0) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))]!;
+};
+const secs = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`);
 
-export function Config() {
-  const status = useStore((s) => s.data!.config);
-  const [file, setFile] = useState<{ text: string; hash: string } | null>(null);
-  const [draft, setDraft] = useState("");
-  const [err, setErr] = useState<{ message: string; path: string | null } | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = async () => {
-    try {
-      const f = await request<{ text: string; hash: string }>("GET", "/config");
-      setFile(f);
-      setDraft(f.text);
-      setErr(null);
-    } catch (e) {
-      setErr({ message: e instanceof Error ? e.message : String(e), path: null });
-    }
-  };
-  useEffect(() => { void load(); }, []);
-  // A save elsewhere (a toggle, a hand edit) moves the hash; reload unless this editor has unsaved text.
-  useEffect(() => {
-    if (file && status.hash !== file.hash && draft === file.text) void load();
-  }, [status.hash]);
-
-  const dirty = file !== null && draft !== file.text;
-  const save = async () => {
-    if (!file) return;
-    setBusy(true);
-    try {
-      const out = await request<{ text: string; hash: string; restartPending: string[] }>("PATCH", "/config", { baseHash: file.hash, text: draft });
-      setFile({ text: out.text, hash: out.hash });
-      setErr(null);
-      toast("ok", out.restartPending.length ? `saved — restart to apply ${out.restartPending.join(", ")}` : "saved and applied");
-    } catch (e) {
-      setErr({ message: e instanceof Error ? e.message : String(e), path: e instanceof RequestError ? e.path : null });
-    } finally {
-      setBusy(false);
-    }
-  };
-
+/** What the last ten minutes of finished requests looked like, per model: how many, how long they waited and ran. */
+export function History() {
+  const calls = useStore((s) => s.data!.calls ?? []);
+  const by = new Map<string, typeof calls>();
+  for (const c of calls) by.set(c.model, [...(by.get(c.model) ?? []), c]);
+  const rows = [...by.entries()].sort((a, b) => b[1].length - a[1].length);
+  const longest = Math.max(1, ...rows.map(([, cs]) => pct(cs.map((c) => c.waitedMs + c.ms), 95)));
   return (
-    <div className="flex h-full flex-col gap-3">
-      <Card className="flex flex-wrap items-center gap-3 px-4 py-3">
-        {status.error ? <Pill tone="bad">does not load</Pill> : status.restartPending.length ? <Pill tone="warn">restart needed</Pill> : <Pill tone="ok">applied</Pill>}
-        <span className={mono}>{status.path ?? "in memory — no config file"}</span>
-        {status.savedAt && <span className="text-dim">last saved {new Date(status.savedAt).toLocaleTimeString()}</span>}
-        {status.restartPending.length > 0 && <span className="text-warn">restart hearth to apply: {status.restartPending.join(", ")}</span>}
-        {status.error && <span className="w-full text-bad">{status.error} — the node keeps running the last config that loaded.</span>}
-      </Card>
-      {status.path && (
-        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <div className="flex items-center gap-2 border-b border-line px-3 py-2">
-            <span className="font-medium">hearth.yaml</span>
-            <span className="text-dim">{dirty ? "edited — not saved" : "matches the file"}</span>
-            <div className="ml-auto flex gap-2">
-              <Button onClick={() => { if (file) setDraft(file.text); setErr(null); }} disabled={!dirty || busy}><RotateCcw size={13} />revert</Button>
-              <Button tone="primary" onClick={() => void save()} disabled={!dirty || busy}>{busy ? <Check size={13} /> : <Save size={13} />}save</Button>
-            </div>
-          </div>
-          {err && <div className="border-b border-line bg-bad/10 px-3 py-2 text-bad">{err.path ? <b className={mono}>{err.path}: </b> : null}{err.message}</div>}
-          <textarea
-            spellCheck={false} value={draft} onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); if (dirty) void save(); } }}
-            className="min-h-0 flex-1 resize-none bg-transparent p-4 font-mono text-[12px] leading-5 outline-none"
-          />
-        </Card>
-      )}
-    </div>
+    <Card className="mt-4 overflow-hidden">
+      <div className="border-b border-line px-4 py-2.5">
+        <div className="font-medium">Recent requests</div>
+        <div className="text-[11px] text-dim">Per model, over the history window. The bar is p95 time: waiting, then running.</div>
+      </div>
+      <table className="w-full text-left">
+        <thead className="border-b border-line bg-muted/50 text-[11px] uppercase tracking-wide text-dim">
+          <tr>{["model", "requests", "failed", "wait p50", "run p50", "run p95", ""].map((h) => <th key={h} className="px-4 py-2 font-medium">{h}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map(([m, cs]) => {
+            const wait95 = pct(cs.map((c) => c.waitedMs), 95);
+            const run95 = pct(cs.map((c) => c.ms), 95);
+            const failed = cs.filter((c) => !c.ok).length;
+            return (
+              <tr key={m} className="border-b border-line/60 last:border-0">
+                <td className={cx("px-4 py-2", mono)}>{m}</td>
+                <td className="tabular px-4 py-2">{cs.length}</td>
+                <td className={cx("tabular px-4 py-2", failed ? "text-bad" : "text-dim")}>{failed}</td>
+                <td className="tabular px-4 py-2 text-dim">{secs(pct(cs.map((c) => c.waitedMs), 50))}</td>
+                <td className="tabular px-4 py-2">{secs(pct(cs.map((c) => c.ms), 50))}</td>
+                <td className="tabular px-4 py-2">{secs(run95)}</td>
+                <td className="w-1/4 px-4 py-2">
+                  <div className="flex h-1.5 overflow-hidden rounded-full bg-line">
+                    <span className="bg-warn" style={{ width: `${(wait95 / longest) * 100}%` }} />
+                    <span className="bg-accent" style={{ width: `${(run95 / longest) * 100}%` }} />
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {rows.length === 0 && <Empty>No requests have finished yet.</Empty>}
+    </Card>
   );
 }
