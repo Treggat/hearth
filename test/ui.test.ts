@@ -175,7 +175,7 @@ const base = await new Promise<string>((ready) =>
 );
 
 {
-  const page = await fetch(`${base}/ui`);
+  const page = await fetch(`${base}/ui/classic`);
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type") ?? "", /text\/html/);
   assert.equal(page.headers.get("cache-control"), "no-store",
@@ -423,7 +423,7 @@ const base = await new Promise<string>((ready) =>
   const ui = `http://127.0.0.1:${uiPort}`;
 
   // The page and its data are served, with no credential and no loopback check.
-  const page = await fetch(`${ui}/ui`);
+  const page = await fetch(`${ui}/ui/classic`);
   assert.equal(page.status, 200, "the page is the point of this port");
   assert.match(await page.text(), /<title>Hearth Console<\/title>/);
   assert.equal((await fetch(`${ui}/`)).status, 200, "bare root serves the page too");
