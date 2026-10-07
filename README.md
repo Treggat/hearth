@@ -184,6 +184,7 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/ui` | loopback | the status page: queue history, which model was loaded when, what you are lending, and what each peer offers |
 | `/control` | local | read or change what leaves this node: lending, borrowing, per-model sharing, peer model maps |
 | `/config` | local | the config file itself: `GET` its text and status, `PATCH` paths or the whole text |
+| `/ui/next` | loopback | the 2.0 console (preview): topology with live request flow, models, queue, and the config file |
 | `/network` | local | every node, what each one serves, and what's **loaded right now**. Also lists peer models you haven't mapped, which is usually the config mistake people actually make |
 | `/queue` | local | jobs in flight, with lane, caller and position |
 | `/ui/events` | same as `/ui` | the page's data, pushed. A snapshot then diffs |

@@ -16,6 +16,25 @@ function clientBundle(): string {
 /** Escape `</script` so the bundle can sit inside a `<script>` element. */
 const inlineable = (js: string): string => js.replace(/<\/script/gi, "<\\/script");
 
+/** The 2.0 console's bundle and stylesheet, read the same way. */
+function consoleAsset(name: string): string {
+  try {
+    return readFileSync(new URL(`./${name}`, import.meta.url), "utf8");
+  } catch {
+    return readFileSync(new URL(`../dist/${name}`, import.meta.url), "utf8");
+  }
+}
+
+/** The 2.0 console, served at /ui/next while it reaches parity with this one. */
+export const CONSOLE_HTML = `<!doctype html>
+<title>hearth</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>try{var t=localStorage.getItem("hearth.theme");if(t==="dark"||(!t&&matchMedia("(prefers-color-scheme: dark)").matches))document.documentElement.classList.add("dark")}catch(e){}</script>
+<style>${consoleAsset("console.css").replace(/<\/style/gi, "<\\/style")}</style>
+<div id="root"></div>
+<script>${inlineable(consoleAsset("console.js"))}</script>
+`;
+
 export const UI_HTML = `<title>Hearth Console</title>
 <!-- Without this a phone lays the page out at a 980px virtual viewport and
      zooms out, so the responsive rules never fire — the breakpoints were dead

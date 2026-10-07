@@ -1,0 +1,79 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+@source "./";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* One neutral ramp, one ember accent, four status colours; dark redefines the ramp only. */
+:root {
+  --bg: oklch(0.985 0.002 75);
+  --panel: oklch(1 0 0);
+  --muted: oklch(0.965 0.003 75);
+  --border: oklch(0.915 0.004 75);
+  --fg: oklch(0.22 0.008 60);
+  --dim: oklch(0.52 0.012 60);
+  --accent: oklch(0.64 0.19 42);
+  --ok: oklch(0.6 0.15 152);
+  --warn: oklch(0.72 0.15 70);
+  --bad: oklch(0.6 0.21 27);
+  --info: oklch(0.6 0.15 255);
+}
+.dark {
+  --bg: oklch(0.155 0.005 60);
+  --panel: oklch(0.19 0.006 60);
+  --muted: oklch(0.235 0.007 60);
+  --border: oklch(0.29 0.008 60);
+  --fg: oklch(0.95 0.003 75);
+  --dim: oklch(0.68 0.012 70);
+  --accent: oklch(0.72 0.17 48);
+  --ok: oklch(0.72 0.16 152);
+  --warn: oklch(0.8 0.14 75);
+  --bad: oklch(0.68 0.19 27);
+  --info: oklch(0.7 0.13 255);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-muted: var(--muted);
+  --color-line: var(--border);
+  --color-fg: var(--fg);
+  --color-dim: var(--dim);
+  --color-accent: var(--accent);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-info: var(--info);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv11", "ss01";
+}
+.tabular { font-variant-numeric: tabular-nums; }
+
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-edge-stroke: var(--border);
+  --xy-edge-stroke-width: 1.5;
+  --xy-node-border-radius: 12px;
+  --xy-controls-button-background-color: var(--panel);
+  --xy-controls-button-border-color: var(--border);
+  --xy-controls-button-color: var(--dim);
+  --xy-attribution-background-color: transparent;
+}
+.react-flow__node { cursor: pointer; }
+.react-flow__handle { opacity: 0; pointer-events: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-dot { display: none; }
+}
