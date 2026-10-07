@@ -21,7 +21,7 @@ import { BackendPool, type BackendSlot } from "./pool.js";
 import { decide, type LocalLoad } from "./route.js";
 import { QueueFullError } from "./scheduler.js";
 import { History } from "./history.js";
-import { fitOutput, needsOf, NOTE_MAX, unfit } from "./stats.js";
+import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
 import { CONSOLE_HTML } from "./ui.js";
 import { createViews } from "./views.js";
 import { send, type UpstreamResponse } from "./upstream.js";
