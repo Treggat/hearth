@@ -2,7 +2,9 @@
 import { AlertTriangle, Boxes, CheckCircle2, FileCog, Flame, ListOrdered, Moon, Network, Sun, XCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { Config, Inspector, Models, Queue } from "./pages.js";
+import { Config } from "./config.js";
+import { History, Inspector, Models, Queue } from "./pages.js";
+import { Palette } from "./Palette.js";
 import type { UiData } from "../ui/types.js";
 import { go, select, useStore, type Page } from "./store.js";
 import { Topology } from "./Topology.js";
@@ -210,6 +212,7 @@ export default function App() {
           </button>
         ))}
         <div className="mt-auto px-2 text-[11px] text-dim max-md:hidden">
+          <div className="mb-2"><kbd className="rounded border border-line px-1">⌘K</kbd> to jump</div>
           <a href="/ui" className="hover:text-fg">classic console</a>
         </div>
       </nav>
@@ -240,12 +243,13 @@ export default function App() {
         ) : (
           <div className="min-h-0 flex-1 overflow-auto p-5">
             {page === "models" && <Models />}
-            {page === "queue" && <Queue />}
+            {page === "queue" && <><Queue /><History /></>}
             {page === "config" && <Config />}
           </div>
         )}
       </main>
 
+      <Palette />
       <KeyDialog />
       <Toast />
     </div>
