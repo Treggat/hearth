@@ -9,7 +9,7 @@ import { accessSync, constants as fsConstants } from "node:fs";
 
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import {
-  ConfigError, WARM_LANE,
+  ConfigError, peersMapping, WARM_LANE,
   type BackendConfig, type HearthConfig, type RoutePolicy,
 } from "./config.js";
 import { Controls } from "./controls.js";
@@ -25,6 +25,12 @@ import { UI_HTML } from "./ui.js";
 import { send, type UpstreamResponse } from "./upstream.js";
 
 /** Constant-time compare over sha256 digests, so neither length nor content leaks. */
+function deepFreeze(v: unknown): void {
+  if (v === null || typeof v !== "object" || Object.isFrozen(v)) return;
+  Object.freeze(v);
+  for (const x of Object.values(v)) deepFreeze(x);
+}
+
 function secretEq(a: string, b: string): boolean {
   return timingSafeEqual(
     createHash("sha256").update(a).digest(),
@@ -120,6 +126,10 @@ export interface HearthNode {
 }
 
 export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
+  // Overrides edits models, share, notes and peers' maps in place and everything reads those per call;
+  // the rest is fixed for the node's life, so an accidental write throws instead of going stale.
+  for (const part of [cfg.listen, cfg.backends, cfg.scheduler, cfg.uiListen, cfg.resources,
+                      cfg.apiKeys, cfg.apiKeyLabels, cfg.apiKeyModels, cfg.peerTokens]) deepFreeze(part);
   // One state and one queue per backend. Pushed over SSE where the backend
   // supports it, polled where it doesn't.
   const pool = new BackendPool(cfg, log);
@@ -200,7 +210,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       name: cfg.name,
       shared,
       // A peer may map an id nothing here serves.
-      unknown: (m) => pool.certainlyUnknown(m) && !peers.all().some((p) => peers.theirModelId(p.name, m) !== undefined)
+      unknown: (m) => pool.certainlyUnknown(m) && peersMapping(m, [], cfg.peers).length === 0
         ? pool.catalog().join(", ") || "nothing"
         : null,
     });

@@ -52,12 +52,16 @@ import { createNode } from "../src/server.js";
   });
   await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
   const url = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
-  const node = createNode(parseConfig({
+  const cfg = parseConfig({
     name: "t",
     apiKeys: ["k"],
     scheduler: { maxPerCaller: 1 },
     backends: [{ name: "sd", url, kind: "none", serves: ["sd"], routes: ["/render"] }],
-  }), silentLogger);
+  });
+  const node = createNode(cfg, silentLogger);
+  // What overrides never edits is fixed once the node exists, so a stray write fails loudly.
+  assert.throws(() => { cfg.scheduler.maxPerCaller = 9; }, TypeError);
+  assert.throws(() => { cfg.backends[0]!.url = "x"; }, TypeError);
   await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${(node.server.address() as AddressInfo).port}`;
   const post = (path: string, body: unknown) => fetch(`${base}${path}`, {
