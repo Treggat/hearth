@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
 import { EMULATIONS, type Emulation } from "./emulate.js";
+import { KINDS, type KindName } from "./kinds.js";
 import { known, NOTE_MAX, type ModelStats } from "./stats.js";
 
 export type RoutePolicy = "local" | "peer" | "spillover" | "fastest";
@@ -19,11 +20,8 @@ export interface PeerConfig {
   models: Record<string, string>;
 }
 
-/**
- * How a backend reports what it has loaded: llama-swap events (else /running), ollama's
- * /api/ps, `single` (always resident), or `none`, which is unknown rather than cold.
- */
-export type WarmSource = "llama-swap" | "ollama" | "single" | "none";
+/** A backend's `kind`, one of the entries in kinds.ts. */
+export type WarmSource = KindName;
 
 /**
  * Whether the standalone status listener also serves the write routes: "off" (page only), or
@@ -91,6 +89,8 @@ export interface BackendConfig {
    * `backendFirstByteMs`. Size it for the slowest honest reply behind this port.
    */
   firstByteMs: number | null;
+  /** How long this backend may go silent mid-answer, in ms; 0 waits forever. Defaults to `backendIdleMs`. */
+  idleMs: number | null;
   /**
    * Hardware this backend consumes (names are yours), so backends whose sets overlap take
    * turns. Routing is unaffected; empty competes for nothing.
@@ -236,6 +236,11 @@ export interface HearthConfig {
    * backend, which would otherwise hold its slot (and any shared card) until restart.
    */
   backendFirstByteMs: number;
+  /**
+   * How long a local backend may go silent once its answer has started, in ms; 0 waits forever.
+   * Catches a generation that hangs mid-stream, which would otherwise hold its slot and card.
+   */
+  backendIdleMs: number;
   /**
    * How long shutdown waits for in-flight requests, in ms; 0 kills them at once. Keep the
    * service manager's stop timeout above it.
@@ -388,7 +393,7 @@ function atLeast(v: unknown, where: string, fallback: number, min = 0): number {
   return n;
 }
 
-const WARM_SOURCES: WarmSource[] = ["llama-swap", "ollama", "single", "none"];
+const WARM_SOURCES = Object.keys(KINDS) as WarmSource[];
 
 /** `kind`, or the `llamaSwapExtras` boolean it replaced; not both. */
 function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
@@ -629,6 +634,9 @@ export function parseConfig(raw: unknown): HearthConfig {
         firstByteMs: entry.firstByteMs === undefined
           ? null
           : atLeast(entry.firstByteMs, `backends[${i}].firstByteMs`, 0),
+        idleMs: entry.idleMs === undefined
+          ? null
+          : atLeast(entry.idleMs, `backends[${i}].idleMs`, 0),
         resources: strList(entry.resources, `backends[${i}].resources`),
         routes: routeList(entry.routes, `backends[${i}].routes`),
         activity: activityDecl(entry.activity, `backends[${i}].activity`),
@@ -670,6 +678,9 @@ export function parseConfig(raw: unknown): HearthConfig {
       firstByteMs: backend.firstByteMs === undefined
         ? null
         : atLeast(backend.firstByteMs, "backend.firstByteMs", 0),
+      idleMs: backend.idleMs === undefined
+        ? null
+        : atLeast(backend.idleMs, "backend.idleMs", 0),
       resources: strList(backend.resources, "backend.resources"),
       routes: routeList(backend.routes, "backend.routes"),
       activity: activityDecl(backend.activity, "backend.activity"),
@@ -681,6 +692,20 @@ export function parseConfig(raw: unknown): HearthConfig {
   for (const b of backends) {
     if (b.resident && !b.resources.some((r) => !resourceDecls[r]?.shared)) {
       throw new ConfigError(`backends "${b.name}" is resident but declares no exclusive resource to yield`);
+    }
+  }
+  // A kind that reports a resident model but cannot unload it would fail every neighbour's turn.
+  for (const b of backends) {
+    const k = KINDS[b.kind];
+    if (b.resident || !k.knowsWarm || k.unload) continue;
+    const mine = b.resources.filter((r) => !resourceDecls[r]?.shared);
+    const rival = backends.find((o) => o !== b && !o.resident && o.resources.some((r) => mine.includes(r)));
+    if (rival) {
+      const card = rival.resources.find((r) => mine.includes(r));
+      throw new ConfigError(
+        `backends "${b.name}" (kind: ${b.kind}) cannot unload, so "${rival.name}" could never take ${card} from it — ` +
+          `declare "${b.name}" resident, or mark ${card} shared`,
+      );
     }
   }
 
@@ -946,6 +971,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     // like working peer failover right up until a peer hangs.
     peerFirstByteMs: atLeast(root.peerFirstByteMs, "peerFirstByteMs", 180_000),
     backendFirstByteMs: atLeast(root.backendFirstByteMs, "backendFirstByteMs", 900_000),
+    backendIdleMs: atLeast(root.backendIdleMs, "backendIdleMs", 600_000),
     coldPenalty: atLeast(root.coldPenalty, "coldPenalty", 2),
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.

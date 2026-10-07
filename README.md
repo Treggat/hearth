@@ -119,6 +119,8 @@ Every key with its default. Only `backend.url` is required.
 | `peerPollMs` / `peerStaleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
 | `peerFirstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
 | `backendFirstByteMs` | `900000` | the same for a local backend. Catches one that accepts the connection and then never answers, which would otherwise hold its slot — and its card — until a restart. `0` waits forever |
+| `backendIdleMs` | `600000` | how long a local backend may go silent once its answer has started. Catches a generation that hangs mid-stream, which would otherwise hold its slot and card until the client gives up. `0` waits forever |
+| `backends[].idleMs` | node default | per-backend override, for a sidecar that sends its headers early and then works silently |
 | `backends[].firstByteMs` | node default | per-backend override. A sidecar that renders a clip before it answers at all needs a longer one than a chat server, and a single number cannot be right for both |
 | `coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
 | `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them, which is what it used to do |
@@ -606,6 +608,13 @@ arbitrate it at all — a shared resource is kept away from the arbiter rather
 than the arbiter being taught a second mode, so nothing waits for it and nothing
 is evicted off it. `guard` and `judge` now say what they run on, and the status
 page draws them on it.
+
+Only a `llama-swap` backend can be told to unload. A `single` or `ollama`
+backend reports a model it cannot let go of, so config refuses one on an
+exclusive resource another backend takes turns on: that neighbour could never
+clear the card. Declare it `resident`, or mark the resource `shared`. A `none`
+backend reports nothing, so hearth loads beside it. New kinds are added in
+`src/kinds.ts`, and `test/kinds.test.ts` holds each one to the same contract.
 
 `kind` is `gpu`, `cpu` or `other` and is display only — it picks the mark on the
 status page and never reaches admission. `other` is there because this mechanism

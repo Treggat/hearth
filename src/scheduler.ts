@@ -443,8 +443,8 @@ export class Scheduler {
 
   /** Run a job and settle its caller; release comes before resolve, so the caller's count is accurate. */
   private execute(job: Job, release: () => void): void {
-    // Captured synchronously: every job of a hold awaits that hold's eviction.
-    const prepared = this.preparing;
+    // Captured synchronously: every job of a hold awaits that hold's eviction; off-box work holds no card.
+    const prepared = job.offbox ? null : this.preparing;
     void Promise.resolve()
       .then(() => prepared ?? undefined)
       .then(() => job.run())

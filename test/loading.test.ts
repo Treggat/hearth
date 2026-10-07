@@ -20,7 +20,7 @@ import assert from "node:assert/strict";
 import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parsePlacement } from "../src/backend.js";
+import { parsePlacement } from "../src/kinds.js";
 import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";

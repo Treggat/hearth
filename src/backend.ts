@@ -3,13 +3,11 @@
  * available (safe on a local link, never across peers), falling back to polling /running
  * when the stream goes quiet for STALE_MS.
  */
-import type { ActivityDecl, WarmSource } from "./config.js";
+import type { ActivityDecl } from "./config.js";
+import { KINDS, readingFromStatus, type Kind, type KindName, type ModelStatus, type Placement } from "./kinds.js";
 import type { Logger } from "./log.js";
-import { known, statsFromModels, statsFromProps, type ModelStats } from "./stats.js";
+import { known, type ModelStats } from "./stats.js";
 import { getJson, send } from "./upstream.js";
-
-/** llama-swap only counts a model as loaded once it's ready to serve. */
-const READY = "ready";
 
 /** How often an activity path is read, and its timeout; sampled only while a page is open. */
 const ACTIVITY_POLL_MS = 2_000;
@@ -29,54 +27,10 @@ function countField(body: unknown, field: string): number | null {
   return null;
 }
 
-/** llama-swap's state for a model loading off the disk. */
-const STARTING = "starting";
-
 /** How long we'll trust a quiet stream before going and asking. */
 const STALE_MS = 60_000;
 
 const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
-
-interface ModelStatus {
-  id: string;
-  state: string;
-  unlisted?: boolean;
-}
-
-/**
- * Where a resident model's weights were assigned when not all fit on the card, read off its
- * launch command (nothing else reports it). Says "on the host", not whether RAM or disk serves them.
- */
-export interface Placement {
-  /** Layers whose experts are computed on the CPU, from `--n-cpu-moe`. */
-  cpuLayers: number | null;
-  /** Every layer of MoE experts, from `--cpu-moe` with no number. */
-  cpuExpertsAll: boolean;
-  /** The whole model runs on the CPU: `-ngl 0`, and no card is involved. */
-  cpuOnly: boolean;
-}
-
-/** Placement from a llama-server command line: only `--n-cpu-moe N`, `--cpu-moe` and `-ngl 0`, which stand alone. */
-export function parsePlacement(cmd: string): Placement | null {
-  const flag = (...names: string[]): string | null => {
-    for (const n of names) {
-      const m = new RegExp(`(?:^|\\s)${n}(?:[=\\s]+)(\\S+)`).exec(cmd);
-      if (m) return m[1]!;
-    }
-    return null;
-  };
-  const has = (...names: string[]): boolean =>
-    names.some((n) => new RegExp(`(?:^|\\s)${n}(?:\\s|$)`).test(cmd));
-
-  const moe = flag("--n-cpu-moe", "-ncmoe");
-  const cpuLayers = moe !== null && /^\d+$/.test(moe) ? Number(moe) : null;
-  const cpuExpertsAll = has("--cpu-moe");
-  const ngl = flag("--n-gpu-layers", "-ngl");
-  const cpuOnly = ngl === "0";
-
-  if (cpuLayers === null && !cpuExpertsAll && !cpuOnly) return null;
-  return { cpuLayers, cpuExpertsAll, cpuOnly };
-}
 
 export class BackendState {
   private loadedIds: string[] = [];
@@ -91,6 +45,8 @@ export class BackendState {
   /** Last successful read from this backend, for status surfaces; unlike lastUpdateAt, failures do not stamp it. */
   private lastOkAt = 0;
   private streaming = false;
+  /** The first event-stream attempt has settled, so silence before it is not yet evidence. */
+  private probed = false;
   private stopped = false;
   private attempt = 0;
   private abort: AbortController | null = null;
@@ -100,7 +56,7 @@ export class BackendState {
   private statsCache = new Map<string, ModelStats>();
   /** The stats key: a `single` backend has one answer whatever id it is asked under. */
   private key(wire: string): string {
-    return this.kind === "single" ? "" : wire;
+    return this.k.single ? "" : wire;
   }
   /** Per-wire in-flight learnContext, so concurrent callers dedupe. */
   private contextInFlight = new Map<string, Promise<void>>();
@@ -110,13 +66,16 @@ export class BackendState {
   private activityAt = 0;
   private activityInFlight: Promise<void> | null = null;
 
+  private readonly k: Kind;
+
   constructor(
     private readonly url: string,
-    private readonly kind: WarmSource,
+    kind: KindName,
     private readonly log: Logger,
   ) {
-    this.useEvents = kind === "llama-swap";
-    this.warmIsKnown = kind !== "none";
+    this.k = KINDS[kind];
+    this.useEvents = this.k.events;
+    this.warmIsKnown = this.k.knowsWarm;
   }
 
   /** Read the backend's own busy signal off its declared path, only while a page is open; rate-limited and deduped. */
@@ -164,31 +123,18 @@ export class BackendState {
 
   private useEvents: boolean;
 
+  /** Can this kind clear the card for a neighbour? */
+  canUnload(): boolean {
+    return this.k.unload !== undefined;
+  }
+
   /**
-   * Unload whatever llama-swap holds so another backend can have the hardware; a no-op for
-   * other kinds. A down backend is a no-op; a refusal throws so the job does not load on top.
+   * Clear the card for another backend; a no-op for a kind that cannot. A down backend is a
+   * no-op; a refusal throws so the job does not load on top.
    */
   async unload(): Promise<void> {
-    if (this.kind !== "llama-swap") return;
-    const url = `${this.url}/api/models/unload`;
-    let res;
-    try {
-      res = await send(url, { method: "POST", headersTimeoutMs: 30_000 });
-    } catch (e) {
-      this.log.warn("backend.unload_failed", {
-        url,
-        detail: e instanceof Error ? e.message : String(e),
-      });
-      return;
-    }
-    res.body.resume();
-    if (!res.ok) {
-      this.log.warn("backend.unload_refused", { url, status: res.status });
-      throw new Error(`${url} answered ${res.status}: the card was not cleared`);
-    }
-    // Warm state is now stale in a way the event stream may take a moment to
-    // tell us. Say so ourselves rather than scoring the next job against a
-    // model we just evicted.
+    if (!this.k.unload || !(await this.k.unload(this.url, this.log))) return;
+    // The event stream may take a moment to say so; scoring the next job against an evicted model is worse.
     this.loadedIds = [];
     this.lastUpdateAt = Date.now();
   }
@@ -225,9 +171,9 @@ export class BackendState {
     return this.streaming;
   }
 
-  /** True where we hold an event stream, the only place silence from a backend means anything. */
+  /** True where we hold an event stream, the only place silence from a backend means anything; never before the first attempt settles. */
   watched(): boolean {
-    return this.useEvents;
+    return this.useEvents && (this.streaming || this.probed);
   }
 
   /** The learned context window for a model, or null if not loaded yet. */
@@ -268,24 +214,9 @@ export class BackendState {
 
   private async fetchStats(wire: string): Promise<void> {
     try {
-      let stats: ModelStats = {};
-      if (this.kind === "llama-swap" || this.kind === "single") {
-        if (this.kind === "llama-swap" && !this.loadedIds.includes(wire)) return;
-        const base = this.kind === "llama-swap" ? `${this.url}/upstream/${encodeURIComponent(wire)}` : this.url;
-        const opts = { headersTimeoutMs: 2_000, totalTimeoutMs: 2_000 };
-        // llama-server answers /props; vLLM has none and reports max_model_len on /v1/models.
-        stats = await getJson<unknown>(`${base}/props`, opts).then(statsFromProps, () => ({}));
-        if (!known(stats)) stats = statsFromModels(await getJson<unknown>(`${base}/v1/models`, opts));
-      } else if (this.kind === "ollama") {
-        const n = await this.ollamaContext(wire);
-        if (n !== null) stats = { context: n };
-      }
-      // Only when something came back. An empty object cached here would mean
-      // "asked and got nothing", which is indistinguishable from "asked and got
-      // an answer with no fields" — and would stop us ever asking again.
-      if (known(stats)) {
-        this.statsCache.set(this.key(wire), stats);
-      }
+      const stats = await this.k.stats(this.url, wire, this.loadedIds);
+      // Only when something came back: a cached {} would read as "asked and got nothing" and never re-ask.
+      if (known(stats)) this.statsCache.set(this.key(wire), stats);
     } catch (e) {
       this.log.debug("backend.context_learn_failed", {
         wire,
@@ -294,55 +225,16 @@ export class BackendState {
     }
   }
 
-  private async ollamaContext(wire: string): Promise<number | null> {
-    // /api/show does not load the model, so it is safe to ask for any id.
-    const show = await send(`${this.url}/api/show`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      json: { name: wire },
-      headersTimeoutMs: 2_000,
-    });
-    const text = await show.text();
-    if (!show.ok) {
-      throw new Error(`ollama /api/show returned ${show.status}: ${text.slice(0, 200)}`);
-    }
-    let parsed: { model_info?: Record<string, unknown>; parameters?: string };
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error(`ollama /api/show did not return JSON: ${text.slice(0, 200)}`);
-    }
-    // Look for a key ending in .context_length (e.g. "qwen3.context_length").
-    let maxCtx: number | null = null;
-    if (parsed.model_info) {
-      for (const k of Object.keys(parsed.model_info)) {
-        if (k.endsWith(".context_length")) {
-          const v = parsed.model_info[k];
-          if (typeof v === "number") { maxCtx = v; break; }
-        }
-      }
-    }
-    if (!maxCtx) return null;
-    // A `num_ctx` in parameters overrides the model's maximum.
-    if (parsed.parameters) {
-      const m = /num_ctx\s+(\d+)/.exec(parsed.parameters);
-      if (m) {
-        const n = parseInt(m[1]!, 10);
-        if (n > 0 && n <= maxCtx) return n;
-      }
-    }
-    return maxCtx;
-  }
-
   /** Recent enough to act on? */
   fresh(): boolean {
     return this.lastUpdateAt > 0 && Date.now() - this.lastUpdateAt <= STALE_MS;
   }
 
   private apply(models: ModelStatus[]): void {
-    this.catalogIds = models.map((m) => m.id);
-    this.loadingIds = models.filter((m) => m.state === STARTING).map((m) => m.id);
-    this.setLoaded(models.filter((m) => m.state === READY).map((m) => m.id));
+    const r = readingFromStatus(models);
+    this.catalogIds = r.catalog;
+    this.loadingIds = r.loading;
+    this.setLoaded(r.loaded);
     // Placement is fetched from /running when the resident set changes, never on a timer.
     void this.learnPlacement();
     this.lastUpdateAt = Date.now();
@@ -354,25 +246,21 @@ export class BackendState {
     // The catalogue always comes from /v1/models, which anything OpenAI-shaped
     // serves. Warm state depends on who we are talking to, so that half is
     // asked differently per kind, or not at all.
-    const [warm, catalog] = await Promise.allSettled([
-      this.readWarm(),
-      getJson<{ data?: { id?: string }[] }>(`${this.url}/v1/models`, {
-        headersTimeoutMs: 3_000,
-      }),
+    const catalogRead = getJson<{ data?: { id?: string }[] }>(`${this.url}/v1/models`, {
+      headersTimeoutMs: 3_000,
+    }).then((c) => (c.data ?? []).map((m) => m.id ?? "").filter((m) => m !== ""));
+    // A kind may answer warm state from the catalogue, so it is handed the fresh one when it arrives.
+    const [catalog, warm] = await Promise.allSettled([
+      catalogRead,
+      catalogRead.catch(() => this.catalogIds).then((ids) => this.k.readWarm(this.url, ids)),
     ]);
 
-    if (catalog.status === "fulfilled") {
-      this.catalogIds = (catalog.value.data ?? [])
-        .map((m) => m.id ?? "")
-        .filter((m) => m !== "");
-    }
+    if (catalog.status === "fulfilled") this.catalogIds = catalog.value;
 
-    if (this.kind === "single") {
-      // One always-resident model, so whatever it lists is by definition warm.
-      // Reading the catalogue is the only question worth asking such a server.
-      this.setLoaded([...this.catalogIds]);
-    } else if (warm.status === "fulfilled") {
-      this.setLoaded(warm.value);
+    if (warm.status === "fulfilled" && warm.value !== null) {
+      this.setLoaded(warm.value.loaded);
+      this.loadingIds = warm.value.loading;
+      if (warm.value.placements) this.placements = warm.value.placements;
     } else {
       // Missing warm endpoint isn't an error, it just means we never know
       // anything is warm, so the bonus never fires and readyNow stays empty.
@@ -407,7 +295,7 @@ export class BackendState {
 
   /** Read resident models' launch commands from /running, once per change in the resident set. */
   private async learnPlacement(): Promise<void> {
-    if (this.kind !== "llama-swap") return;
+    if (!this.k.placement) return;
     const key = [...this.loadedIds].sort().join("\u0000");
     if (key === this.placementFor) return;
     this.placementFor = key;
@@ -416,17 +304,7 @@ export class BackendState {
       return;
     }
     try {
-      const running = await getJson<{ running?: { model?: string; cmd?: string }[] }>(
-        `${this.url}/running`,
-        { headersTimeoutMs: 3_000 },
-      );
-      const next = new Map<string, Placement>();
-      for (const r of running.running ?? []) {
-        if (!r.model || !r.cmd) continue;
-        const p = parsePlacement(r.cmd);
-        if (p) next.set(r.model, p);
-      }
-      this.placements = next;
+      this.placements = await this.k.placement(this.url);
     } catch {
       // Placement is a nicety. Failing to read it must not disturb warm state,
       // which is what this backend is actually for.
@@ -437,49 +315,6 @@ export class BackendState {
   /** Models loading off the disk now; empty also where the backend cannot tell. */
   loading(): string[] {
     return [...this.loadingIds];
-  }
-
-  /** Whatever this kind of backend calls "what is loaded right now". */
-  private async readWarm(): Promise<string[]> {
-    if (this.kind === "ollama") {
-      // Ollama's /api/ps is the direct equivalent of llama-swap's /running. It
-      // returns a SET: several models resident at once, each with its own
-      // keep_alive TTL, all servable together. No eviction, so no thrash.
-      const ps = await getJson<{ models?: { model?: string; name?: string }[] }>(
-        `${this.url}/api/ps`,
-        { headersTimeoutMs: 3_000 },
-      );
-      return (ps.models ?? [])
-        .map((m) => m.model ?? m.name ?? "")
-        .filter((m) => m !== "");
-    }
-    if (this.kind === "llama-swap") {
-      const running = await getJson<{ running?: { model?: string; state?: string; cmd?: string }[] }>(
-        `${this.url}/running`,
-        { headersTimeoutMs: 3_000 },
-      );
-      // The poll already has the payload the SSE path has to go and ask for,
-      // so it reads placement straight out of it.
-      const next = new Map<string, Placement>();
-      for (const r of running.running ?? []) {
-        const p = r.model && r.cmd ? parsePlacement(r.cmd) : null;
-        if (p && r.model) next.set(r.model, p);
-      }
-      this.placements = next;
-      // The poll is the fallback for a backend with no event stream, and it
-      // reports the same states — so it must learn the same thing, or a load
-      // would be visible on one transport and invisible on the other.
-      this.loadingIds = (running.running ?? [])
-        .filter((m) => m.state === STARTING)
-        .map((m) => m.model ?? "")
-        .filter((m) => m !== "");
-      return (running.running ?? [])
-        .filter((m) => (m.state ?? READY) === READY)
-        .map((m) => m.model ?? "")
-        .filter((m) => m !== "");
-    }
-    // "single" is answered from the catalogue above; "none" has no answer.
-    return [];
   }
 
   /** Refresh only if we have to. This is what the hot path calls. */
@@ -567,6 +402,7 @@ export class BackendState {
           error: e instanceof Error ? e.message : String(e),
         });
       }
+      this.probed = true;
       this.streaming = false;
       if (this.stopped || !this.useEvents) return;
       const wait = BACKOFF_MS[Math.min(this.attempt, BACKOFF_MS.length - 1)]!;

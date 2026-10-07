@@ -5,6 +5,7 @@
  */
 import type { BackendConfig, HearthConfig, ModelRoute, RouteRule } from "./config.js";
 import { BackendState } from "./backend.js";
+import { KINDS } from "./kinds.js";
 import type { Logger } from "./log.js";
 import { mergeStats, type ModelStats, type Need } from "./stats.js";
 import { ResourceArbiter } from "./resources.js";
@@ -99,7 +100,7 @@ export class BackendPool {
           // foreign job and refuses to run them together.
           wire: (m) => this.outboundId(m),
           // Ollama serves a resident set side by side, so a model's ceiling counts its own jobs.
-          coresident: b.kind === "ollama",
+          coresident: KINDS[b.kind].coresident,
           // A resident never takes turns: its own requests neither wait for the card nor evict.
           resources: b.resident ? [] : this.arbitrated(b.resources),
           arbiter: this.arbiter,
@@ -508,7 +509,7 @@ export class BackendPool {
   loadedCapacity(slot: BackendSlot): ReturnType<Scheduler["capacity"]> {
     const base = slot.scheduler.capacity();
     // Ollama serves a set side by side, so one member's ceiling is not the backend's.
-    if (slot.cfg.kind === "ollama") return base;
+    if (KINDS[slot.cfg.kind].coresident) return base;
     const raw = slot.state.resident();
     if (raw === null) return base;
     // Asked under the advertised id; aliases of one seat inherit the same ceiling.

@@ -1,0 +1,91 @@
+/**
+ * The contract every backend kind meets. It loops over KINDS, so a new kind is held to it
+ * the moment it is added: answer warm state or say it cannot, never load a cold model to
+ * learn its stats, and either clear the card on request or be refused where it would have to.
+ */
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { ConfigError, parseConfig } from "../src/config.js";
+import { KINDS, type KindName } from "../src/kinds.js";
+import { silentLogger } from "../src/log.js";
+
+/** Paths the fake backend was asked, and how it answers an unload. */
+const asked: string[] = [];
+let unloadStatus = 200;
+
+const server = createServer((req, res) => {
+  const path = req.url ?? "/";
+  asked.push(path);
+  const json = (body: unknown, status = 200) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  if (path === "/v1/models") return json({ data: [{ id: "warm", max_model_len: 4096 }] });
+  if (path === "/running") return json({ running: [{ model: "warm", state: "ready", cmd: "llama-server --n-cpu-moe 4" }] });
+  if (path === "/api/ps") return json({ models: [{ model: "warm" }] });
+  if (path === "/api/show") return json({ model_info: { "x.context_length": 4096 } });
+  if (path === "/api/models/unload") return json({}, unloadStatus);
+  if (path.endsWith("/props")) return json({ default_generation_settings: { n_ctx: 4096 } });
+  json({ error: "not found" }, 404);
+});
+await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+for (const [name, k] of Object.entries(KINDS) as [KindName, (typeof KINDS)[KindName]][]) {
+  // --- warm state: an answer exactly when the kind claims to know ------------------
+  const reading = await k.readWarm(url, ["warm"]);
+  assert.equal(reading !== null, k.knowsWarm, `${name}: readWarm answers iff knowsWarm`);
+  if (reading) assert.ok(reading.loaded.includes("warm"), `${name}: sees the loaded model`);
+
+  // --- stats: asking about a cold model must not reach that model -------------------
+  asked.length = 0;
+  await k.stats(url, "cold", ["warm"]).catch(() => ({}));
+  if (!k.single) {
+    assert.ok(!asked.some((p) => p.includes("/upstream/cold")), `${name}: a stats probe would load a cold model`);
+  }
+
+  // --- unload: a refusal throws, a down backend does not ----------------------------
+  if (k.unload) {
+    unloadStatus = 500;
+    await assert.rejects(k.unload(url, silentLogger), `${name}: a refused unload must throw`);
+    unloadStatus = 200;
+    assert.equal(await k.unload(url, silentLogger), true, `${name}: a clean unload says so`);
+    assert.equal(await k.unload("http://127.0.0.1:1", silentLogger), false, `${name}: a down backend is not cleared`);
+  }
+
+  // --- config: a kind that holds a model it cannot unload never shares a contested card
+  const shared = () => parseConfig({
+    name: "t",
+    resources: { gpu0: { kind: "gpu" } },
+    backends: [
+      { name: "a", url, kind: name, serves: ["a"], resources: ["gpu0"] },
+      { name: "b", url, kind: "llama-swap", serves: ["b"], resources: ["gpu0"] },
+    ],
+  });
+  if (k.knowsWarm && !k.unload) assert.throws(shared, ConfigError, `${name}: refused on a contested card`);
+  else shared();
+}
+
+// --- the escape hatches the refusal names both work ---------------------------------
+parseConfig({
+  name: "t",
+  resources: { gpu0: { kind: "gpu" } },
+  backends: [
+    { name: "a", url, kind: "single", serves: ["a"], resources: ["gpu0"], resident: true },
+    { name: "b", url, kind: "llama-swap", serves: ["b"], resources: ["gpu0"] },
+  ],
+});
+parseConfig({
+  name: "t",
+  resources: { cpu: { kind: "cpu", shared: true } },
+  backends: [
+    { name: "a", url, kind: "single", serves: ["a"], resources: ["cpu"] },
+    { name: "b", url, kind: "single", serves: ["b"], resources: ["cpu"] },
+  ],
+});
+
+server.closeAllConnections();
+server.close();
+console.log("kinds.test.ts ok");
