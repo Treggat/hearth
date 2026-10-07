@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
 import { EMULATIONS, type Emulation } from "./emulate.js";
+import { KINDS, type KindName } from "./kinds.js";
 import { known, NOTE_MAX, type ModelStats } from "./stats.js";
 
 export type RoutePolicy = "local" | "peer" | "spillover" | "fastest";
@@ -19,11 +20,8 @@ export interface PeerConfig {
   models: Record<string, string>;
 }
 
-/**
- * How a backend reports what it has loaded: llama-swap events (else /running), ollama's
- * /api/ps, `single` (always resident), or `none`, which is unknown rather than cold.
- */
-export type WarmSource = "llama-swap" | "ollama" | "single" | "none";
+/** A backend's `kind`, one of the entries in kinds.ts. */
+export type WarmSource = KindName;
 
 /**
  * Whether the standalone status listener also serves the write routes: "off" (page only), or
@@ -395,7 +393,7 @@ function atLeast(v: unknown, where: string, fallback: number, min = 0): number {
   return n;
 }
 
-const WARM_SOURCES: WarmSource[] = ["llama-swap", "ollama", "single", "none"];
+const WARM_SOURCES = Object.keys(KINDS) as WarmSource[];
 
 /** `kind`, or the `llamaSwapExtras` boolean it replaced; not both. */
 function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
@@ -694,6 +692,20 @@ export function parseConfig(raw: unknown): HearthConfig {
   for (const b of backends) {
     if (b.resident && !b.resources.some((r) => !resourceDecls[r]?.shared)) {
       throw new ConfigError(`backends "${b.name}" is resident but declares no exclusive resource to yield`);
+    }
+  }
+  // A kind that reports a resident model but cannot unload it would fail every neighbour's turn.
+  for (const b of backends) {
+    const k = KINDS[b.kind];
+    if (b.resident || !k.knowsWarm || k.unload) continue;
+    const mine = b.resources.filter((r) => !resourceDecls[r]?.shared);
+    const rival = backends.find((o) => o !== b && !o.resident && o.resources.some((r) => mine.includes(r)));
+    if (rival) {
+      const card = rival.resources.find((r) => mine.includes(r));
+      throw new ConfigError(
+        `backends "${b.name}" (kind: ${b.kind}) cannot unload, so "${rival.name}" could never take ${card} from it — ` +
+          `declare "${b.name}" resident, or mark ${card} shared`,
+      );
     }
   }
 

@@ -1056,10 +1056,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
     const slot = slotFor;
     const wire = pool.outboundId(model);
-    // Only an evicting backend has anything to do. A `single` backend holds
-    // its model resident forever, and saying "warmed" there would claim work
-    // that did not happen.
-    if (slot.cfg.kind !== "llama-swap") {
+    // Only a backend that swaps models has anything to warm; saying "warmed" elsewhere claims work that did not happen.
+    if (!slot.state.canUnload()) {
       json(res, 200, {
         model, backend: slot.name, warmed: false,
         note: `${slot.name} keeps its models resident, so there is nothing to warm`,
@@ -1139,7 +1137,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           const entry: Entry = { id };
           const note = pool.statsFor(id)?.note;
           if (note) entry.description = note;
-          if (pool.for(id).cfg.kind === "none") return entry;
+          if (!pool.for(id).state.knowsWarm()) return entry;
           entry.status = { value: warm.has(id) ? "loaded" : "unloaded" };
           const ctx = pool.contextLength(id);
           if (ctx !== null) entry.context_length = ctx;
@@ -1828,9 +1826,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
             ...(b.state.watched() ? { answering: b.state.answering() } : {}),
             // Sent whenever declared, including unread (ok:false), which the page shows as unknown.
             ...(b.cfg.activity ? { activity: b.state.activity() } : {}),
-            // Only llama-swap evicts. An ollama backend keeps its set resident
-            // and serves them together, so there is no thrash to warn about.
-            evicts: b.cfg.kind === "llama-swap",
+            // Only a kind that unloads evicts; one that keeps its set resident has no thrash to warn about.
+            evicts: b.state.canUnload(),
             slots: c.slots,
             free: c.free,
             queued: Object.values(c.queued).reduce((a, x) => a + x, 0),
@@ -1948,7 +1945,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       unknownWarm: [...unknownWarm].sort(),
       // Does anything here actually evict? If nothing does, the status page
       // should not talk about model thrash.
-      evicts: pool.all().some((b) => b.cfg.kind === "llama-swap"),
+      evicts: pool.all().some((b) => b.state.canUnload()),
     };
   }
 
