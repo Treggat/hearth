@@ -1125,17 +1125,25 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       await Promise.all(pool.all().map((b) => b.state.ensureFresh()));
       // Carry warm state, as llama-swap does on this route.
       const warm = new Set(pool.loaded());
-      type Entry = { id: string; status?: { value: string }; context_length?: number; description?: string };
+      type Entry = {
+        id: string; status?: { value: string }; context_length?: number; description?: string;
+        input_modalities?: string[];
+      };
+      // What a client may send, where the model or its operator has said. Silence stays silence.
+      const input = (stats: ModelStats | null | undefined): string[] | undefined =>
+        typeof stats?.vision === "boolean" ? (stats.vision ? ["text", "image"] : ["text"]) : undefined;
       const upstream: { data?: Entry[] } = {
         data: pool.catalog().map((id) => {
           // Unknown warmth or window is omitted, never reported as cold or null.
           const entry: Entry = { id };
-          const note = pool.statsFor(id)?.note;
-          if (note) entry.description = note;
+          const stats = pool.statsFor(id);
+          if (stats?.note) entry.description = stats.note;
           if (!pool.for(id).state.knowsWarm()) return entry;
           entry.status = { value: warm.has(id) ? "loaded" : "unloaded" };
           const ctx = pool.contextLength(id);
           if (ctx !== null) entry.context_length = ctx;
+          const takes = input(stats);
+          if (takes) entry.input_modalities = takes;
           return entry;
         }),
       };
@@ -1150,6 +1158,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           if (per) entry.status = { value: per.warm ? "loaded" : "unloaded" };
           if (per?.stats?.context !== undefined) entry.context_length = per.stats.context;
           if (per?.stats?.note) entry.description = per.stats.note;
+          const takes = input(per?.stats);
+          if (takes) entry.input_modalities = takes;
           upstream.data!.push(entry);
         }
       }
