@@ -1,0 +1,276 @@
+/**
+ * hearth.yaml is the only config state. Every edit lands in the file the moment it is made, the
+ * running node follows the file, and nothing is ever "pending" except what needs a restart.
+ *
+ * The failures worth catching are all "it worked and ruined something":
+ *
+ *   - comments or styles stripped from a file a person maintains by hand
+ *   - an edit made in another window overwritten, or ignored by the running node
+ *   - a file written that parses as YAML and then fails to LOAD
+ *   - a live-looking change that actually needs a restart, or the reverse
+ */
+import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { loadConfig, parseConfig } from "../src/config.js";
+import { silentLogger } from "../src/log.js";
+import { createNode } from "../src/server.js";
+
+const dir = mkdtempSync(join(tmpdir(), "hearth-cfg-"));
+const cfgPath = join(dir, "hearth.yaml");
+
+const backend = createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(req.url === "/v1/models"
+    ? JSON.stringify({ data: [{ id: "mine" }, { id: "spare" }] })
+    : JSON.stringify({ choices: [{ message: { role: "assistant", content: "local" } }] }));
+});
+await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
+const beUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
+
+// Comments in every position: above a key, beside a value, inside a nested mapping.
+const ORIGINAL = `# hearth on the test box.
+#
+# Two peers, one of which is a friend.
+name: node-under-test
+
+backend:
+  url: ${beUrl}          # the local llama-swap
+  kind: none
+  serves: [mine, spare]
+
+# Empty by default, since lending is opt-in per model.
+share: [mine]
+
+peerTokens:
+  friend: shhh
+
+peers:
+  - name: friend
+    url: http://127.0.0.1:1
+    token: t
+    models:
+      # my id: their id. Also the allowlist.
+      borrowed: theirs
+
+models:
+  borrowed:
+    policy: peer
+    fallbackLocal: true
+  # Past 80 columns on purpose: the writer's default would fold it across lines.
+  long-one: {concurrency: 4, params: {thinking_token_budget: 2048}, pool: {tokens: 144000, output: 8192}, stats: {context: 131072}}
+`;
+
+const comments = (t: string) => t.split("\n").filter((l) => l.includes("#")).map((l) => l.slice(l.indexOf("#"))).join("\n");
+
+type Status = { path: string | null; hash: string; restartPending: string[]; error: string | null };
+
+async function boot(path = cfgPath) {
+  const node = createNode(loadConfig(path), silentLogger);
+  node.start();
+  await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(node.server.address() as AddressInfo).port}`;
+  const send = (route: string, method: string, body: unknown) =>
+    fetch(`${url}${route}`, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return {
+    node,
+    url,
+    control: (body: unknown) => send("/control", "POST", body),
+    patch: (body: unknown) => send("/config", "PATCH", body),
+    file: async () => (await (await fetch(`${url}/config`)).json()) as Status & { text: string },
+    note: async (model: string) => {
+      const m = (await (await fetch(`${url}/v1/models`)).json()) as { data: { id: string; description?: string }[] };
+      return m.data.find((x) => x.id === model)?.description;
+    },
+  };
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 700));
+
+/* ------------------------------------------ every console edit lands in the file */
+
+{
+  writeFileSync(cfgPath, ORIGINAL);
+  const a = await boot();
+  assert.equal((await a.control({ share: { mine: false, spare: true } })).status, 200);
+  assert.equal((await a.control({ link: { peer: "friend", mine: "extra", theirs: "their-extra" } })).status, 200);
+  assert.equal((await a.control({ notes: { mine: "use for: \"quoted\" things" } })).status, 200);
+
+  const written = readFileSync(cfgPath, "utf8");
+  assert.equal(comments(written), comments(ORIGINAL), "every comment survives, in order");
+  assert.match(written, /serves: \[mine, spare\]/, "untouched flow lists keep their spacing");
+  assert.match(written, /^share: \[spare\]/m, "an inline list stays inline after being rewritten");
+  assert.ok(written.includes("  long-one: {concurrency: 4, params: {thinking_token_budget: 2048}, pool: {tokens: 144000, output: 8192}, stats: {context: 131072}}\n"),
+    "a long line nobody edited stays one line");
+
+  const back = loadConfig(cfgPath);
+  assert.deepEqual(back.share, ["spare"], "no save step: the file already says it");
+  assert.equal(back.peers[0]!.models.extra, "their-extra");
+  assert.equal(back.models.extra!.policy, "peer", "a link writes its route, not just the mapping");
+  assert.equal(back.peers[0]!.models.borrowed, "theirs", "untouched entries stay untouched");
+  assert.deepEqual(back.notes, { mine: "use for: \"quoted\" things" });
+  assert.equal(await a.note("mine"), "use for: \"quoted\" things", "and the running node has it too");
+
+  const st = await a.file();
+  assert.deepEqual(st.restartPending, [], "all of that applies live");
+  assert.equal(st.path, cfgPath);
+
+  // The last mapping going leaves the peer configured, borrowing nothing.
+  assert.equal((await a.control({ unlink: { peer: "friend", mine: "borrowed" } })).status, 200);
+  assert.equal((await a.control({ unlink: { peer: "friend", mine: "extra" } })).status, 200);
+  const empty = loadConfig(cfgPath);
+  assert.deepEqual(empty.peers[0]!.models, {}, "the peer is still there");
+  assert.equal(empty.peers[0]!.token, "t", "with its token");
+  assert.equal(empty.models.borrowed, undefined, "and the dead route is retired in the file");
+  await a.node.close();
+}
+
+/* ------------------------------------------------- hand edits, two ways in */
+
+{
+  writeFileSync(cfgPath, ORIGINAL);
+  const a = await boot();
+
+  // An edit made elsewhere is loaded before ours, so ours builds on it instead of overwriting it.
+  writeFileSync(cfgPath, ORIGINAL.replace("# Empty by default", "# somebody was in here\n# Empty by default"));
+  assert.equal((await a.control({ share: { spare: true } })).status, 200);
+  const both = readFileSync(cfgPath, "utf8");
+  assert.match(both, /somebody was in here/, "their edit survives");
+  assert.match(both, /^share: \[mine, spare\]/m, "and ours is on top of it");
+
+  // With no request at all, the watcher picks a hand edit up and the node runs it.
+  writeFileSync(cfgPath, readFileSync(cfgPath, "utf8") + "notes:\n  mine: typed in vim\n");
+  await settle();
+  assert.equal(await a.note("mine"), "typed in vim", "a hand edit applies without a restart or a click");
+
+  // A broken hand edit leaves the node on the last good config and says why.
+  const good = readFileSync(cfgPath, "utf8");
+  writeFileSync(cfgPath, good.replace("kind: none", "kind: banana"));
+  await settle();
+  const st = await a.file();
+  assert.match(st.error ?? "", /kind/, "the status names what is wrong");
+  assert.equal(await a.note("mine"), "typed in vim", "and the node keeps serving the last good config");
+  const refused = await a.control({ share: { spare: false } });
+  assert.equal(refused.status, 409, "an edit on top of a file that does not load is refused");
+  assert.match(readFileSync(cfgPath, "utf8"), /banana/, "and the file is left for its author to fix");
+
+  writeFileSync(cfgPath, good);
+  await settle();
+  assert.equal((await a.file()).error, null, "fixing it clears the error");
+  await a.node.close();
+}
+
+/* ------------------------------------------------------------ PATCH /config */
+
+{
+  writeFileSync(cfgPath, ORIGINAL);
+  const a = await boot();
+  const { hash } = await a.file();
+
+  // A live key applies at once; a key read only at startup is saved and listed.
+  let r = await a.patch({ baseHash: hash, ops: [{ path: ["backendIdleMs"], value: 1234 }] });
+  assert.equal(r.status, 200);
+  let out = (await r.json()) as Status;
+  assert.deepEqual(out.restartPending, [], "an idle deadline is read per request");
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["scheduler", "maxPerLane"], value: 7 }] });
+  out = (await r.json()) as Status;
+  assert.deepEqual(out.restartPending, ["scheduler"], "lanes and queues are built once, so they wait");
+  assert.equal(loadConfig(cfgPath).scheduler.maxPerLane, 7, "but the file has it now");
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["scheduler", "maxPerLane"], delete: true }] });
+  out = (await r.json()) as Status;
+  assert.deepEqual(out.restartPending, [], "putting it back clears the restart");
+
+  // Invalid: 422 with the field, and nothing written.
+  const before = readFileSync(cfgPath, "utf8");
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["backend", "url"], value: "nope" }] });
+  assert.equal(r.status, 422);
+  const err = (await r.json()) as { error: { message: string; path: string | null } };
+  assert.equal(err.error.path, "backend.url", "the error carries the field it is about");
+  assert.equal(readFileSync(cfgPath, "utf8"), before, "and the file is untouched");
+
+  // A dry run shows the result without writing it.
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["share"], value: [] }], dryRun: true });
+  assert.match(((await r.json()) as { text: string }).text, /share: \[\]/);
+  assert.equal(readFileSync(cfgPath, "utf8"), before, "a dry run writes nothing");
+
+  // Someone edits a different key: ops on untouched paths merge onto their file.
+  writeFileSync(cfgPath, before.replace("name: node-under-test", "name: renamed"));
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["coldPenalty"], value: 3 }] });
+  assert.equal(r.status, 200, "an unrelated edit elsewhere is not a conflict");
+  const merged = readFileSync(cfgPath, "utf8");
+  assert.match(merged, /name: renamed/);
+  assert.match(merged, /coldPenalty: 3/);
+
+  // ...but the same path, or the whole text, from a stale base is.
+  const stale = out.hash;
+  writeFileSync(cfgPath, merged.replace("coldPenalty: 3", "coldPenalty: 4"));
+  r = await a.patch({ baseHash: stale, ops: [{ path: ["coldPenalty"], value: 5 }] });
+  assert.equal(r.status, 409, "a path someone else changed is theirs until you reload");
+  r = await a.patch({ baseHash: stale, text: ORIGINAL });
+  assert.equal(r.status, 409, "replacing the whole file needs the current hash");
+  assert.match(readFileSync(cfgPath, "utf8"), /coldPenalty: 4/, "and their value stands");
+  await a.node.close();
+}
+
+/* ------------------------------- a writable file in a read-only directory */
+
+{
+  // ReadWritePaths=/etc/hearth.yaml leaves /etc read-only, so the temp-file rename fails; write in place.
+  const locked = mkdtempSync(join(tmpdir(), "hearth-ro-"));
+  const roCfg = join(locked, "hearth.yaml");
+  writeFileSync(roCfg, ORIGINAL);
+  chmodSync(locked, 0o500);
+  try {
+    const a = await boot(roCfg);
+    assert.equal((await a.control({ share: { mine: false } })).status, 200);
+    assert.deepEqual(loadConfig(roCfg).share, [], "a writable file is enough, directory or not");
+    await a.node.close();
+  } finally {
+    chmodSync(locked, 0o700);
+  }
+}
+
+/* --------------------------------------------- a pre-2.0 sidecar folds in once */
+
+{
+  const statePath = join(dir, "overrides.json");
+  writeFileSync(cfgPath, `stateFile: ${statePath}\n` + ORIGINAL);
+  writeFileSync(statePath, JSON.stringify({
+    version: 1, savedAt: "", share: { spare: true },
+    maps: { friend: { extra: "their-extra" }, gone: { x: "y" } },
+    routes: { extra: { policy: "peer", peers: [], fallbackLocal: false } },
+    notes: { mine: "from the sidecar" },
+  }));
+  const a = await boot();
+  const after = loadConfig(cfgPath);
+  assert.deepEqual(after.share, ["mine", "spare"], "its share deltas are in the file");
+  assert.equal(after.peers[0]!.models.extra, "their-extra");
+  assert.equal(after.models.extra!.fallbackLocal, false);
+  assert.equal(after.notes?.mine, "from the sidecar");
+  assert.ok(!existsSync(statePath) && existsSync(`${statePath}.migrated`), "and the sidecar is retired");
+  assert.match(readFileSync(cfgPath, "utf8"), /# my id: their id\. Also the allowlist\./, "comments intact");
+  await a.node.close();
+}
+
+/* ---------------------------------------- a node built in code edits memory */
+
+{
+  const node = createNode(parseConfig({ name: "n", backend: { url: beUrl, kind: "none", serves: ["mine"] } }), silentLogger);
+  await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(node.server.address() as AddressInfo).port}`;
+  const r = await fetch(`${url}/control`, { method: "POST", body: JSON.stringify({ share: { mine: true } }) });
+  const out = (await r.json()) as { share: string[]; config: Status };
+  assert.deepEqual(out.share, ["mine"], "the edit applies");
+  assert.equal(out.config.path, null, "and the status says there is no file behind it");
+  const p = await fetch(`${url}/config`, { method: "PATCH", body: JSON.stringify({ ops: [] }) });
+  assert.equal(p.status, 409, "raw file edits need a file");
+  await node.close();
+}
+
+backend.closeAllConnections();
+backend.close();
+console.log("configfile.test.ts ok");

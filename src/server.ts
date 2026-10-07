@@ -8,12 +8,12 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import {
-  ConfigError, peersMapping, WARM_LANE,
+  peersMapping, WARM_LANE,
   type BackendConfig, type HearthConfig, type RoutePolicy,
 } from "./config.js";
 import { Controls } from "./controls.js";
 import { emulatedRequest, relayEmulated } from "./emulate.js";
-import { Overrides, readState, writeState } from "./overrides.js";
+import { ConfigFile, ConfigRefusal, deepFreeze, link, setNote, setShare, unlink } from "./configfile.js";
 import type { Logger } from "./log.js";
 import { PeerRegistry, PeerStatusError } from "./peers.js";
 import { BackendPool, type BackendSlot } from "./pool.js";
@@ -25,12 +25,6 @@ import { createViews } from "./views.js";
 import { send, type UpstreamResponse } from "./upstream.js";
 
 /** Constant-time compare over sha256 digests, so neither length nor content leaks. */
-function deepFreeze(v: unknown): void {
-  if (v === null || typeof v !== "object" || Object.isFrozen(v)) return;
-  Object.freeze(v);
-  for (const x of Object.values(v)) deepFreeze(x);
-}
-
 function secretEq(a: string, b: string): boolean {
   return timingSafeEqual(
     createHash("sha256").update(a).digest(),
@@ -126,38 +120,21 @@ export interface HearthNode {
 }
 
 export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
-  // Overrides edits models, share, notes and peers' maps in place and everything reads those per call;
-  // the rest is fixed for the node's life, so an accidental write throws instead of going stale.
+  // ConfigFile swaps the live keys in whole and everything reads those per call; the rest changes
+  // only with a restart, so an accidental write throws instead of going stale.
   for (const part of [cfg.listen, cfg.backends, cfg.scheduler, cfg.uiListen, cfg.resources,
                       cfg.apiKeys, cfg.apiKeyLabels, cfg.apiKeyModels, cfg.peerTokens]) deepFreeze(part);
   // One state and one queue per backend. Pushed over SSE where the backend
   // supports it, polled where it doesn't.
   const pool = new BackendPool(cfg, log);
 
-  // Runtime overrides on the config's two federation directions. Passed to the
-  // registry so a borrowing pause removes every peer from routing at source.
+  // Pause switches for the two federation directions. Passed to the registry so a
+  // borrowing pause removes every peer from routing at source.
   const controls = new Controls();
-  // Writes THROUGH cfg, so peers and routing see an edit on the next request
-  // with nothing to invalidate. It snapshots the file's version first, which is
-  // the only remaining record of what the YAML said.
-  const overrides = new Overrides(cfg);
-  // AFTER the baseline snapshot above, so restored edits still read as
-  // differing from the file — saved and "in the config" are separate claims and
-  // the page reports both.
-  if (cfg.stateFile) {
-    const saved = readState(cfg.stateFile, log);
-    if (saved) {
-      overrides.restore(saved, log);
-      for (const [model, on] of Object.entries(saved.share)) controls.setShare(model, on);
-      log.info("state.restored", {
-        path: cfg.stateFile,
-        savedAt: saved.savedAt,
-        share: Object.keys(saved.share).length,
-        peers: Object.keys(saved.maps).length,
-        routes: Object.keys(saved.routes).length,
-      });
-    }
-  }
+  // hearth.yaml as the only config state: edits write the file and apply live.
+  // Deferred: the sidecar migration below applies before the stream state further down exists.
+  const config = new ConfigFile(cfg, log, () => queueMicrotask(() => void broadcast()));
+  if (cfg.stateFile) config.migrateSidecar(cfg.stateFile);
   const peers = new PeerRegistry(cfg, log, controls);
 
   /** What we lend right now: `share:` while lending is on, nothing while paused. Every share gate reads this. */
@@ -645,6 +622,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // Local only: /control changes state, so a peer must never reach it.
     { path: "/network", auth: "local", handler: routeNetwork },
     { path: "/control", auth: "local", handler: routeControl },
+    { path: "/config", methods: ["GET", "PATCH", "POST"], auth: "local", handler: routeConfig },
     { path: "/queue", auth: "local", handler: routeQueue },
 
     // The OpenAI surface: a peer may send us work here, and so may we.
@@ -777,13 +755,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   async function routeControl(c: Call): Promise<void> {
     const { req, res } = c;
     if (req.method === "GET") {
-      json(res, 200, {
-        ...controls.state(),
-        share: shared(),
-        configuredShare: cfg.share,
-        catalog: pool.catalog(),
-        ...overrideView(),
-      });
+      json(res, 200, { ...controls.state(), share: shared(), catalog: pool.catalog(), config: config.status() });
       return;
     }
     if (req.method !== "POST") {
@@ -859,119 +831,110 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       apiError(res, 400, "send link or unlink, not both");
       return;
     }
+    let edit: { peer: string; mine: string; theirs: string; policy: RoutePolicy; fallbackLocal: boolean; unlink: boolean } | null = null;
     if (body.link !== undefined || body.unlink !== undefined) {
-      const edit = (body.link ?? body.unlink) as Record<string, unknown>;
-      if (typeof edit !== "object" || edit === null || Array.isArray(edit)) {
+      const e = (body.link ?? body.unlink) as Record<string, unknown>;
+      if (typeof e !== "object" || e === null || Array.isArray(e)) {
         apiError(res, 400, "link/unlink must be an object");
         return;
       }
-      const peerName = typeof edit.peer === "string" ? edit.peer : "";
-      const mine = typeof edit.mine === "string" ? edit.mine : "";
+      const peerName = typeof e.peer === "string" ? e.peer : "";
+      const mine = typeof e.mine === "string" ? e.mine : "";
       if (peerName === "" || mine === "") {
         apiError(res, 400, "link/unlink need peer and mine");
         return;
       }
-      try {
-        if (body.unlink !== undefined) {
-          overrides.unlink(peerName, mine);
-          log.info("control.unlink", { peer: peerName, model: mine });
-        } else {
-          const theirs = typeof edit.theirs === "string" && edit.theirs !== "" ? edit.theirs : mine;
-          // If we serve it too, `fastest` with local fallback; if not, peer only, since home would 404.
-          const local = pool.catalog().includes(mine);
-          const policy = (edit.policy as RoutePolicy | undefined) ?? (local ? "fastest" : "peer");
-          if (!["local", "peer", "spillover", "fastest"].includes(policy)) {
-            apiError(res, 400, `policy must be local, peer, spillover or fastest (got ${policy})`);
-            return;
-          }
-          const fallback = typeof edit.fallbackLocal === "boolean" ? edit.fallbackLocal : local;
-          overrides.link(peerName, mine, theirs, policy, fallback);
-          log.info("control.link", { peer: peerName, model: mine, theirs, policy, fallbackLocal: fallback });
-        }
-      } catch (e) {
-        apiError(res, 400, e instanceof Error ? e.message : String(e));
+      // If we serve it too, `fastest` with local fallback; if not, peer only, since home would 404.
+      const local = pool.catalog().includes(mine);
+      const policy = (e.policy as RoutePolicy | undefined) ?? (local ? "fastest" : "peer");
+      if (!["local", "peer", "spillover", "fastest"].includes(policy)) {
+        apiError(res, 400, `policy must be local, peer, spillover or fastest (got ${policy})`);
         return;
       }
+      edit = {
+        peer: peerName, mine, policy, unlink: body.unlink !== undefined,
+        theirs: typeof e.theirs === "string" && e.theirs !== "" ? e.theirs : mine,
+        fallbackLocal: typeof e.fallbackLocal === "boolean" ? e.fallbackLocal : local,
+      };
     }
 
-    if (body.notes !== undefined) {
-      for (const [model, text] of Object.entries(body.notes as Record<string, string | null>)) {
-        overrides.setNote(model, text);
+    // One write: every config edit in this POST lands in hearth.yaml together, or none does.
+    if (edit || body.notes !== undefined || body.share !== undefined) {
+      try {
+        config.update((d) => {
+          if (edit?.unlink) unlink(d, edit.peer, edit.mine);
+          else if (edit) link(d, edit.peer, edit.mine, edit.theirs, edit.policy, edit.fallbackLocal);
+          for (const [model, text] of Object.entries((body.notes ?? {}) as Record<string, string | null>)) setNote(d, model, text);
+          for (const [model, want] of Object.entries((body.share ?? {}) as Record<string, boolean | null>)) {
+            // null meant "defer to the file" when edits were a layer over it; the file is all there is now.
+            if (want !== null) setShare(d, model, want);
+          }
+        });
+      } catch (e) {
+        failConfig(res, e);
+        return;
       }
-      log.info("control.notes", { models: Object.keys(body.notes as object) });
-    }
-
-    if (body.share !== undefined) {
-      for (const [model, want] of Object.entries(body.share as Record<string, boolean | null>)) {
-        controls.setShare(model, want);
-      }
-      log.info("control.share", { share: shared() });
+      log.info("control.config", {
+        ...(edit ? { [edit.unlink ? "unlink" : "link"]: { peer: edit.peer, model: edit.mine } } : {}),
+        ...(body.notes !== undefined ? { notes: Object.keys(body.notes as object) } : {}),
+        ...(body.share !== undefined ? { share: shared() } : {}),
+      });
     }
 
     const changed = controls.set({
       lending: body.lending as boolean | undefined,
       borrowing: body.borrowing as boolean | undefined,
     });
-    // Only the transitions. This is a thing a human did to a live system, so
-    // it belongs at info — but a no-op POST should not leave a trail implying
-    // something moved.
-    if (Object.keys(changed).length > 0) log.info("control.changed", changed);
-
-    // Save is its own verb and runs last, so a tried link does not outlive the session unless saved.
-    if (body.save === true) {
-      const to = savesTo();
-      if (to === null) {
-        apiError(
-          res,
-          400,
-          cfg.configPath
-            ? `${cfg.configPath} is not writable, and no stateFile is set — add ReadWritePaths=${cfg.configPath} ` +
-              `to the unit (ProtectSystem=strict makes everything outside WorkingDirectory read-only), ` +
-              `or set stateFile for a sidecar instead`
-            : "this node was not loaded from a config file and has no stateFile, so there is nowhere to save",
-        );
-        return;
-      }
-      if (to === "config") {
-        // The effective list BEFORE the overrides are folded away, since that
-        // is what gets written as `share:`.
-        const effective = [...shared()];
-        try {
-          overrides.saveConfig(effective);
-        } catch (e) {
-          apiError(res, e instanceof ConfigError ? 409 : 500, e instanceof Error ? e.message : String(e));
-          return;
-        }
-        controls.clearShareOverrides();
-        overrides.rebase(effective);
-        // Whatever was in the sidecar is in the config now, and leaving it
-        // would re-apply a stale copy of it over the file on the next start.
-        if (cfg.stateFile) {
-          try {
-            writeState(cfg.stateFile, overrides.pending({}));
-          } catch (e) {
-            log.warn("state.stale", { path: cfg.stateFile, error: String(e) });
-          }
-        }
-        overrides.markSaved(overrides.pending({}));
-        log.info("config.saved", { path: cfg.configPath });
-      } else {
-        const state = overrides.pending(controls.shareOverrides());
-        try {
-          writeState(cfg.stateFile!, state);
-        } catch (e) {
-          // A write that fails must not report success: the operator would
-          // walk away believing a restart is safe.
-          apiError(res, 500, `could not write ${cfg.stateFile}: ${String(e)}`);
-          return;
-        }
-        overrides.markSaved(state);
-        log.info("state.saved", { path: cfg.stateFile });
-      }
+    // Only the transitions; a no-op POST should not leave a trail implying something moved.
+    if (Object.keys(changed).length > 0) {
+      log.info("control.changed", changed);
+      void broadcast();
     }
+    // `save` is accepted and does nothing: every edit above is already in the file.
 
-    json(res, 200, { ...controls.state(), share: shared(), changed, ...overrideView() });
+    json(res, 200, { ...controls.state(), share: shared(), changed, config: config.status() });
     return;
+  }
+
+  /** A config refusal as `{error: {message, path}}`, so a form can put it beside its field. */
+  function failConfig(res: ServerResponse, e: unknown): void {
+    if (e instanceof ConfigRefusal) {
+      json(res, e.status, { error: { message: e.message, type: "invalid_request_error", path: e.path } });
+      return;
+    }
+    fail(res, e);
+  }
+
+  /**
+   * hearth.yaml itself: GET is its text, hash and status; PATCH takes `{baseHash, ops}` or
+   * `{baseHash, text}` (and `dryRun`), writes the file and applies it, or says why not.
+   */
+  async function routeConfig(c: Call): Promise<void> {
+    const { req, res } = c;
+    if (req.method === "GET") {
+      try {
+        json(res, 200, { ...config.text(), ...config.status() });
+      } catch (e) {
+        failConfig(res, e);
+      }
+      return;
+    }
+    try {
+      const body = await readJson(req);
+      const ops = body.ops;
+      if (ops !== undefined && !Array.isArray(ops)) throw new Refusal(400, "ops must be a list of {path, value} or {path, delete: true}");
+      if (body.text !== undefined && typeof body.text !== "string") throw new Refusal(400, "text must be the whole file as a string");
+      const out = config.patch({
+        ...(typeof body.baseHash === "string" ? { baseHash: body.baseHash } : {}),
+        ...(ops ? { ops: ops as never } : {}),
+        ...(typeof body.text === "string" ? { text: body.text } : {}),
+        dryRun: body.dryRun === true,
+      });
+      if (body.dryRun !== true) log.info("config.patched", { hash: out.hash, restartPending: out.restartPending });
+      json(res, 200, { ...out, ...config.status() });
+    } catch (e) {
+      failConfig(res, e);
+    }
   }
 
   async function routeQueue(c: Call): Promise<void> {
@@ -1555,8 +1518,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   /** Requests proxied right now without queueing, counted for the console only; admission is unchanged. */
   let proxySeq = 0;
   const proxying = new Set<{ id: string; backend: string; model: string | null }>();
-  const { uiPayload, overrideView, networkView, savesTo } = createViews({
-    cfg, pool, peers, history, controls, overrides, shared, proxying, writeMode,
+  const { uiPayload, networkView } = createViews({
+    cfg, pool, peers, history, controls, config, shared, proxying, writeMode,
   });
 
   const uiWritable = cfg.uiListen?.control === "key";
@@ -1610,8 +1573,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       pool.start();
       peers.start();
       history.start();
+      config.watch();
     },
     close: async (graceMs = 0) => {
+      config.close();
       peers.stop();
       pool.stop();
       history.stop();

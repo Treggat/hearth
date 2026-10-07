@@ -251,19 +251,13 @@ export function Toggle({ label, on, hint, offHint, ctx, body }: {
 
 /* ---------------------------------------------------------------- models */
 
-/**
- * Whether we lend a model: intent (config plus override), effective (nothing while lending
- * is paused), and drift (intent differs from the file) shown together.
- */
+/** Whether we lend a model: what hearth.yaml says, and whether it is going out while lending is paused. */
 export function ShareToggle({ model, d, ctx }: { model: string; d: UiData; ctx: Ctx }) {
   if (!d.catalog.includes(model)) {
     return <Typography component="span" sx={{ fontFamily: MONO, fontSize: 11, color: "faint" }}>—</Typography>;
   }
-  const ovr = d.controls.models ?? {};
-  const inFile = d.configuredShare.includes(model);
-  const intent = Object.prototype.hasOwnProperty.call(ovr, model) ? ovr[model]! : inFile;
+  const intent = d.configuredShare.includes(model);
   const effective = d.share.includes(model);
-  const drift = intent !== inFile;
   const why = intent
     ? (effective ? "peers may use this model"
                  : "lending is paused, so this is not going out despite being on the list")
@@ -277,10 +271,7 @@ export function ShareToggle({ model, d, ctx }: { model: string; d: UiData; ctx: 
           label={intent ? "lent" : "held"}
           title={`${why} — click to ${intent ? "hold" : "lend"}`}
           ctx={ctx}
-          // Toggling back to what the config says CLEARS the override rather
-          // than pinning the same value by hand, or the pending block keeps
-          // reporting a difference after you put everything back.
-          body={() => ({ share: { [model]: !intent === inFile ? null : !intent } })}
+          body={() => ({ share: { [model]: !intent } })}
         />
       ) : (
         <Tooltip title={why}>
@@ -289,16 +280,11 @@ export function ShareToggle({ model, d, ctx }: { model: string; d: UiData; ctx: 
           }}>{intent ? "lent" : "held"}</Typography>
         </Tooltip>
       )}
-      {drift && (
-        <Tooltip title="not what hearth.yaml says — reverts on restart">
-          <Box component="span" sx={{ color: "warning.main", cursor: "help" }}>*</Box>
-        </Tooltip>
-      )}
     </Row>
   );
 }
 
-/** A model's note: what peers read beside it. Click to edit; Save in the rail keeps it. */
+/** A model's note: what peers read beside it. Click to edit; saving writes it into hearth.yaml. */
 export function NoteEdit({ model, note, ctx }: { model: string; note: string | undefined; ctx: Ctx }) {
   const [draft, setDraft] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -552,54 +538,34 @@ function MapEditor({ n, d, ctx }: { n: Node; d: UiData; ctx: Ctx }) {
   );
 }
 
-/* --------------------------------------------------------------- pending */
+/* ---------------------------------------------------------------- config */
 
-/** Runtime changes not in the config file, with the YAML to make them stick. */
-function Pending({ d, ctx }: { d: UiData; ctx: Ctx }) {
-  const [show, setShow] = useState(false);
-  const ov = d.overrides;
-  if (!ov?.dirty) return null;
-
-  const drift = [...d.share].sort().join(",") !== [...d.configuredShare].sort().join(",");
-  const n = ov.changes.maps.length + ov.changes.routes.length + (ov.changes.notes?.length ?? 0) + (drift ? 1 : 0);
-  const toConfig = ov.savesTo === "config";
-  const fate = !ov.canSave ? "these revert on restart"
-    : ov.unsaved ? "not saved, so a restart discards them"
-    : "saved, and kept across a restart";
-
+/** Where edits land: quiet when saved, amber when a restart is owed, red when the file does not load. */
+function ConfigState({ d }: { d: UiData }) {
+  const c = d.config;
+  const file = c.path ?? "memory (no config file)";
+  if (c.error) {
+    return (
+      <Box sx={{ mt: 2, p: 1.5, borderRadius: 2, border: "1px solid", borderColor: "error.main" }}>
+        <Typography sx={{ fontFamily: MONO, fontSize: 11, color: "error.main" }}>
+          {file} does not load — still running the last config that did: {c.error}
+        </Typography>
+      </Box>
+    );
+  }
+  if (c.restartPending.length > 0) {
+    return (
+      <Box sx={{ mt: 2, p: 1.5, borderRadius: 2, border: "1px solid", borderColor: "warning.main" }}>
+        <Typography sx={{ fontFamily: MONO, fontSize: 11, color: "warning.main" }}>
+          saved to {file}; restart hearth to apply {c.restartPending.join(", ")}
+        </Typography>
+      </Box>
+    );
+  }
   return (
-    <Box sx={{
-      mt: 2, p: 1.5, borderRadius: 2, border: "1px solid", borderColor: "warning.main",
-      bgcolor: "background.default",
-    }}>
-      <Typography sx={{ fontFamily: MONO, fontSize: 11, color: "warning.main", mb: 1 }}>
-        {n} runtime change{n === 1 ? "" : "s"} not in the config file — {fate}
-      </Typography>
-      {ctx.canWarm && ov.canSave && ov.unsaved && (
-        <Action full tone="primary"
-                label={toConfig ? "save to config" : "save"}
-                title={toConfig
-                  ? `write these into ${ov.savePath ?? "the config file"}, comments and all`
-                  : `keep these across a restart in ${ov.savePath ?? "the state file"}`}
-                ctx={ctx} body={() => ({ save: true })} />
-      )}
-      <Button onClick={() => setShow((s) => !s)} sx={{ mt: 1 }}>
-        {show ? "hide" : "show"} the config
-      </Button>
-      {show && (
-        <>
-          <Pre>{ov.yaml}</Pre>
-          <Why>
-            {toConfig
-              ? "Save writes these into the config file itself, comments intact, and this block goes away — the file becomes the record again."
-              : ov.canSave
-                ? "Save keeps these on this box. Pasting puts them where the rest of the config lives — each block replaces the one it names."
-                : "Paste into hearth.yaml to keep them. Each block replaces the one it names."}
-          </Why>
-          <CopyButton text={ov.yaml} />
-        </>
-      )}
-    </Box>
+    <Typography sx={{ mt: 2, fontFamily: MONO, fontSize: 11, color: "text.secondary" }}>
+      every change saves to {file}{c.savedAt ? ` · last ${new Date(c.savedAt).toLocaleTimeString()}` : ""}
+    </Typography>
   );
 }
 
@@ -637,7 +603,7 @@ export function SelfPanel({ d, ctx }: { d: UiData; ctx: Ctx }) {
                      warm={d.net.readyNow.includes(m)} peer={null} />
         ))}
       </FieldGroup>
-      <Pending d={d} ctx={ctx} />
+      <ConfigState d={d} />
     </>
   );
 }
@@ -846,7 +812,7 @@ export function ResourcePanel({ name, d }: { name: string; d: UiData }) {
 }
 
 /** Nothing selected: the vitals, and what to click. */
-function Overview({ d, ctx }: { d: UiData; ctx: Ctx }) {
+function Overview({ d }: { d: UiData }) {
   const self = d.net.nodes.find((n) => n.self);
   return (
     <>
@@ -856,10 +822,10 @@ function Overview({ d, ctx }: { d: UiData; ctx: Ctx }) {
       </Box>
       <Typography sx={{ fontSize: 11, color: "faint", lineHeight: 1.7 }}>
         Click anything above to act on it. The self node holds the federation switches
-        and any unsaved runtime changes; a peer holds its model links; a backend holds
+        and where config edits are saved; a peer holds its model links; a backend holds
         its models and what it is loaded with; a card says who is standing on it.
       </Typography>
-      <Pending d={d} ctx={ctx} />
+      <ConfigState d={d} />
     </>
   );
 }
@@ -935,7 +901,7 @@ export function Inspector({ d, sel, ctx, onSelect }: {
     : peer ? <PeerPanel n={peer} d={d} ctx={ctx} />
     : backend ? <BackendPanel b={backend} d={d} ctx={ctx} />
     : card ? <ResourcePanel name={card.name} d={d} />
-    : <Overview d={d} ctx={ctx} />;
+    : <Overview d={d} />;
 
   return (
     <Box sx={{

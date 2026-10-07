@@ -176,15 +176,15 @@ export interface Call {
   ok: boolean;
 }
 
-export interface Overrides {
-  dirty: boolean;
-  changes: { maps: unknown[]; routes: unknown[]; notes?: unknown[] };
-  canSave: boolean;
-  savesTo: "config" | "state" | null;
-  savePath: string | null;
-  /** Distinct from `dirty`: "will not survive a restart", not "not in the file". */
-  unsaved: boolean;
-  yaml: string;
+/** hearth.yaml: where every edit lands, and what is waiting on a restart. */
+export interface ConfigStatus {
+  /** Null for a node built in code, whose edits live in memory only. */
+  path: string | null;
+  hash: string;
+  savedAt: string | null;
+  restartPending: string[];
+  /** Why the file on disk does not load; the node keeps running the last good config. */
+  error: string | null;
 }
 
 /** Where a request for one id may go, and whether it can fall back home if the peer cannot take it. */
@@ -201,8 +201,6 @@ export interface Routing {
 export interface Controls {
   lending: boolean;
   borrowing: boolean;
-  /** Per-model lending overrides. Absent key means "whatever the file says". */
-  models?: Record<string, boolean>;
 }
 
 export interface UiData {
@@ -213,11 +211,11 @@ export interface UiData {
   controls: Controls;
   /** What is going out right now. */
   share: string[];
-  /** What the file says. */
+  /** What hearth.yaml lends, whether or not lending is paused. */
   configuredShare: string[];
   /** What we could lend at all. */
   catalog: string[];
-  overrides: Overrides;
+  config: ConfigStatus;
   net: Net;
   q: { jobs: Job[]; capacity: Capacity };
   hist: Sample[];
