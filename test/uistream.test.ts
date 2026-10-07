@@ -84,7 +84,7 @@ const s = await listen(`${base}/ui/events`);
 {
   const first = await s.next(1);
   assert.equal(first!.event, "snapshot", "a stream opens with everything, so the page can draw at once");
-  for (const k of ["net", "q", "hist", "catalog", "overrides", "controls", "histKeep"]) {
+  for (const k of ["net", "q", "hist", "catalog", "config", "controls", "histKeep"]) {
     assert.ok(k in first!.data, `snapshot carries ${k}`);
   }
   assert.equal(first!.data.canWarm, true, "and the socket's own capability, which no patch repeats");

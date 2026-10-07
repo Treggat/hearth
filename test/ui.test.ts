@@ -204,8 +204,9 @@ const base = await new Promise<string>((ready) =>
   assert.match(html, /you have not mapped, so nothing can route to them/,
     "the page must still render unmapped peer models, and say what it means in words");
   assert.match(html, /peers may use this model/, "the sharing toggle must survive");
-  assert.match(html, /not in the config file/,
-    "and the record of what is not in the file");
+  assert.match(html, /every change saves to/,
+    "and the page says where edits land, since there is no save step to tell you");
+  assert.match(html, /restart hearth to apply/, "and what is waiting on a restart");
   assert.ok(!html.includes("secret-key"), "no credential may appear in the page");
 
   // Two views, both offered at once, the choice remembered per browser. Pinned

@@ -59,7 +59,7 @@ import { createNode } from "../src/server.js";
     backends: [{ name: "sd", url, kind: "none", serves: ["sd"], routes: ["/render"] }],
   });
   const node = createNode(cfg, silentLogger);
-  // What overrides never edits is fixed once the node exists, so a stray write fails loudly.
+  // What only a restart changes is fixed once the node exists, so a stray write fails loudly.
   assert.throws(() => { cfg.scheduler.maxPerCaller = 9; }, TypeError);
   assert.throws(() => { cfg.backends[0]!.url = "x"; }, TypeError);
   await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));

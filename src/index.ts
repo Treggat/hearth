@@ -20,3 +20,5 @@ export { decide } from "./route.js";
 export type { Decision, LocalLoad } from "./route.js";
 export { createLogger, silentLogger } from "./log.js";
 export type { Logger, Level } from "./log.js";
+export { ConfigFile, ConfigRefusal } from "./configfile.js";
+export type { ConfigOp, ConfigStatus, CommitResult } from "./configfile.js";

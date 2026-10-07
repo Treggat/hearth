@@ -20,7 +20,7 @@ import type { AddressInfo } from "node:net";
 import { parseConfig } from "../src/config.js";
 import { Controls } from "../src/controls.js";
 import { silentLogger } from "../src/log.js";
-import { Overrides } from "../src/overrides.js";
+import { link, setShare, unlink } from "../src/configfile.js";
 import { decide } from "../src/route.js";
 import { createNode } from "../src/server.js";
 
@@ -28,23 +28,17 @@ import { createNode } from "../src/server.js";
 
 {
   const c = new Controls();
-  assert.deepEqual(c.share(["a", "b"]), ["a", "b"], "no overrides means the config decides");
-
-  c.setShare("a", false);
-  assert.deepEqual(c.share(["a", "b"]), ["b"], "withholding one leaves the rest");
-
-  c.setShare("c", true);
-  assert.deepEqual(c.share(["a", "b"]).slice().sort(), ["b", "c"],
-    "and something the config never listed can be lent");
-
-  // The third state is the point of the Map. Without it, un-withholding would
-  // have to guess whether to add the model back to the list.
-  c.setShare("a", null);
-  assert.deepEqual(c.share(["a", "b"]).slice().sort(), ["a", "b", "c"], "null hands it back");
-
+  assert.deepEqual(c.share(["a", "b"]), ["a", "b"], "the config decides");
   c.set({ lending: false });
-  assert.deepEqual(c.share(["a", "b"]), [],
-    "the master switch still wins — a per-model yes must not survive a pause");
+  assert.deepEqual(c.share(["a", "b"]), [], "the master switch wins: a pause lends nothing");
+
+  // Per-model lending edits share: itself, keeping the file's order and appending new ids.
+  const cfg = parseConfig({ name: "me", backend: { url: "http://127.0.0.1:1", serves: ["a", "b", "c"] }, share: ["a", "b"] });
+  setShare(cfg, "a", false);
+  assert.deepEqual(cfg.share, ["b"], "withholding one leaves the rest");
+  setShare(cfg, "c", true);
+  setShare(cfg, "a", true);
+  assert.deepEqual(cfg.share, ["b", "c", "a"], "and lending appends");
 }
 
 {
@@ -55,7 +49,6 @@ import { createNode } from "../src/server.js";
     backend: { url: "http://127.0.0.1:1", serves: ["local-only"], kind: "none" },
     peers: [{ name: "friend", url: "http://127.0.0.1:2", token: "t", models: { known: "known" } }],
   });
-  const ov = new Overrides(cfg);
   const peers = {
     candidates: (m: string, named: string[]) =>
       cfg.peers.filter((p) => p.models[m] && (!named.length || named.includes(p.name))).map((p) => p.name),
@@ -65,7 +58,7 @@ import { createNode } from "../src/server.js";
   assert.equal(decide("theirs", cfg, peers, { queued: 0, free: 1, slots: 1, loaded: [] }).target,
     "local", "unmapped and unrouted, so it stays home");
 
-  ov.link("friend", "theirs", "their-name", "peer", false);
+  link(cfg, "friend", "theirs", "their-name", "peer", false);
   const after = decide("theirs", cfg, peers, { queued: 0, free: 1, slots: 1, loaded: [] });
   assert.equal(after.target, "peer", "a link must route, not just map");
   assert.equal(after.target === "peer" && after.theirModel, "their-name",
@@ -74,10 +67,10 @@ import { createNode } from "../src/server.js";
   // An existing route that names its peers is an operator being specific.
   // Widening it to everyone would send work to boxes they left out.
   cfg.models.pinned = { backend: null, as: null, follow: false, policy: "peer", peers: ["friend"], spilloverAt: 1, fallbackLocal: true, concurrency: null, params: null, lane: null, stats: null, emulate: null, pool: null };
-  ov.link("friend", "pinned", "pinned", "peer", true);
+  link(cfg, "friend", "pinned", "pinned", "peer", true);
   assert.deepEqual(cfg.models.pinned!.peers, ["friend"], "an existing peer list is kept");
 
-  assert.throws(() => ov.link("nobody", "x", "x", "peer", false), /not a configured peer/,
+  assert.throws(() => link(cfg, "nobody", "x", "x", "peer", false), /not a configured peer/,
     "peers are added in the file, not here");
 
   // A route that NAMES its peers, with two peers mapping the model. Testing
@@ -94,8 +87,7 @@ import { createNode } from "../src/server.js";
       ],
       models: { shared: { policy: "peer", peers: ["a"] } },
     });
-    const o = new Overrides(two);
-    o.unlink("a", "shared");
+    unlink(two, "a", "shared");
     assert.equal(two.models.shared, undefined,
       "the route named only the peer we unlinked, so it is retired");
     assert.equal(two.peers[1]!.models.shared, "shared", "the other peer keeps its mapping");
@@ -113,7 +105,7 @@ import { createNode } from "../src/server.js";
       ],
       models: { shared: { policy: "peer", peers: ["a", "b"] } },
     });
-    new Overrides(three).unlink("a", "shared");
+    unlink(three, "a", "shared");
     assert.deepEqual(three.models.shared!.peers, ["b"], "only the unlinked peer comes out");
   }
 
@@ -130,7 +122,7 @@ import { createNode } from "../src/server.js";
       peers: [{ name: "a", url: "http://127.0.0.1:2", token: "t", models: { "vllm-model": "theirs" } }],
       models: { "vllm-model": { policy: "peer", backend: "gpu", batch: 32 } },
     });
-    new Overrides(rich).unlink("a", "vllm-model");
+    unlink(rich, "a", "vllm-model");
     assert.equal(rich.models["vllm-model"]!.policy, "local", "it stops going away");
     assert.equal(rich.models["vllm-model"]!.concurrency, 32, "and keeps what was never about the peer");
     assert.equal(rich.models["vllm-model"]!.backend, "gpu");
@@ -146,7 +138,7 @@ import { createNode } from "../src/server.js";
       peers: [{ name: "a", url: "http://127.0.0.1:2", token: "t", models: { small: "theirs" } }],
       models: { small: { policy: "peer", stats: { context: 4096 } } },
     });
-    new Overrides(declared).unlink("a", "small");
+    unlink(declared, "a", "small");
     assert.equal(declared.models.small!.policy, "local");
     assert.equal(declared.models.small!.stats?.context, 4096, "the declared window survives an unlink");
   }
@@ -155,15 +147,11 @@ import { createNode } from "../src/server.js";
   // second is the important half: rewriting the operator's stated intent would
   // make the file on disk and the config in memory disagree about something
   // nobody changed.
-  ov.unlink("friend", "theirs");
+  unlink(cfg, "friend", "theirs");
   assert.equal(cfg.models.theirs, undefined, "our own route goes with the mapping");
-  ov.unlink("friend", "known");
+  unlink(cfg, "friend", "known");
   assert.equal(cfg.peers[0]!.models.known, undefined, "a file mapping can still be removed");
 
-  const y = ov.yaml(["local-only"], ["local-only"]);
-  assert.match(y, /peers\[name: friend\]/, "the snippet says where each block goes");
-  assert.ok(!y.includes("share:"), "and says nothing about share when share did not change");
-  assert.equal(ov.dirty(), true);
 }
 
 /* ----------------------------------------------------- and through HTTP */
@@ -234,8 +222,8 @@ const advertised = async () => {
   const bad = await control({ share: { nonexistent: true } });
   assert.equal(bad.status, 400, "lending something we cannot serve is refused");
 
-  assert.equal((await control({ share: { mine: null, spare: null } })).status, 200);
-  assert.deepEqual(await advertised(), ["mine"], "clearing both returns to the file");
+  assert.equal((await control({ share: { mine: true, spare: false } })).status, 200);
+  assert.deepEqual(await advertised(), ["mine"], "and both edits can be put back");
 }
 
 {
@@ -253,10 +241,9 @@ const advertised = async () => {
 {
   const r = await control({ link: { peer: "friend", mine: "new-thing", theirs: "their-thing" } });
   assert.equal(r.status, 200);
-  const d = (await r.json()) as { dirty: boolean; yaml: string; changes: { maps: unknown[] } };
-  assert.equal(d.dirty, true);
-  assert.equal(d.changes.maps.length, 1);
-  assert.match(d.yaml, /new-thing: their-thing/, "the reply carries the config to keep it");
+  const d = (await r.json()) as { config: { path: string | null; restartPending: string[] } };
+  assert.equal(d.config.path, null, "a node built in code keeps edits in memory, and says so");
+  assert.deepEqual(d.config.restartPending, [], "a link applies live");
 
   const net = await (await fetch(`${url}/network`)).json() as {
     nodes: { self: boolean; map?: Record<string, string> }[];
@@ -273,8 +260,8 @@ const advertised = async () => {
   assert.equal(both.status, 400, "link and unlink together is a mistake, not a merge");
 
   assert.equal((await control({ unlink: { peer: "friend", mine: "new-thing" } })).status, 200);
-  const back = (await (await control({})).json()) as { dirty: boolean };
-  assert.equal(back.dirty, false, "and taking it back leaves nothing pending");
+  const after = await (await fetch(`${url}/network`)).json() as { nodes: { self: boolean; map?: Record<string, string> }[] };
+  assert.equal(after.nodes.find((n) => !n.self)!.map!["new-thing"], undefined, "and taking it back removes it");
 }
 
 await node.close();

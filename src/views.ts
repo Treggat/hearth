@@ -2,12 +2,10 @@
  * The read model: what /network, /control and the status page show, derived from live state
  * per call. Its only effects are freshening peers and sampling declared activity for the page.
  */
-import { accessSync, constants as fsConstants } from "node:fs";
-
 import type { HearthConfig, RoutePolicy } from "./config.js";
 import type { Controls } from "./controls.js";
 import { KEEP, type History } from "./history.js";
-import type { Overrides } from "./overrides.js";
+import type { ConfigFile } from "./configfile.js";
 import type { PeerRegistry } from "./peers.js";
 import type { BackendPool } from "./pool.js";
 import type { ModelStats } from "./stats.js";
@@ -18,7 +16,7 @@ export interface ViewDeps {
   peers: PeerRegistry;
   history: History;
   controls: Controls;
-  overrides: Overrides;
+  config: ConfigFile;
   /** What we lend right now. */
   shared: () => readonly string[];
   /** Requests proxied right now without queueing. */
@@ -27,7 +25,7 @@ export interface ViewDeps {
   writeMode: () => "open" | "key";
 }
 
-export function createViews({ cfg, pool, peers, history, controls, overrides, shared, proxying, writeMode }: ViewDeps) {
+export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode }: ViewDeps) {
   /**
    * Everything the page draws, shared by /ui/data and the event stream. `canWarm` is whether this
    * socket can perform actions. Uses ensureFresh, never probeAll.
@@ -46,6 +44,8 @@ export function createViews({ cfg, pool, peers, history, controls, overrides, sh
       // What the sharing and mapping controls need, sent to the read-only listener too.
       share: shared(),
       configuredShare: cfg.share,
+      // Where every edit lands, and what is waiting on a restart; replaces the old pending-changes block.
+      config: config.status(),
       catalog: pool.catalog(),
       contexts: (() => {
         const out: Record<string, number> = {};
@@ -59,7 +59,6 @@ export function createViews({ cfg, pool, peers, history, controls, overrides, sh
       aliases: aliasView(),
       // Where each id may go, and whether it falls back home.
       routing: routingView(),
-      overrides: overrideView(),
       net: networkView(),
       q: {
         jobs: pool.jobs(),
@@ -76,43 +75,6 @@ export function createViews({ cfg, pool, peers, history, controls, overrides, sh
       // time and the page trims to this, so its history stays the same length
       // as ours instead of growing for as long as the tab is open.
       histKeep: KEEP,
-    };
-  }
-
-  function savesTo(): "config" | "state" | null {
-    if (cfg.configPath) {
-      try {
-        accessSync(cfg.configPath, fsConstants.W_OK);
-        return "config";
-      } catch {
-        // Read-only, or not ours. Fall through to the sidecar.
-      }
-    }
-    return cfg.stateFile ? "state" : null;
-  }
-
-  /** Runtime changes not in the file, with the YAML to paste; shared by /control and /ui/data. */
-  function overrideView() {
-    const changes = overrides.changes();
-    const dirty =
-      changes.maps.length > 0 ||
-      changes.routes.length > 0 ||
-      changes.notes.length > 0 ||
-      [...shared()].sort().join(",") !== [...cfg.share].sort().join(",");
-    return {
-      changes,
-      dirty,
-      // `dirty` is not in hearth.yaml; `unsaved` will not survive a restart.
-      canSave: savesTo() !== null,
-      savesTo: savesTo(),
-      // Named, not left to be discovered. "Saved" is a claim about a specific
-      // file and the operator should not have to guess which one.
-      savePath: savesTo() === "config" ? cfg.configPath : savesTo() === "state" ? cfg.stateFile : null,
-      // Only meaningful for the sidecar. A config save leaves nothing behind:
-      // the file IS the record, so `dirty` goes false and the whole block goes
-      // away rather than sitting there asking to be dealt with.
-      unsaved: savesTo() !== null && overrides.unsaved(controls.shareOverrides()),
-      yaml: dirty ? overrides.yaml(shared(), cfg.share) : "",
     };
   }
 
@@ -313,5 +275,5 @@ export function createViews({ cfg, pool, peers, history, controls, overrides, sh
     };
   }
 
-  return { uiPayload, overrideView, networkView, savesTo };
+  return { uiPayload, networkView };
 }

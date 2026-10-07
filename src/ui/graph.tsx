@@ -511,7 +511,7 @@ export function Graph({ d, sel, onSelect }: {
                        selected={sel?.kind === "self"}
                        dim={dimmed("self")} onHover={(on) => setHover(on ? "self" : null)}
                        onSelect={() => onSelect({ kind: "self" })}
-                       title="this node — click for federation switches and unsaved runtime changes">
+                       title="this node — click for federation switches and config status">
                 <Head name={self?.name ?? "this node"}
                       right={<Typography component="span" sx={{ fontFamily: MONO, fontSize: 10, color: "faint" }}>self</Typography>} />
                 <Sub>{running} running · {queued} queued{d.q.capacity.offbox ? ` · ${d.q.capacity.offbox} off-box` : ""}</Sub>

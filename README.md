@@ -126,7 +126,7 @@ Every key with its default. Only `backend.url` is required.
 | `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them, which is what it used to do |
 | `peers` | `[]` | nodes you can send work to |
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
-| `stateFile` | `null` | fallback for Save when the config file itself cannot be written. Null unless you need it |
+| `stateFile` | `null` | a sidecar from earlier versions. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 | `models.<id>.follow` | `false` | go out as whatever the pinned backend has loaded, and as `as` when nothing is (or when `as` is among several loaded). Needs `backend` and `as`. It follows any model, a non-chat one included, so pin it to a backend that serves one kind |
 | `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. `batch` is the older name for it. See below |
 | `models.<id>.videoTokens` | `49152` | what one video costs this model when checking a request fits its context window. Size it from the seat: frames sampled per clip × tokens per frame |
@@ -183,6 +183,7 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 |---|---|---|
 | `/ui` | loopback | the status page: queue history, which model was loaded when, what you are lending, and what each peer offers |
 | `/control` | local | read or change what leaves this node: lending, borrowing, per-model sharing, peer model maps |
+| `/config` | local | the config file itself: `GET` its text and status, `PATCH` paths or the whole text |
 | `/network` | local | every node, what each one serves, and what's **loaded right now**. Also lists peer models you haven't mapped, which is usually the config mistake people actually make |
 | `/queue` | local | jobs in flight, with lane, caller and position |
 | `/ui/events` | same as `/ui` | the page's data, pushed. A snapshot then diffs |
@@ -406,44 +407,40 @@ Three of those are clickable on the main listener, and every one of them is a
   one you do not gets `policy: peer` and no fallback, since home is a backend
   that has never heard of it.
 
-A **runtime changes** block appears under the node list whenever anything
-differs from the file, listing what changed and handing you the YAML to paste.
-By default that is the only way to keep a change: nothing is written to disk,
-`hearth.yaml` stays the whole story, and a restart is a reset.
+### Where changes go
 
-### Keeping a change
-
-Press **Save** and the change is written into your config file — the same one
-you edited to set the node up, comments and layout intact. One exception, and
-it is the honest one: **deleting** a route or a mapping takes its comments with
-it, because they belong to the thing being deleted. If a comment there is
-reasoning you want to keep, move it before you unlink. The runtime-changes
-block then disappears, because there is nothing left to report: the file says
-what the node is doing, which is the only arrangement where those two never
-drift apart.
-
-Not everything should be saved, and that is what the button is for. Holding a
-model back for an hour while a friend rebuilds is not a config change; leave it
-unsaved and a restart puts it back. Only what you press Save on becomes
-permanent.
+`hearth.yaml` is the only config state. Every change from the console or the API
+is written into that file as it is made — comments and layout intact — and the
+running node follows the file. There is no save step and nothing to sync.
 
 Unlinking a peer's last model is fine, and so is a peer that maps nothing —
 that is simply the state between deciding to trust someone and deciding what to
 borrow. Their url, token and your notes stay where they are, and the console
-still lists everything they serve, so borrowing again is a click.
+still lists everything they serve, so borrowing again is a click. **Deleting** a
+route or a mapping takes its comments with it, because they belong to the thing
+being deleted.
 
-The write refuses rather than damages, in three cases:
+Most of the config applies as soon as it is written: models and routes, sharing,
+notes, peers' model maps, api keys and peer tokens, and the deadlines and limits
+read per request. The rest — listen addresses, backends, resources, lanes, and
+adding or changing a peer — is written immediately but takes effect on the next
+restart, and the console lists those keys until then.
 
-- the file has changed on disk since hearth started, so somebody edited it in
-  another window and saving would overwrite them
-- the result fails validation — checked against the edited document before the
-  file is touched, so a bad edit is a message now rather than a node that will
-  not come back at the next restart
+Hand edits work the same way. hearth watches the file and loads an edit as soon
+as it is saved; an edit that does not load is reported with the reason, and the
+node keeps running the last config that did. A change from the console always
+builds on the file as it is on disk, so it never overwrites an edit made in an
+editor.
+
+A write is refused, and the file left untouched, when:
+
+- the result fails validation — the error names the field
 - the file is not writable
+- with `PATCH /config`, the part being edited changed on disk since it was read
 
-Under `ProtectSystem=strict` that last one is the default, so the unit needs to
-say the config is writable — and must not also say the opposite, which is easy
-to miss because both lines look like hardening:
+Under `ProtectSystem=strict` the unit needs to say the config is writable — and
+must not also say the opposite, which is easy to miss because both lines look
+like hardening:
 
 ```ini
 ReadWritePaths=/etc/hearth.yaml
@@ -454,15 +451,27 @@ ReadOnlyPaths=/opt/hearth /etc/hearth.env   # NOT the config as well
 be writable, not `/etc` — hearth writes in place when it cannot stage a temp
 file beside the config, which is exactly what that pairing produces.
 
-If it genuinely cannot be written — a read-only bind mount in a container is the
-usual reason — set `stateFile` and Save falls back to a sidecar of deltas
-applied over the config at startup. It is a worse arrangement and it is meant to
-be a fallback: two files describing one node, and a page that has to keep
-explaining which is which. An entry there says "lend this", "do not lend this"
-or "this maps to that", and anything absent is left to the config — storing the
-whole picture is how an edit to the YAML silently stops working months later. A
-corrupt sidecar logs a warning and starts from the config, because losing a
-preference should not be an outage.
+Pausing lending or borrowing is operational rather than config: it applies at
+once and a restart clears it.
+
+### Editing the file over HTTP
+
+`GET /config` returns the file's text, a `hash`, and its status: `restartPending`
+and, if the file on disk does not load, `error`. `PATCH /config` edits it:
+
+```bash
+# set or delete paths; anything the edit did not touch may have changed meanwhile
+curl -X PATCH localhost:4141/config -H 'content-type: application/json' \
+  -d '{"baseHash": "<hash>", "ops": [{"path": ["backendIdleMs"], "value": 300000}]}'
+
+# replace the whole file; refused with 409 unless baseHash is current
+curl -X PATCH localhost:4141/config -H 'content-type: application/json' \
+  -d '{"baseHash": "<hash>", "text": "..."}'
+```
+
+Add `"dryRun": true` to see the resulting text without writing it. A refusal is
+`{"error": {"message", "path"}}`: 422 for a config that would not load (with the
+field), 409 for a conflict.
 
 The ui-only listener serves the page **without** these controls unless you set
 `uiListen.control: key`. It still states every fact, including the ones you
@@ -1045,12 +1054,11 @@ notes:
 ```
 
 Both blocks can also be edited from `/ui` or `curl` while it runs, which is
-usually how they get written in the first place — try the link, watch a request
-land on their box, then paste the YAML the page gives you. Changes are live
-immediately and gone on restart:
+usually how they get written in the first place. Each change is live at once and
+written into the config:
 
 ```bash
-# hold one model back without pausing the rest; null hands it back to the config
+# hold one model back without pausing the rest
 curl -X POST localhost:4141/control -H 'content-type: application/json' \
   -d '{"share": {"big-model": false}}'
 
@@ -1063,9 +1071,9 @@ curl -X POST localhost:4141/control -H 'content-type: application/json' \
   -d '{"unlink": {"peer": "friend", "mine": "coder"}}'
 ```
 
-`GET /control` reports the current state, what differs from the file, and that
-same paste-ready YAML. New **peers** are still config-only: a token and a URL
-are a trust decision, and the map is only what you do with one you already have.
+`GET /control` reports the current state and where edits are saved. Adding a
+**peer** is an edit to `peers:` and applies on restart: a token and a URL are a
+trust decision, and the map is only what you do with one you already have.
 
 Peers exchange capacity **per model** rather than per node, because a node with
 several backends can be flat out on its GPU and completely idle on the queue that
@@ -1231,12 +1239,10 @@ RestartSec=5
 TimeoutStopSec=45
 ```
 
-`ReadWritePaths=` is what lets the console's Save button write your config.
+`ReadWritePaths=` is what lets console edits write your config.
 `ProtectSystem=strict` leaves nothing outside `WorkingDirectory` writable, so
-without it Save refuses with a message naming this line. Leave it out if you
-would rather the config were only ever edited by hand — the page still shows
-what changed and still hands you the YAML. (If you use `stateFile` instead, it
-wants `StateDirectory=hearth` for the same reason.)
+without it every edit is refused with a message saying the file is not writable.
+Leave it out if you would rather the config were only ever edited by hand.
 
 `--check` validates and exits, so a typo in a peer's model map stops the deploy
 with a readable line. Put the peer tokens in `/etc/hearth.env` and reference
