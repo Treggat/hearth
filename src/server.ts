@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { accessSync, constants as fsConstants } from "node:fs";
 
+import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import {
   ConfigError, WARM_LANE,
   type BackendConfig, type HearthConfig, type RoutePolicy,
@@ -19,7 +20,6 @@ import { PeerRegistry, PeerStatusError } from "./peers.js";
 import { BackendPool, type BackendSlot } from "./pool.js";
 import { decide, type LocalLoad } from "./route.js";
 import { History, KEEP } from "./history.js";
-import { QueueFullError } from "./scheduler.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
 import { UI_HTML } from "./ui.js";
 import { send, type UpstreamResponse } from "./upstream.js";
@@ -59,13 +59,6 @@ function apiError(res: ServerResponse, status: number, message: string, type = "
 
 /** Thrown, not returned, so the caller can answer 413 rather than the 400 an
  *  unparseable body would otherwise get. */
-class BodyTooLargeError extends Error {
-  constructor(public readonly limitBytes: number) {
-    super(`request body exceeds ${limitBytes} bytes`);
-    this.name = "BodyTooLargeError";
-  }
-}
-
 function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -200,6 +193,46 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
   const peerOverLimit = (name: string) => overBudget(peerHits, name, cfg.peerRateLimit);
   const controlOverLimit = (name: string) => overBudget(controlHits, name, CONTROL_LIMIT_PER_HOUR);
+
+  /** The gates every model request passes before it is queued; throws the Refusal. */
+  function admit(c: Call, model: string): void {
+    const refused = admitModel({ model, peer: c.peer, scope: c.models }, {
+      name: cfg.name,
+      shared,
+      // A peer may map an id nothing here serves.
+      unknown: (m) => pool.certainlyUnknown(m) && !peers.all().some((p) => peers.theirModelId(p.name, m) !== undefined)
+        ? pool.catalog().join(", ") || "nothing"
+        : null,
+    });
+    if (refused) throw refused;
+  }
+
+  /** A peer's hourly budget, spent before its body is even read. */
+  function admitPeer(c: Call): void {
+    if (c.peer !== null && peerOverLimit(c.peer)) throw new Refusal(429, "rate capped", "rate_limit_error");
+  }
+
+  /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
+  async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+    const raw = await readBody(req, cfg.maxBodyBytes);
+    try {
+      return JSON.parse(raw.toString()) as Record<string, unknown>;
+    } catch (e) {
+      throw new Refusal(400, `body was not JSON: ${String(e)}`);
+    }
+  }
+
+  /** Answer any failure with its status, or end a response already under way. */
+  function fail(res: ServerResponse, e: unknown): void {
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+    const r = refusalOf(e);
+    // The rest of an oversized body is never read, so the connection cannot be reused.
+    if (e instanceof BodyTooLargeError) res.setHeader("Connection", "close");
+    apiError(res, r.status, r.message, r.type);
+  }
 
   /** Which peer is calling, by token. Null if we don't recognise it. */
   function peerCaller(req: IncomingMessage): string | null {
@@ -347,16 +380,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     if (decision.target === "unavailable") {
       // Refusing is the point. The operator said this can't run here.
       logRequest(t, { model, lane, caller, target: "unavailable" }, false, decision.reason);
-      apiError(
-        res,
-        503,
-        // "none can take it" rather than "none is available": since routing
-        // started reading model stats, a peer can be up, mapped and simply too
-        // small for this request, and the reason in the brackets says so.
-        `${model} runs only on a peer, and none can take it (${decision.reason})`,
-        "server_error",
-      );
-      return;
+      // "none can take it": a peer can be up, mapped and simply too small for this request.
+      throw new Refusal(503, `${model} runs only on a peer, and none can take it (${decision.reason})`, "server_error");
     }
 
     if (decision.target === "local") {
@@ -365,12 +390,11 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       const tooMuch = unfit(pool.statsFor(model), fitted);
       if (tooMuch !== null) {
         logRequest(t, { model, lane, caller, backend: local.name, target: "local" }, false, tooMuch);
-        apiError(res, 400, `${model} ${tooMuch}`, "invalid_request_error");
-        return;
+        throw new Refusal(400, `${model} ${tooMuch}`);
       }
       try {
         await local.scheduler.submit(
-          { lane, model, caller, ...(cfg.scheduler.maxPerCaller > 0 ? { maxPerCaller: cfg.scheduler.maxPerCaller } : {}), signal, tokens: pool.poolTokens(model, fitted) },
+          { lane, model, caller, maxPerCaller: callerCap(null, cfg), signal, tokens: pool.poolTokens(model, fitted) },
           async () => {
             t.startedAt = Date.now();
             await runLocal();
@@ -401,7 +425,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         lane,
         model,
         caller,
-        ...(cfg.scheduler.maxPerCaller > 0 ? { maxPerCaller: cfg.scheduler.maxPerCaller } : {}),
+        maxPerCaller: callerCap(null, cfg),
         // No local slot: this runs on their hardware, not ours.
         offbox: true,
         peer: decision.peer,
@@ -954,38 +978,22 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   // Ask a model to be resident without generating. Queued like any job, since loading one evicts
   // another; best-effort, and nothing reserves it.
   async function routeWarm(c: Call): Promise<void> {
-    const { req, res } = c;
+    try {
+      // A warm spends the GPU, so it meets the same gates as chat.
+      admitPeer(c);
+      const body = await readJson(c.req);
+      const model = typeof body.model === "string" ? body.model : "";
+      admit(c, model);
+      await warm(c, model);
+    } catch (e) {
+      fail(c.res, e);
+    }
+  }
+
+  async function warm(c: Call, model: string): Promise<void> {
+    const { res } = c;
     const fromPeer = c.peer;
     const caller = c.caller;
-    // A peer's warm is rate-limited like any other work it sends.
-    if (fromPeer !== null && peerOverLimit(fromPeer)) {
-      apiError(res, 429, "rate capped", "rate_limit_error");
-      return;
-    }
-
-    let body: Record<string, unknown>;
-    try {
-      body = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
-    } catch (e) {
-      if (e instanceof BodyTooLargeError) {
-        res.setHeader("Connection", "close");
-        apiError(res, 413, e.message, "invalid_request_error");
-        return;
-      }
-      apiError(res, 400, `body was not JSON: ${String(e)}`);
-      return;
-    }
-    const model = typeof body.model === "string" ? body.model : "";
-    if (model === "") {
-      apiError(res, 400, "model is required");
-      return;
-    }
-    if (fromPeer !== null && !shared().includes(model)) {
-      // Same gate as chat: lending is opt-in per model, and a warm is a way
-      // of spending the GPU, so it cannot reach anything you did not offer.
-      apiError(res, 403, `${cfg.name} does not share "${model}"`, "permission_error");
-      return;
-    }
 
     // Same routing question chat asks. Phase 1 implements only the local
     // answer, but asking it here is what makes peer warming a branch of this
@@ -1077,11 +1085,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     let startedAt = 0;
     try {
       await slot.scheduler.submit(
-        {
-          lane: WARM_LANE, model, caller,
-          ...(cfg.scheduler.maxPerCaller > 0 ? { maxPerCaller: cfg.scheduler.maxPerCaller } : {}),
-          signal: ctrl.signal,
-        },
+        { lane: WARM_LANE, model, caller, maxPerCaller: callerCap(fromPeer, cfg), signal: ctrl.signal },
         async () => {
           startedAt = Date.now();
           // A health probe on the model's upstream loads it without generating, within the backend deadline.
@@ -1098,15 +1102,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         },
       );
     } catch (e) {
-      // A full lane is 429, the caller's cue to back off, not a 502.
-      if (e instanceof QueueFullError) {
-        apiError(res, 429, e.message, "rate_limit_error");
-        return;
-      }
-      const msg = e instanceof Error ? e.message : String(e);
-      log.warn("warm.failed", { model, backend: slot.name, error: msg });
-      apiError(res, 502, msg, "server_error");
-      return;
+      const r = refusalOf(e);
+      if (r.status >= 500) log.warn("warm.failed", { model, backend: slot.name, error: r.message });
+      throw r;
     }
     const now = Date.now();
     log.info("warm", { model, backend: slot.name,
@@ -1187,62 +1185,28 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   }
 
   async function routeChat(c: Call): Promise<void> {
-    const { req, res } = c;
+    try {
+      admitPeer(c);
+      const payload = await readJson(c.req);
+      const model = typeof payload.model === "string" ? payload.model : "";
+      admit(c, model);
+      await chat(c, model, payload);
+    } catch (e) {
+      fail(c.res, e);
+    }
+  }
+
+  async function chat(c: Call, model: string, payload: Record<string, unknown>): Promise<void> {
+    const { res } = c;
     // A peer's request gets served here and never routed onward. Two nodes
     // that each prefer the other would otherwise bounce a request back and
     // forth until something gave out.
     const fromPeer = c.peer;
     const caller = c.caller;
-    if (fromPeer !== null && peerOverLimit(fromPeer)) {
-      apiError(res, 429, "rate capped", "rate_limit_error");
-      return;
-    }
-
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse((await readBody(req, cfg.maxBodyBytes)).toString()) as Record<string, unknown>;
-    } catch (e) {
-      if (e instanceof BodyTooLargeError) {
-        res.setHeader("Connection", "close");
-        apiError(res, 413, e.message, "invalid_request_error");
-        return;
-      }
-      apiError(res, 400, `body was not JSON: ${String(e)}`);
-      return;
-    }
-
-    const model = typeof payload.model === "string" ? payload.model : "";
-    if (model === "") {
-      apiError(res, 400, "model is required");
-      return;
-    }
-    if (fromPeer !== null && !shared().includes(model)) {
-      // Lending is opt-in per model, so a peer can't reach anything you
-      // didn't deliberately offer.
-      apiError(res, 403, `${cfg.name} does not share "${model}"`, "permission_error");
-      return;
-    }
-    if (c.models !== null && !c.models.includes(model)) {
-      apiError(res, 403, `this key may not run "${model}"`, "permission_error");
-      return;
-    }
-    // An id nothing here can serve is refused before queueing, unless a peer maps it.
-    if (pool.certainlyUnknown(model)
-        && !peers.all().some((p) => peers.theirModelId(p.name, model) !== undefined)) {
-      apiError(
-        res, 404,
-        `no backend here serves "${model}" (${pool.catalog().join(", ") || "nothing"})`,
-        "invalid_request_error",
-      );
-      return;
-    }
     if (fromPeer !== null) {
       // A borrower's oversized request gets the local path's 4xx before it is queued.
       const why = unfit(pool.statsFor(model), fitOutput(pool.statsFor(model), needsOf(payload, cfg.models[model]?.videoTokens), payload));
-      if (why !== null) {
-        apiError(res, 400, `${model} ${why}`, "invalid_request_error");
-        return;
-      }
+      if (why !== null) throw new Refusal(400, `${model} ${why}`);
     }
 
     // Peers get cfg.peerLane; local callers may send a `lane` (stripped before forwarding); a route's lane wins.
@@ -1260,62 +1224,40 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       if (!res.writableEnded) ctrl.abort();
     });
 
-    try {
-      if (fromPeer !== null) {
-        const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
-        const serving = pool.for(model);
-        // As on the local path: what we relayed to the borrower, so lent
-        // capacity that failed is not filed as lent capacity that worked.
-        let lentStatus = 0;
-        try {
-          await serving.scheduler.submit(
-            // Peers are capped by peerMaxConcurrent per backend, whether or not apiKeys are set.
-            { lane, model, caller, maxPerCaller: cfg.peerMaxConcurrent, signal: ctrl.signal, tokens: pool.poolTokens(model, needsOf(payload, cfg.models[model]?.videoTokens)) },
-            async () => {
-              t.startedAt = Date.now();
-              await serving.state.ensureFresh();
-              // A lent request gets the same id rewrite and params as a local one.
-              lentStatus = await sendLocal(serving.cfg.url, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
-            },
-          );
-        } catch (e) {
-          // Log lent failures too.
-          logRequest(t, { model, lane, target: "local", forPeer: fromPeer }, false, e);
-          throw e;
-        }
-        // Lent capacity is the thing you most want a record of.
-        logRequest(
-          t,
-          { model, lane, target: "local", forPeer: fromPeer,
-            ...(lentStatus >= 400 ? { status: lentStatus } : {}) },
-          lentStatus < 400,
-          lentStatus >= 400 ? `backend answered ${lentStatus}` : undefined,
-        );
-      } else {
-        await dispatch(payload, model, lane, caller, res, ctrl.signal);
-      }
-    } catch (e) {
-      if (res.headersSent) {
-        res.end();
-        return;
-      }
-      if (e instanceof QueueFullError) {
-        apiError(res, 429, e.message, "rate_limit_error");
-        return;
-      }
-      // A peer's refusal keeps its 4xx status; only its 5xx becomes our 502.
-      if (e instanceof PeerStatusError && e.isRefusal) {
-        apiError(
-          res,
-          e.status,
-          e.message,
-          e.status === 429 ? "rate_limit_error" : "invalid_request_error",
-        );
-        return;
-      }
-      apiError(res, 502, e instanceof Error ? e.message : String(e), "server_error");
+    if (fromPeer === null) {
+      await dispatch(payload, model, lane, caller, res, ctrl.signal);
+      return;
     }
-    return;
+
+    const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
+    const serving = pool.for(model);
+    // As on the local path: what we relayed to the borrower, so lent
+    // capacity that failed is not filed as lent capacity that worked.
+    let lentStatus = 0;
+    try {
+      await serving.scheduler.submit(
+        // Peers are capped by peerMaxConcurrent per backend, whether or not apiKeys are set.
+        { lane, model, caller, maxPerCaller: callerCap(fromPeer, cfg), signal: ctrl.signal, tokens: pool.poolTokens(model, needsOf(payload, cfg.models[model]?.videoTokens)) },
+        async () => {
+          t.startedAt = Date.now();
+          await serving.state.ensureFresh();
+          // A lent request gets the same id rewrite and params as a local one.
+          lentStatus = await sendLocal(serving.cfg.url, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
+        },
+      );
+    } catch (e) {
+      // Log lent failures too.
+      logRequest(t, { model, lane, target: "local", forPeer: fromPeer }, false, e);
+      throw e;
+    }
+    // Lent capacity is the thing you most want a record of.
+    logRequest(
+      t,
+      { model, lane, target: "local", forPeer: fromPeer,
+        ...(lentStatus >= 400 ? { status: lentStatus } : {}) },
+      lentStatus < 400,
+      lentStatus >= 400 ? `backend answered ${lentStatus}` : undefined,
+    );
   }
 
   async function routeUi(c: Call): Promise<void> {
@@ -1337,17 +1279,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     const who = c.caller;
     let body: Buffer | undefined;
     try {
-      body =
-        req.method === "GET" || req.method === "HEAD"
-          ? undefined
-          : await readBody(req, cfg.maxBodyBytes);
+      body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req, cfg.maxBodyBytes);
     } catch (e) {
-      if (e instanceof BodyTooLargeError) {
-        res.setHeader("Connection", "close");
-        apiError(res, 413, e.message, "invalid_request_error");
-        return;
-      }
-      throw e;
+      fail(res, e);
+      return;
     }
     // A declared route wins over every heuristic below it, being the only
     // statement here the operator actually made.
@@ -1420,7 +1355,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
         try {
           await target.scheduler.submit(
-            { lane, model, caller: who, signal: ctrl.signal },
+            { lane, model, caller: who, maxPerCaller: callerCap(null, cfg), signal: ctrl.signal },
             async () => {
               t.startedAt = Date.now();
               await proxy();
@@ -1448,19 +1383,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         }
       }
     } catch (e) {
-      // Same reasoning as the warm route: a full lane is the caller's cue to
-      // back off, and dressing it as a 502 makes a client that retries on 429
-      // give up on a queue that just needed a moment.
-      if (e instanceof QueueFullError) {
-        if (!res.headersSent) apiError(res, 429, e.message, "rate_limit_error");
-        else res.end();
-        return;
-      }
-      if (!res.headersSent) {
-        apiError(res, 502, e instanceof Error ? e.message : String(e), "server_error");
-      } else {
-        res.end();
-      }
+      fail(res, e);
     }
   }
 
