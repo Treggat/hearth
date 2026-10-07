@@ -43,6 +43,8 @@ export interface RequestOptions {
   signal?: AbortSignal;
   /** Deadline for response headers only, in ms. Omit for inference; peer polls set a short one. */
   headersTimeoutMs?: number;
+  /** Deadline for silence once the body flows, in ms: a backend that stops sending mid-answer fails. */
+  idleTimeoutMs?: number;
   /** Total deadline for `getJson`, body included. Defaults to 2x the headers
    *  timeout. Does nothing in `send`, which is for streams. */
   totalTimeoutMs?: number;
@@ -84,6 +86,7 @@ export function send(url: string, opts: RequestOptions = {}): Promise<UpstreamRe
       settled = true;
       clearTimeout(headerTimer);
       const status = res.statusCode ?? 0;
+      if (opts.idleTimeoutMs != null) watchIdle(res, opts.idleTimeoutMs);
       resolve({
         ok: status >= 200 && status < 300,
         status,
@@ -156,6 +159,22 @@ export function send(url: string, opts: RequestOptions = {}): Promise<UpstreamRe
     }
 
     req.end(body ?? undefined);
+  });
+}
+
+/** Destroy the body after `ms` with no bytes from the socket; the timer resets on every read. */
+function watchIdle(res: IncomingMessage, ms: number): void {
+  const sock = res.socket;
+  const timer = setTimeout(
+    () => res.destroy(new UpstreamError(`no bytes for ${ms}ms mid-response`)),
+    ms,
+  );
+  // The http parser already reads this socket, so another listener does not change its flow.
+  const bump = () => timer.refresh();
+  sock.on("data", bump);
+  res.once("close", () => {
+    clearTimeout(timer);
+    sock.off("data", bump);
   });
 }
 

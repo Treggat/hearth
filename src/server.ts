@@ -1473,10 +1473,11 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    */
   const writeMode = (): "open" | "key" => (cfg.apiKeys.length === 0 ? "open" : "key");
 
-  /** The first-byte deadline for a local backend: its own `firstByteMs`, else the node default. */
-  const backendDeadline = (b: BackendConfig): { headersTimeoutMs?: number } => {
-    const ms = b.firstByteMs ?? cfg.backendFirstByteMs;
-    return ms > 0 ? { headersTimeoutMs: ms } : {};
+  /** A local backend's deadlines, first byte and mid-answer silence: its own, else the node defaults. */
+  const backendDeadline = (b: BackendConfig): { headersTimeoutMs?: number; idleTimeoutMs?: number } => {
+    const first = b.firstByteMs ?? cfg.backendFirstByteMs;
+    const idle = b.idleMs ?? cfg.backendIdleMs;
+    return { ...(first > 0 ? { headersTimeoutMs: first } : {}), ...(idle > 0 ? { idleTimeoutMs: idle } : {}) };
   };
 
   /**

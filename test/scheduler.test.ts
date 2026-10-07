@@ -159,6 +159,22 @@ function holdSlot(s: Scheduler, order: string[]) {
   assert.deepEqual(order, ["blocker", "offbox", "local"]);
 }
 
+// --- ...nor wait on, or fail with, the local eviction ----------------------
+// The card's eviction belongs to local work; a peer job sharing that tick must not inherit it.
+{
+  const arbiter = new ResourceArbiter();
+  const s = new Scheduler({
+    lanes, resources: ["gpu0"], arbiter,
+    evict: () => new Promise<void>((_, reject) => setTimeout(() => reject(new Error("still loaded")), 50)),
+  });
+  const local = s.submit({ lane: "chat", model: "m", caller: "A" }, async () => "local");
+  const started = Date.now();
+  const remote = await s.submit({ lane: "chat", model: "m", caller: "B", offbox: true }, async () => "offbox");
+  assert.equal(remote, "offbox", "off-box ran despite the failing eviction");
+  assert.ok(Date.now() - started < 40, "and did not wait for it");
+  await assert.rejects(local, /still loaded/, "the local job still fails with the eviction");
+}
+
 // --- ...but still count against the cap ------------------------------------
 // Otherwise "ask for the model that happens to be remote" is a way around the
 // limit that governs every other request.

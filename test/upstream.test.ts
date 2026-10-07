@@ -49,6 +49,13 @@ const server = createServer((req, res) => {
     return;
   }
 
+  if (path === "/stall") {
+    // Headers and one chunk, then silence: a generation hung mid-answer.
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write("data: one\n\n");
+    return;
+  }
+
   if (path === "/slow-headers") {
     setTimeout(() => {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -122,6 +129,25 @@ const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     send(`${base}/slow-headers`, { headersTimeoutMs: 50 }),
     /no response headers in 50ms/,
   );
+}
+
+// --- silence mid-answer fails once a caller opts in ------------------------
+{
+  const up = await send(`${base}/stall`, { idleTimeoutMs: 100 });
+  const read = (async () => { for await (const _ of up.body) { /* drain */ } })();
+  await assert.rejects(read, /no bytes for 100ms/);
+}
+
+// --- ...a steady stream under the deadline is untouched --------------------
+{
+  // /stream's gaps are 60ms, under the 150ms deadline.
+  const up = await send(`${base}/stream`, { idleTimeoutMs: 150 });
+  let text = "";
+  for await (const c of up.body) text += String(c);
+  assert.match(text, /three/);
+  // The same keep-alive socket, reused without a deadline, must not inherit the old timer.
+  const later = await send(`${base}/slow-headers`);
+  assert.deepEqual(JSON.parse(await later.text()), { late: true });
 }
 
 // --- non-2xx keeps its body ------------------------------------------------

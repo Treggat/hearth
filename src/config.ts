@@ -91,6 +91,8 @@ export interface BackendConfig {
    * `backendFirstByteMs`. Size it for the slowest honest reply behind this port.
    */
   firstByteMs: number | null;
+  /** How long this backend may go silent mid-answer, in ms; 0 waits forever. Defaults to `backendIdleMs`. */
+  idleMs: number | null;
   /**
    * Hardware this backend consumes (names are yours), so backends whose sets overlap take
    * turns. Routing is unaffected; empty competes for nothing.
@@ -236,6 +238,11 @@ export interface HearthConfig {
    * backend, which would otherwise hold its slot (and any shared card) until restart.
    */
   backendFirstByteMs: number;
+  /**
+   * How long a local backend may go silent once its answer has started, in ms; 0 waits forever.
+   * Catches a generation that hangs mid-stream, which would otherwise hold its slot and card.
+   */
+  backendIdleMs: number;
   /**
    * How long shutdown waits for in-flight requests, in ms; 0 kills them at once. Keep the
    * service manager's stop timeout above it.
@@ -629,6 +636,9 @@ export function parseConfig(raw: unknown): HearthConfig {
         firstByteMs: entry.firstByteMs === undefined
           ? null
           : atLeast(entry.firstByteMs, `backends[${i}].firstByteMs`, 0),
+        idleMs: entry.idleMs === undefined
+          ? null
+          : atLeast(entry.idleMs, `backends[${i}].idleMs`, 0),
         resources: strList(entry.resources, `backends[${i}].resources`),
         routes: routeList(entry.routes, `backends[${i}].routes`),
         activity: activityDecl(entry.activity, `backends[${i}].activity`),
@@ -670,6 +680,9 @@ export function parseConfig(raw: unknown): HearthConfig {
       firstByteMs: backend.firstByteMs === undefined
         ? null
         : atLeast(backend.firstByteMs, "backend.firstByteMs", 0),
+      idleMs: backend.idleMs === undefined
+        ? null
+        : atLeast(backend.idleMs, "backend.idleMs", 0),
       resources: strList(backend.resources, "backend.resources"),
       routes: routeList(backend.routes, "backend.routes"),
       activity: activityDecl(backend.activity, "backend.activity"),
@@ -946,6 +959,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     // like working peer failover right up until a peer hangs.
     peerFirstByteMs: atLeast(root.peerFirstByteMs, "peerFirstByteMs", 180_000),
     backendFirstByteMs: atLeast(root.backendFirstByteMs, "backendFirstByteMs", 900_000),
+    backendIdleMs: atLeast(root.backendIdleMs, "backendIdleMs", 600_000),
     coldPenalty: atLeast(root.coldPenalty, "coldPenalty", 2),
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.
