@@ -45,6 +45,8 @@ export class BackendState {
   /** Last successful read from this backend, for status surfaces; unlike lastUpdateAt, failures do not stamp it. */
   private lastOkAt = 0;
   private streaming = false;
+  /** The first event-stream attempt has settled, so silence before it is not yet evidence. */
+  private probed = false;
   private stopped = false;
   private attempt = 0;
   private abort: AbortController | null = null;
@@ -169,9 +171,9 @@ export class BackendState {
     return this.streaming;
   }
 
-  /** True where we hold an event stream, the only place silence from a backend means anything. */
+  /** True where we hold an event stream, the only place silence from a backend means anything; never before the first attempt settles. */
   watched(): boolean {
-    return this.useEvents;
+    return this.useEvents && (this.streaming || this.probed);
   }
 
   /** The learned context window for a model, or null if not loaded yet. */
@@ -400,6 +402,7 @@ export class BackendState {
           error: e instanceof Error ? e.message : String(e),
         });
       }
+      this.probed = true;
       this.streaming = false;
       if (this.stopped || !this.useEvents) return;
       const wait = BACKOFF_MS[Math.min(this.attempt, BACKOFF_MS.length - 1)]!;
