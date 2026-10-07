@@ -1158,6 +1158,12 @@ All six come from one `/props` call that already happens the first time a model
 is loaded, so this costs no extra traffic. They appear on `/ui` under **takes**,
 and the window has been on `/v1/models` as `context_length` all along.
 
+Whether a model takes images is there too, as `input_modalities` (`["text", "image"]` or
+`["text"]`), so a client can read what it may send instead of having it set by hand. It
+comes from the same record: the running process's `/props` where it has one, a declared
+`stats.vision` otherwise. A model nobody has spoken for carries no field, which means
+unknown, not text only.
+
 Two rules make it safe to act on:
 
 **A request is measured before it is routed.** Prompt, tool schemas and reserved
