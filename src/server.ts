@@ -634,7 +634,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
     // On the MAIN port the page stays loopback-only. Reaching it from
     // elsewhere is what uiListen is for, and that is a separate socket.
-    { path: ["/ui", "/ui/", "/ui/next", "/ui/data", "/ui/events"], auth: "loopback", envelope: "openai",
+    { path: ["/ui", "/ui/", "/ui/next", "/ui/classic", "/ui/data", "/ui/events"], auth: "loopback", envelope: "openai",
       handler: routeUi },
 
     { path: "*", auth: "local", envelope: "openai", handler: routePassthrough },
@@ -1506,7 +1506,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       json(res, 200, await uiPayload(canWarm));
       return;
     }
-    const html = path === "/ui/next" ? CONSOLE_HTML : UI_HTML;
+    // The 2.0 console everywhere; the previous page stays at /ui/classic for one release.
+    const html = path === "/ui/classic" ? UI_HTML : CONSOLE_HTML;
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Content-Length": Buffer.byteLength(html),
@@ -1525,7 +1526,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
   const uiWritable = cfg.uiListen?.control === "key";
   /** The only paths the standalone listener serves. */
-  const UI_PATHS = new Set(["/ui", "/ui/", "/ui/next", "/ui/data", "/ui/events", "/"]);
+  const UI_PATHS = new Set(["/ui", "/ui/", "/ui/next", "/ui/classic", "/ui/data", "/ui/events", "/"]);
   /** The writes the standalone listener passes through when `uiListen.control` allows; new controls must be added here. */
   const UI_WRITE_PATHS = new Set(["/control", "/v1/warm"]);
   // The status listener: only UI_PATHS (plus UI_WRITE_PATHS behind localCaller), 404 for the rest.
@@ -1555,7 +1556,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           });
           return;
         }
-        void serveUi(path === "/ui/data" || path === "/ui/next" ? path : "/ui", res, uiWritable).catch((e) => {
+        void serveUi(path === "/ui/data" || path === "/ui/classic" ? path : "/ui", res, uiWritable).catch((e) => {
           log.error("ui.failed", { error: e instanceof Error ? e.message : String(e) });
           if (!res.headersSent) json(res, 500, { error: "internal error" });
           else res.end();

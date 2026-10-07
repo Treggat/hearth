@@ -213,7 +213,7 @@ export default function App() {
         ))}
         <div className="mt-auto px-2 text-[11px] text-dim max-md:hidden">
           <div className="mb-2"><kbd className="rounded border border-line px-1">⌘K</kbd> to jump</div>
-          <a href="/ui" className="hover:text-fg">classic console</a>
+          <a href="/ui/classic" className="hover:text-fg">classic console</a>
         </div>
       </nav>
 

@@ -1,5 +1,5 @@
 /**
- * The 2.0 console at /ui/next: one self-contained response behind the page's own gate,
+ * The console at /ui: one self-contained response behind the page's own gate,
  * with its stylesheet and bundle inlined and nothing that renders raw HTML.
  */
 import assert from "node:assert/strict";
@@ -14,7 +14,7 @@ const node = createNode(parseConfig({
   name: "n", apiKeys: ["secret-key"], backend: { url: "http://127.0.0.1:1", kind: "none", serves: ["m"] },
 }), silentLogger);
 await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));
-const r = await fetch(`http://127.0.0.1:${(node.server.address() as AddressInfo).port}/ui/next`);
+const r = await fetch(`http://127.0.0.1:${(node.server.address() as AddressInfo).port}/ui`);
 const html = await r.text();
 assert.equal(r.status, 200);
 assert.match(r.headers.get("content-type") ?? "", /text\/html/);
