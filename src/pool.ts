@@ -95,12 +95,15 @@ export class BackendPool {
           // that fallback, and answering it here would freeze the value.
           slots: (m) => this.slotsOf(m),
           pool: (m) => this.poolOf(m)?.tokens ?? null,
+          // Inherited from the seat an alias fronts, like slots.
+          shareAfter: (m) => this.cfg.models[m]?.shareAfterMs ?? this.cfg.models[this.outboundId(m)]?.shareAfterMs ?? 0,
           // Two ids that resolve to the same resident model ARE the same model
           // to a backend that batches; without this the scheduler sees a
           // foreign job and refuses to run them together.
           wire: (m) => this.outboundId(m),
           // Ollama serves a resident set side by side, so a model's ceiling counts its own jobs.
           coresident: KINDS[b.kind].coresident,
+          onChange: () => { for (const cb of this.jobListeners) cb(); },
           // A resident never takes turns: its own requests neither wait for the card nor evict.
           resources: b.resident ? [] : this.arbitrated(b.resources),
           arbiter: this.arbiter,
@@ -546,6 +549,14 @@ export class BackendPool {
 
   start(): void {
     for (const s of this.slots) s.state.start();
+  }
+
+  private readonly jobListeners = new Set<() => void>();
+
+  /** Called whenever any backend's job list changes: queued, started, finished, or moved in line. */
+  onJobs(cb: () => void): () => void {
+    this.jobListeners.add(cb);
+    return () => this.jobListeners.delete(cb);
   }
 
   stop(): void {

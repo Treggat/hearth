@@ -101,6 +101,7 @@ Every key with its default. Only `backend.url` is required.
 | `scheduler.concurrency` | `1` | default jobs-at-once per backend; a backend can override it |
 | `scheduler.lanes` | `chat`, `batch` | named lanes and their base priority |
 | `scheduler.lanes.<lane>.concurrency` | unset | the most slots of one backend this lane may hold at once. Unset is no ceiling. See Lanes |
+| `scheduler.lanes.<lane>.maxWaitMs` | unset | fail a queued job in this lane with a 503 once nothing on its backend has started for this long. A guard against a wedged backend, not a deadline: a slow queue that keeps moving never trips it |
 | `scheduler.agePerSecond` | `1` | priority earned per second waited, which is also the starvation bound |
 | `scheduler.warmBonus` | `40` | priority discount for a model already loaded |
 | `scheduler.maxPerLane` | `100` | how long one lane's queue may get before new work is refused. Off-box jobs are bounded separately, on their own count |
@@ -129,6 +130,7 @@ Every key with its default. Only `backend.url` is required.
 | `stateFile` | `null` | a sidecar from earlier versions. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 | `models.<id>.follow` | `false` | go out as whatever the pinned backend has loaded, and as `as` when nothing is (or when `as` is among several loaded). Needs `backend` and `as`. It follows any model, a non-chat one included, so pin it to a backend that serves one kind |
 | `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. `batch` is the older name for it. See below |
+| `models.<id>.shareAfterMs` | unset | a turn joins this model's running turns only once each has run this long, so two turns started together do not both pay for sharing the card. Only matters where `concurrency` is above 1 |
 | `models.<id>.videoTokens` | `49152` | what one video costs this model when checking a request fits its context window. Size it from the seat: frames sampled per clip × tokens per frame |
 | `models` | `{}` | routing policy per model. Anything unlisted stays local |
 
@@ -183,6 +185,9 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 |---|---|---|
 | `/ui` | loopback | the console: topology with live request flow, models and sharing, the queue and recent requests, and the config file by section. ⌘K jumps anywhere |
 | `/control` | local | read or change what leaves this node: lending, borrowing, per-model sharing, peer model maps |
+| `/queue/events` | local | the caller's own jobs, pushed over SSE: a `snapshot` on connect, then `jobs` whenever the list changes (queued, started, finished, moved in line). One connection serves every job a client has, so it never needs to poll |
+| `X-Hearth-Job: <id>` | request header | the client's own id for this request (letters, digits, `._:-`, up to 128). It comes back as the job's `id` on `/queue` and `/queue/events`, so a client can match updates to its own work |
+| `X-Hearth-Queue: stream` | request header | on a streamed chat, open the stream while the request waits and send `: hearth-queue {"position":N}` comments (how many are ahead, the running turn included). OpenAI-style parsers skip comments. A failure after that arrives as an SSE `data: {"error": …}` frame, since the 200 is already sent |
 | `/config` | local | the config file itself: `GET` its text and status, `PATCH` paths or the whole text |
 | `/ui/classic` | loopback | the previous console, kept for one release |
 | `/network` | local | every node, what each one serves, and what's **loaded right now**. Also lists peer models you haven't mapped, which is usually the config mistake people actually make |

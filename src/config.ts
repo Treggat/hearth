@@ -147,6 +147,8 @@ export interface ModelRoute {
   emulate: Emulation | null;
   /** Tokens the model's running requests share (vLLM's KV cache, llama.cpp `--kv-unified`); `output` caps each request's counted `max_tokens`, null counts it whole. */
   pool: { tokens: number; output: number | null } | null;
+  /** A turn shares the backend with this model's running turns only once each has run this long; unset never waits. */
+  shareAfterMs?: number;
   /**
    * Jobs this model may run at once locally, overriding the backend's `concurrency` either way:
    * vLLM's --max-num-seqs above it, llama.cpp's --parallel below it. A raise applies only while
@@ -181,7 +183,7 @@ export interface HearthConfig {
     agePerSecond: number;
     warmBonus: number;
     /** `concurrency` is the most of a backend's slots the lane may hold at once; unset is no ceiling. */
-    lanes: Record<string, { priority: number; concurrency?: number }>;
+    lanes: Record<string, { priority: number; concurrency?: number; maxWaitMs?: number }>;
     /** How long one lane's queue may get before we start refusing. Someone told
      *  "full" can retry. Someone queued behind 400 jobs just waits. */
     maxPerLane: number;
@@ -721,13 +723,16 @@ export function parseConfig(raw: unknown): HearthConfig {
   }
 
   const lanesRaw = sched.lanes === undefined ? DEFAULT_LANES : asRecord(sched.lanes, "scheduler.lanes");
-  const lanes: Record<string, { priority: number; concurrency?: number }> = {};
+  const lanes: Record<string, { priority: number; concurrency?: number; maxWaitMs?: number }> = {};
   for (const [lane, v] of Object.entries(lanesRaw)) {
     const entry = asRecord(v, `scheduler.lanes.${lane}`);
     lanes[lane] = { priority: num(entry.priority, `scheduler.lanes.${lane}.priority`, 0) };
     // Left off when unset rather than defaulted: no number here means the lane has no ceiling of its own.
     if (entry.concurrency !== undefined) {
       lanes[lane].concurrency = count(entry.concurrency, `scheduler.lanes.${lane}.concurrency`, 1);
+    }
+    if (entry.maxWaitMs !== undefined) {
+      lanes[lane].maxWaitMs = count(entry.maxWaitMs, `scheduler.lanes.${lane}.maxWaitMs`, 0, 1000);
     }
   }
   // BEFORE the warm lane is added, or `lanes: {}` would quietly become a valid
@@ -861,6 +866,9 @@ export function parseConfig(raw: unknown): HearthConfig {
       emulate: emulate === "" ? null : (emulate as Emulation),
       pool: modelPool(entry.pool, id),
     };
+    if (entry.shareAfterMs !== undefined) {
+      models[id].shareAfterMs = count(entry.shareAfterMs, `models.${id}.shareAfterMs`, 0, 0);
+    }
     if (entry.videoTokens !== undefined) {
       models[id].videoTokens = count(entry.videoTokens, `models.${id}.videoTokens`, 1);
     }

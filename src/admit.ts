@@ -3,7 +3,7 @@
  * scheduler answers "can this start now"; this answers "may it run at all", for every route.
  */
 import { PeerStatusError } from "./peers.js";
-import { QueueFullError } from "./scheduler.js";
+import { QueueFullError, QueueTimeoutError } from "./scheduler.js";
 
 /** A request turned away, with the status and OpenAI error type to answer it with. */
 export class Refusal extends Error {
@@ -68,6 +68,7 @@ export function refusalOf(e: unknown): Refusal {
   if (e instanceof Refusal) return e;
   if (e instanceof BodyTooLargeError) return new Refusal(413, e.message);
   if (e instanceof QueueFullError) return new Refusal(429, e.message, "rate_limit_error");
+  if (e instanceof QueueTimeoutError) return new Refusal(503, e.message, "server_error");
   if (e instanceof PeerStatusError && e.isRefusal) {
     return new Refusal(e.status, e.message, e.status === 429 ? "rate_limit_error" : "invalid_request_error");
   }
