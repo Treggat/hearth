@@ -11,7 +11,7 @@
  */
 import assert from "node:assert/strict";
 
-import { parseConfig } from "../src/config.js";
+import { parseV1 } from "./v1.js";
 
 /** The smallest config that loads, with the canary block under test spliced in. */
 const withCanary = (canary: unknown): Record<string, unknown> => ({
@@ -22,7 +22,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 
 // --- absent means off ------------------------------------------------------
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "c",
     backends: [{ name: "cardb", url: "http://127.0.0.1:9999", kind: "llama-swap" }],
   });
@@ -31,7 +31,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 
 // --- the defaults ----------------------------------------------------------
 {
-  const cfg = parseConfig(withCanary({ models: { "gpu2": {} } }));
+  const cfg = parseV1(withCanary({ models: { "gpu2": {} } }));
   assert.ok(cfg.canary, "a canary block with a model is a canary");
   const d = cfg.canary!.defaults;
   assert.equal(d.expect, "Paris", "the default question is the one from the incident");
@@ -49,7 +49,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 // gpt-oss is a reasoning model: it needs more room than the default, and the
 // override must apply to it alone.
 {
-  const cfg = parseConfig(withCanary({
+  const cfg = parseV1(withCanary({
     maxTokens: 64,
     models: { "gpt-oss": { maxTokens: 1024 }, "gpu2": {} },
   }));
@@ -60,7 +60,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 
 // --- a whole backend at once ------------------------------------------------
 {
-  const cfg = parseConfig(withCanary({ backends: { cardb: { intervalMs: 5_000 } } }));
+  const cfg = parseV1(withCanary({ backends: { cardb: { intervalMs: 5_000 } } }));
   assert.deepEqual(Object.keys(cfg.canary!.backends), ["cardb"]);
   assert.equal(cfg.canary!.backends["cardb"]!.intervalMs, 5_000);
 }
@@ -69,7 +69,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 // A typo here would silently probe nothing, which is the worst outcome.
 {
   assert.throws(
-    () => parseConfig(withCanary({ backends: { cardbb: {} } })),
+    () => parseV1(withCanary({ backends: { cardbb: {} } })),
     /canary\.backends\.cardbb/,
     "an unknown backend name must be refused",
   );
@@ -78,7 +78,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 // --- naming nothing ---------------------------------------------------------
 {
   assert.throws(
-    () => parseConfig(withCanary({ passive: true })),
+    () => parseV1(withCanary({ passive: true })),
     /canary/,
     "a canary that asks no model is a config mistake, not a no-op",
   );
@@ -87,7 +87,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 // --- an expect that will not compile ---------------------------------------
 {
   assert.throws(
-    () => parseConfig(withCanary({ expect: "Par(is", models: { "gpu2": {} } })),
+    () => parseV1(withCanary({ expect: "Par(is", models: { "gpu2": {} } })),
     /canary\.expect/,
     "a bad regex must fail at --check, not inside a probe",
   );
@@ -96,11 +96,11 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 // --- numbers are numbers ---------------------------------------------------
 {
   assert.throws(
-    () => parseConfig(withCanary({ maxTokens: "lots", models: { "gpu2": {} } })),
+    () => parseV1(withCanary({ maxTokens: "lots", models: { "gpu2": {} } })),
     /canary\.maxTokens/,
   );
   assert.throws(
-    () => parseConfig(withCanary({ failureThreshold: 0, models: { "gpu2": {} } })),
+    () => parseV1(withCanary({ failureThreshold: 0, models: { "gpu2": {} } })),
     /canary\.failureThreshold/,
     "a threshold of zero would degrade on the first reading",
   );
@@ -110,7 +110,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 {
   process.env.HEARTH_TEST_KEY = "sekrit";
   try {
-    const cfg = parseConfig(withCanary({
+    const cfg = parseV1(withCanary({
       models: { "gpu2": {} },
       notify: {
         url: "http://192.168.1.3:9876/api/notifications",
@@ -125,7 +125,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
     delete process.env.HEARTH_TEST_KEY;
   }
   assert.throws(
-    () => parseConfig(withCanary({ models: { "gpu2": {} }, notify: { url: "" } })),
+    () => parseV1(withCanary({ models: { "gpu2": {} }, notify: { url: "" } })),
     /canary\.notify\.url/,
   );
 }
@@ -134,18 +134,18 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 // The block IS the flag: naming it turns it on, and `unload: false` is how you
 // say "tell me, but do not touch the seat".
 {
-  const on = parseConfig(withCanary({ models: { "gpu2": {} }, recovery: {} }));
+  const on = parseV1(withCanary({ models: { "gpu2": {} }, recovery: {} }));
   assert.equal(on.canary!.recovery!.unload, true, "declaring recovery: enables it");
   assert.ok(on.canary!.recovery!.cooldownMs > 0, "and it comes with a cooldown");
 
-  const off = parseConfig(withCanary({ models: { "gpu2": {} }, recovery: { unload: false } }));
+  const off = parseV1(withCanary({ models: { "gpu2": {} }, recovery: { unload: false } }));
   assert.equal(off.canary!.recovery!.unload, false);
 
-  const timed = parseConfig(withCanary({ models: { "gpu2": {} }, recovery: { cooldownMs: 60_000 } }));
+  const timed = parseV1(withCanary({ models: { "gpu2": {} }, recovery: { cooldownMs: 60_000 } }));
   assert.equal(timed.canary!.recovery!.cooldownMs, 60_000);
 
   assert.throws(
-    () => parseConfig(withCanary({ models: { "gpu2": {} }, recovery: { cooldownMs: 0 } })),
+    () => parseV1(withCanary({ models: { "gpu2": {} }, recovery: { cooldownMs: 0 } })),
     /canary\.recovery\.cooldownMs/,
     "a zero cooldown would unload the seat on every tick",
   );
@@ -153,7 +153,7 @@ const withCanary = (canary: unknown): Record<string, unknown> => ({
 
 // --- passive is opt-in ------------------------------------------------------
 {
-  const cfg = parseConfig(withCanary({ models: { "gpu2": {} }, passive: true }));
+  const cfg = parseV1(withCanary({ models: { "gpu2": {} }, passive: true }));
   assert.equal(cfg.canary!.passive, true);
 }
 

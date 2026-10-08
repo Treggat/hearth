@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
+import { parseV1 } from "./v1.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 
@@ -110,7 +110,7 @@ const until = async <T>(want: () => Promise<T | null>, ms = 20_000): Promise<T> 
 {
   const swap = fakeSwap();
   const url = await swap.url();
-  const node = createNode(parseConfig({
+  const node = createNode(parseV1({
     name: "mp",
     backends: [{ name: "swap", url, kind: "llama-swap", serves: ["m"] }],
     canary: { models: { m: { intervalMs: 100 } } },
