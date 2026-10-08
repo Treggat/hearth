@@ -299,6 +299,22 @@ export function Config() {
           </Card>
         </div>
       )}
+      {status.path && !file && (
+        <Card className="p-6">
+          {err ? (
+            <div>
+              <div className="text-bad">{err.message}</div>
+              {err.message.includes("status page is served on this port") && (
+                <div className="mt-1 text-[12px] text-dim">
+                  this status port only shows the dashboard — the config editor lives on the node's main port.
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-dim">loading hearth.yaml…</div>
+          )}
+        </Card>
+      )}
       {plan && <Review plan={plan} onClose={() => setPlan(null)} />}
     </div>
   );
