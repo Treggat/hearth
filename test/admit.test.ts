@@ -7,11 +7,11 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "../src/admit.js";
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { PeerStatusError } from "../src/peers.js";
 import { QueueFullError } from "../src/scheduler.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 // --- the model gates, in order -------------------------------------------------------
 {
@@ -52,7 +52,7 @@ import { createNode } from "../src/server.js";
   });
   await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
   const url = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "t",
     apiKeys: ["k"],
     scheduler: { maxPerCaller: 1 },

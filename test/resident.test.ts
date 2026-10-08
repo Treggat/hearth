@@ -11,9 +11,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { BackendPool } from "../src/pool.js";
+import { parseV1 } from "./v1.js";
 
 const tick = () => new Promise((r) => setImmediate(r));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -36,7 +37,7 @@ const resident = createServer((req, res) => {
 await new Promise<void>((r) => resident.listen(0, "127.0.0.1", r));
 const residentUrl = `http://127.0.0.1:${(resident.address() as AddressInfo).port}`;
 
-const config = (url: string) => parseConfig({
+const config = (url: string) => parseV1({
   name: "t",
   resources: { gpu1: { kind: "gpu" } },
   backends: [
@@ -99,11 +100,11 @@ const config = (url: string) => parseConfig({
 {
   const b = config(residentUrl).backends.find((x) => x.name === "memory")!;
   assert.deepEqual(b.resident, { yield: "/yield", resume: "/resume" }, "resident: true means the default paths");
-  assert.throws(() => parseConfig({
+  assert.throws(() => parseV1({
     name: "t", resources: { cpu: { kind: "cpu", shared: true } },
     backends: [{ name: "m", url: "http://127.0.0.1:1", kind: "none", serves: ["m"], resources: ["cpu"], resident: true }],
   }), ConfigError, "a resident on shared hardware has nothing to yield");
-  assert.throws(() => parseConfig({
+  assert.throws(() => parseV1({
     name: "t", backends: [{ name: "m", url: "http://127.0.0.1:1", kind: "none", serves: ["m"], resident: { yield: "nope" } , resources: ["g"] }],
   }), ConfigError, "paths must be paths");
 }

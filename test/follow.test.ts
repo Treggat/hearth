@@ -15,9 +15,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A llama-swap stand-in: /running is ours to set, chat bodies are recorded. */
 function fakeSwap(ids: string[]) {
@@ -58,7 +59,7 @@ function fakeSwap(ids: string[]) {
 const card = fakeSwap(["main", "trial"]);
 await card.listen();
 
-const cfg = parseConfig({
+const cfg = parseV1({
   name: "follow",
   backends: [{ name: "card", url: card.url(), kind: "llama-swap", concurrency: 2, serves: ["main", "trial"] }],
   models: {
@@ -94,16 +95,16 @@ try {
     assert.equal(cfg.models.main!.follow, false, "absent means off");
     const base = { name: "x", backends: [{ name: "card", url: card.url(), kind: "llama-swap" }] };
     assert.throws(
-      () => parseConfig({ ...base, models: { f: { as: "main", follow: true } } }),
+      () => parseV1({ ...base, models: { f: { as: "main", follow: true } } }),
       (e: unknown) => e instanceof ConfigError && /backend/.test((e as Error).message),
       "following needs a backend to follow",
     );
     assert.throws(
-      () => parseConfig({ ...base, models: { f: { backend: "card", follow: true } } }),
+      () => parseV1({ ...base, models: { f: { backend: "card", follow: true } } }),
       (e: unknown) => e instanceof ConfigError && /as/.test((e as Error).message),
       "following needs a model to load when nothing is",
     );
-    assert.throws(() => parseConfig({ ...base, models: { f: { backend: "card", as: "main", follow: "yes" } } }), ConfigError);
+    assert.throws(() => parseV1({ ...base, models: { f: { backend: "card", as: "main", follow: "yes" } } }), ConfigError);
   }
 
   // --- nothing loaded: `as` is what goes out, so the default seat loads ---------

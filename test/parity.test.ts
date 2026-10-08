@@ -6,10 +6,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { QueueTimeoutError, Scheduler } from "../src/scheduler.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 const lanes = { chat: { priority: 0 } };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -62,7 +62,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     res.end('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n');
   });
   await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
-  const node = createNode(parseConfig({
+  const node = createNode(parseV1({
     name: "n", backend: { url: `http://127.0.0.1:${(backend.address() as AddressInfo).port}`, kind: "none", serves: ["m"] },
   }), silentLogger);
   await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));

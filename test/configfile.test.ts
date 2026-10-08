@@ -16,9 +16,10 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadConfig, parseConfig } from "../src/config.js";
+import { loadConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 const dir = mkdtempSync(join(tmpdir(), "hearth-cfg-"));
 const cfgPath = join(dir, "hearth.yaml");
@@ -38,21 +39,21 @@ const ORIGINAL = `# hearth on the test box.
 # Two peers, one of which is a friend.
 name: node-under-test
 
-backend:
-  url: ${beUrl}          # the local llama-swap
-  kind: none
-  serves: [mine, spare]
+backends:
+  main:
+    url: ${beUrl}          # the local llama-swap
+    kind: none
+    serves: [mine, spare]
 
 # Empty by default, since lending is opt-in per model.
-share: [mine]
-
-peerTokens:
-  friend: shhh
+lending:
+  models: [mine]
 
 peers:
-  - name: friend
+  friend:
     url: http://127.0.0.1:1
     token: t
+    accept: shhh
     models:
       # my id: their id. Also the allowlist.
       borrowed: theirs
@@ -103,7 +104,8 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   const written = readFileSync(cfgPath, "utf8");
   assert.equal(comments(written), comments(ORIGINAL), "every comment survives, in order");
   assert.match(written, /serves: \[mine, spare\]/, "untouched flow lists keep their spacing");
-  assert.match(written, /^share: \[spare\]/m, "an inline list stays inline after being rewritten");
+  assert.match(written, /^lending:\n  models: \[spare\]/m, "an inline list stays inline after being rewritten");
+  assert.match(written, /^  mine:\n    note: 'use for: "quoted" things'/m, "a note is written onto its model");
   assert.ok(written.includes("  long-one: {concurrency: 4, params: {thinking_token_budget: 2048}, pool: {tokens: 144000, output: 8192}, stats: {context: 131072}}\n"),
     "a long line nobody edited stays one line");
 
@@ -140,10 +142,10 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   assert.equal((await a.control({ share: { spare: true } })).status, 200);
   const both = readFileSync(cfgPath, "utf8");
   assert.match(both, /somebody was in here/, "their edit survives");
-  assert.match(both, /^share: \[mine, spare\]/m, "and ours is on top of it");
+  assert.match(both, /^lending:\n  models: \[mine, spare\]/m, "and ours is on top of it");
 
   // With no request at all, the watcher picks a hand edit up and the node runs it.
-  writeFileSync(cfgPath, readFileSync(cfgPath, "utf8") + "notes:\n  mine: typed in vim\n");
+  writeFileSync(cfgPath, readFileSync(cfgPath, "utf8").replace("models:\n  borrowed:", "models:\n  mine:\n    note: typed in vim\n  borrowed:"));
   await settle();
   assert.equal(await a.note("mine"), "typed in vim", "a hand edit applies without a restart or a click");
 
@@ -172,7 +174,7 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   const { hash } = await a.file();
 
   // A live key applies at once; a key read only at startup is saved and listed.
-  let r = await a.patch({ baseHash: hash, ops: [{ path: ["backendIdleMs"], value: 1234 }] });
+  let r = await a.patch({ baseHash: hash, ops: [{ path: ["backendDefaults", "idleMs"], value: 1234 }] });
   assert.equal(r.status, 200);
   let out = (await r.json()) as Status;
   assert.deepEqual(out.restartPending, [], "an idle deadline is read per request");
@@ -186,22 +188,22 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
 
   // Invalid: 422 with the field, and nothing written.
   const before = readFileSync(cfgPath, "utf8");
-  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["backend", "url"], value: "nope" }] });
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["backends", "main", "url"], value: "nope" }] });
   assert.equal(r.status, 422);
   const err = (await r.json()) as { error: { message: string; path: string | null } };
-  assert.equal(err.error.path, "backend.url", "the error carries the field it is about");
+  assert.equal(err.error.path, "backends.main.url", "the error carries the field it is about");
   assert.equal(readFileSync(cfgPath, "utf8"), before, "and the file is untouched");
 
   // A dry run shows the result without writing it.
   r = await a.patch({ baseHash: out.hash, ops: [{ path: ["scheduler", "maxPerLane"], value: 9 }], dryRun: true });
   assert.deepEqual(((await r.json()) as Status).restartPending, ["scheduler"], "a dry run says what its change would need");
-  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["share"], value: [] }], dryRun: true });
-  assert.match(((await r.json()) as { text: string }).text, /share: \[\]/);
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["lending", "models"], value: [] }], dryRun: true });
+  assert.match(((await r.json()) as { text: string }).text, /lending:\n  models: \[\]/);
   assert.equal(readFileSync(cfgPath, "utf8"), before, "a dry run writes nothing");
 
   // Someone edits a different key: ops on untouched paths merge onto their file.
   writeFileSync(cfgPath, before.replace("name: node-under-test", "name: renamed"));
-  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["coldPenalty"], value: 3 }] });
+  r = await a.patch({ baseHash: out.hash, ops: [{ path: ["borrowing", "coldPenalty"], value: 3 }] });
   assert.equal(r.status, 200, "an unrelated edit elsewhere is not a conflict");
   const merged = readFileSync(cfgPath, "utf8");
   assert.match(merged, /name: renamed/);
@@ -210,7 +212,7 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   // ...but the same path, or the whole text, from a stale base is.
   const stale = out.hash;
   writeFileSync(cfgPath, merged.replace("coldPenalty: 3", "coldPenalty: 4"));
-  r = await a.patch({ baseHash: stale, ops: [{ path: ["coldPenalty"], value: 5 }] });
+  r = await a.patch({ baseHash: stale, ops: [{ path: ["borrowing", "coldPenalty"], value: 5 }] });
   assert.equal(r.status, 409, "a path someone else changed is theirs until you reload");
   r = await a.patch({ baseHash: stale, text: ORIGINAL });
   assert.equal(r.status, 409, "replacing the whole file needs the current hash");
@@ -264,20 +266,20 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   process.env.HEARTH_TEST_SECRET = "env-resolved-value";
   const secretPath = join(dir, "secret-hearth.yaml");
   const SECRETED = `name: node-under-test
-backend:
-  url: ${beUrl}
-  kind: none
-  serves: [mine]
+backends:
+  main:
+    url: ${beUrl}
+    kind: none
+    serves: [mine]
 apiKeys:
   - plain-key-value
   - {key: plain-map-key, label: ops}
   - env:HEARTH_TEST_SECRET
-peerTokens:
-  friend: plain-token-value
 peers:
-  - name: friend
+  friend:
     url: http://127.0.0.1:1
     token: plain-peer-token
+    accept: plain-token-value
     models: {}
 operator:
   user: op
@@ -286,7 +288,7 @@ operator:
   writeFileSync(secretPath, SECRETED);
   const a = await boot(secretPath);
   const auth = { Authorization: "Bearer plain-key-value", "Content-Type": "application/json" };
-  type SecretDoc = { apiKeys: (string | { key: string; label: string })[]; peerTokens: Record<string, string>; peers: { token: string }[] };
+  type SecretDoc = { apiKeys: (string | { key: string; label: string })[]; peers: Record<string, { token: string; accept: string }> };
   const get = async () => (await (await fetch(`${a.url}/config`, { headers: auth })).json()) as { text: string; hash: string; doc: SecretDoc };
   const patch = (body: unknown) => fetch(`${a.url}/config`, { method: "PATCH", headers: auth, body: JSON.stringify(body) });
 
@@ -301,8 +303,8 @@ operator:
   assert.match(mapEntry.key, /^hearth-secret\d+$/, "a {key, label} entry masks the key, keeps the label");
   assert.equal(mapEntry.label, "ops");
   assert.equal(f.doc.apiKeys[2], "env:HEARTH_TEST_SECRET", "an env: reference is not a secret in the file");
-  assert.match(f.doc.peerTokens["friend"]!, /^hearth-secret\d+$/);
-  assert.match(f.doc.peers[0]!.token, /^hearth-secret\d+$/);
+  assert.match(f.doc.peers.friend!.accept, /^hearth-secret\d+$/);
+  assert.match(f.doc.peers.friend!.token, /^hearth-secret\d+$/);
   assert.ok(readFileSync(secretPath, "utf8").includes("plain-key-value"), "the file itself still holds the real key");
 
   // A whole-text save sends the stand-ins back; the originals come home.
@@ -325,7 +327,7 @@ operator:
   const auth2 = { Authorization: "Bearer rotated-key", "Content-Type": "application/json" };
   const get2 = async () => (await (await fetch(`${a.url}/config`, { headers: auth2 })).json()) as { text: string; hash: string; doc: SecretDoc };
   const f3 = await get2();
-  r = await fetch(`${a.url}/config`, { method: "PATCH", headers: auth2, body: JSON.stringify({ baseHash: f3.hash, ops: [{ path: ["peerTokens", "friend"], value: "another" }], dryRun: true }) });
+  r = await fetch(`${a.url}/config`, { method: "PATCH", headers: auth2, body: JSON.stringify({ baseHash: f3.hash, ops: [{ path: ["peers", "friend", "accept"], value: "another" }], dryRun: true }) });
   assert.ok(!((await r.json()) as { text: string }).text.includes("another"));
   assert.ok(!readFileSync(secretPath, "utf8").includes("another"), "a dry run writes nothing");
   await a.node.close();
@@ -335,7 +337,7 @@ operator:
 /* ---------------------------------------- a node built in code edits memory */
 
 {
-  const node = createNode(parseConfig({ name: "n", backend: { url: beUrl, kind: "none", serves: ["mine"] } }), silentLogger);
+  const node = createNode(parseV1({ name: "n", backend: { url: beUrl, kind: "none", serves: ["mine"] } }), silentLogger);
   await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));
   const url = `http://127.0.0.1:${(node.server.address() as AddressInfo).port}`;
   const r = await fetch(`${url}/control`, { method: "POST", body: JSON.stringify({ share: { mine: true } }) });

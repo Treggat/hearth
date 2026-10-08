@@ -18,9 +18,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A backend that takes `delay` ms to answer, so a request is genuinely in
  *  flight when the shutdown starts rather than racing it. */
@@ -42,7 +42,7 @@ const slowBackend = (delay: number) => {
 
 const nodeOn = async (url: string) => {
   const node = createNode(
-    parseConfig({
+    parseV1({
       name: "drain",
       backends: [{ name: "b", url, serves: ["m"], concurrency: 4 }],
     }),
@@ -169,7 +169,7 @@ const chat = (base: string) =>
   const backend = slowBackend(250);
   await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
   const node = createNode(
-    parseConfig({
+    parseV1({
       name: "queued",
       // One at a time, so the second request is provably still in the queue
       // when the shutdown starts.

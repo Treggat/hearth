@@ -35,12 +35,11 @@
     "README.md"
   ],
   "scripts": {
-    "build": "npm run build:ui && npm run build:console && tsc",
-    "build:ui": "esbuild src/ui/main.tsx --bundle --minify --format=iife --target=es2022 --tsconfig=tsconfig.ui.json --define:process.env.NODE_ENV=\\\"production\\\" --outfile=dist/ui-client.js",
-    "prepare": "npm run build:ui && npm run build:console && tsc",
+    "build": "npm run build:console && tsc",
+    "prepare": "npm run build:console && tsc",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "typecheck": "tsc -p tsconfig.test.json && tsc -p tsconfig.ui.json",
-    "pretest": "npm run build:ui && npm run build:console",
+    "pretest": "npm run build:console",
     "dev": "tsx src/cli.ts serve",
     "test": "for f in test/*.test.ts; do tsx $f || exit 1; done",
     "build:console": "tailwindcss -i src/console/app.css -o dist/console.css --minify && esbuild src/console/main.tsx --bundle --minify --format=iife --target=es2022 --tsconfig=tsconfig.ui.json --define:process.env.NODE_ENV=\\\"production\\\" --outfile=dist/console.js"
@@ -49,11 +48,6 @@
     "yaml": "^2.5.0"
   },
   "devDependencies": {
-    "@emotion/react": "^11.14.0",
-    "@emotion/styled": "^11.14.1",
-    "@hugeicons/core-free-icons": "^4.3.0",
-    "@hugeicons/react": "^1.1.10",
-    "@mui/material": "^9.3.1",
     "@tailwindcss/cli": "^4.3.3",
     "@types/node": "^22.20.1",
     "@types/react": "^19.2.18",

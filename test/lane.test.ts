@@ -13,9 +13,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A backend that answers only when told, so a job can be seen while running. */
 let arrived: (respond: () => void) => void = () => {};
@@ -45,7 +46,7 @@ function listen(node: HearthNode): Promise<string> {
 }
 
 const lanes = { chat: { priority: 0 }, batch: { priority: 100 } };
-const cfg = parseConfig({
+const cfg = parseV1({
   name: "me",
   backends: [{ name: "swap", url: beUrl, kind: "none" }],
   scheduler: { lanes },
@@ -63,7 +64,7 @@ await node.pool.first().state.refresh();
   assert.equal(cfg.models.quiet!.lane, "batch");
   assert.equal(cfg.models.seat!.lane, null, "a plain route carries no lane");
   assert.throws(
-    () => parseConfig({ name: "x", backend: { url: beUrl }, scheduler: { lanes }, models: { m: { lane: "vip" } } }),
+    () => parseV1({ name: "x", backend: { url: beUrl }, scheduler: { lanes }, models: { m: { lane: "vip" } } }),
     (e: unknown) => e instanceof ConfigError && /not in scheduler.lanes/.test((e as Error).message),
     "a lane nobody declared is refused at load",
   );

@@ -1,13 +1,12 @@
 /**
- * The status page and the one endpoint that feeds it.
+ * The console and the one endpoint that feeds it.
  *
- * Two things worth asserting. The first is the gate: /ui and /ui/data are
- * loopback-only, and unlike everything else on this server that is NOT relaxed
- * by configuring apiKeys, because a browser loading a page cannot present a
- * bearer token. If that check ever softens into localCaller, a node bound to
- * 0.0.0.0 starts handing its queue contents and model inventory to the network.
+ * Two things worth asserting. The first is the gate: /ui/data and /ui/events
+ * take loopback or an operator session, and a valid api key does NOT open them.
+ * If that check ever softens into localCaller, a node bound to 0.0.0.0 starts
+ * handing its queue contents and model inventory to anyone holding a chat key.
  *
- * The second is that /ui/data actually carries what the page draws. src/ui/types.ts
+ * The second is that /ui/data actually carries what the page draws. src/console/types.ts
  * now states the shape the console consumes, but nothing connects it to the
  * server that builds the payload, so a renamed field would still surface as a
  * blank panel rather than a failure.
@@ -17,12 +16,11 @@ import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { History } from "../src/history.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
-import { UI_HTML } from "../src/ui.js";
-import { blockers, callStats, waitReason } from "../src/ui/why.js";
+import { CONSOLE_HTML } from "../src/ui.js";
+import { parseV1 } from "./v1.js";
 
 // --- the shell must actually carry the console -----------------------------
 // The class of bug this replaces is gone rather than tested for: the page was a
@@ -32,14 +30,14 @@ import { blockers, callStats, waitReason } from "../src/ui/why.js";
 // other test here passed, and the browser rendered a blank page. Shipped
 // exactly that on 2026-08-16 and only found it by opening a browser.
 //
-// src/ui/ is ordinary .tsx now, so esbuild fails the build on a syntax error
+// src/console/ is ordinary .tsx now, so esbuild fails the build on a syntax error
 // and `npm run typecheck` covers the rest. What is still worth asserting is the
-// join: `npm test` runs build:ui first, and if the bundle went missing or empty
+// join: `npm test` runs build:console first, and if the bundle went missing or empty
 // the page would serve a mount point and nothing to mount into it — which looks
 // exactly like the old blank page.
 {
-  assert.match(UI_HTML, /<div id="root">/, "the shell must have a mount point");
-  const script = UI_HTML.match(/<script>([\s\S]*)<\/script>/)?.[1] ?? "";
+  assert.match(CONSOLE_HTML, /<div id="root">/, "the shell must have a mount point");
+  const script = CONSOLE_HTML.match(/<div id="root"><\/div>\n<script>([\s\S]*)<\/script>/)?.[1] ?? "";
   assert.ok(script.length > 10_000, "the compiled console must be inlined, not a stub");
   assert.ok(script.includes("react-dom"), "and it must actually be the bundle");
   // The HTML parser ends a script at the first literal `</script`, wherever it
@@ -49,53 +47,13 @@ import { blockers, callStats, waitReason } from "../src/ui/why.js";
   // is the config for the SERVER half. Built that way the bundle emits classic
   // `React.createElement` against a global that nothing defines, and the page is
   // blank with one ReferenceError in a console nobody is watching — which is how
-  // this was found. The fix is `--tsconfig=tsconfig.ui.json` in build:ui; this is
+  // this was found. The fix is `--tsconfig=tsconfig.ui.json` in build:console; this is
   // what notices if it goes missing.
   //
   // ponytail: pins the one symptom rather than rendering the page. A real mount
   // check wants jsdom; add it if a second bug of this shape gets through.
   assert.ok(!script.includes("React.createElement"),
-    "the bundle must use the automatic JSX runtime — build:ui lost its --tsconfig");
-}
-
-// --- why a job is waiting -------------------------------------------------
-//
-// The page's one piece of real derivation, and the one thing on it that is a
-// claim rather than a readout: "blocked" and "full" and "cold" are different
-// problems with different answers, and getting the ORDER wrong is how a job
-// waiting on somebody else's GPU gets reported as this backend being busy.
-// Admission checks hardware before either of the backend's own ceilings, so
-// this must too.
-{
-  const gpu0 = { name: "gpu0", holder: "video", backends: ["swap", "video"] };
-  const free = { name: "gpu1", holder: null, backends: ["other"] };
-  const job = { id: "j1", lane: "chat", model: "coder", caller: "x", state: "queued" as const,
-                position: 3, since: 0 };
-
-  const swap = { name: "swap", resources: ["gpu0"], slots: 4, free: 0, evicts: true,
-                 knowsWarm: true, loaded: ["other-model"] };
-  assert.equal(waitReason(job, swap, [gpu0, free]).tone, "blocked",
-    "hardware held by another backend outranks this backend being full");
-  assert.match(waitReason(job, swap, [gpu0, free]).text, /gpu0/);
-
-  // Same backend, nobody on the card: now the ceiling is the real answer.
-  const idle = { ...gpu0, holder: null };
-  assert.equal(waitReason(job, swap, [idle, free]).tone, "busy");
-
-  // Room to run, but the wrong model is resident on a backend that evicts.
-  assert.equal(waitReason(job, { ...swap, free: 2 }, [idle]).tone, "cold");
-  assert.match(waitReason(job, { ...swap, free: 2 }, [idle]).text, /must unload/);
-
-  // A backend that keeps everything resident cannot make a job wait for a
-  // load, so claiming it did would be an invention.
-  assert.equal(waitReason(job, { ...swap, free: 2, evicts: false }, [idle]).tone, "lane");
-
-  // Holding the resource ourselves never blocks us: that is what concurrency
-  // is for, and a backend running its second job is not waiting on its first.
-  assert.deepEqual(blockers({ name: "video", resources: ["gpu0"] }, [gpu0]), []);
-  assert.equal(blockers({ name: "swap", resources: ["gpu0"] }, [gpu0]).length, 1);
-  assert.deepEqual(blockers({ name: "loner" }, [gpu0]), [],
-    "a backend that declares nothing competes for nothing");
+    "the bundle must use the automatic JSX runtime — build:console lost its --tsconfig");
 }
 
 // --- the ring buffer, on its own ------------------------------------------
@@ -158,7 +116,7 @@ const backendUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`
 
 // apiKeys ARE set here on purpose: the page's gate must not depend on them.
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "ui-test",
     // Serves /running, so it IS a llama-swap backend. Under the old boolean
     // this said false and still expected /running to be polled, which is the
@@ -175,49 +133,19 @@ const base = await new Promise<string>((ready) =>
 );
 
 {
-  const page = await fetch(`${base}/ui/classic`);
+  const page = await fetch(`${base}/ui`);
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type") ?? "", /text\/html/);
   assert.equal(page.headers.get("cache-control"), "no-store",
     "a cached copy of a live status page is a lie");
   const html = await page.text();
-  assert.match(html, /<title>Hearth Console<\/title>/);
-  assert.match(html, /fetch\("\/ui\/data"/, "the page must fetch its own endpoint");
-  assert.ok(!html.includes("MOCK_NETWORK"), "the draft's mock data must not ship");
-
-  // These used to name the DOM helpers that drew each thing. The bundle is
-  // minified, so every identifier in it is now a mangled two letters — but
-  // string literals survive verbatim, and the operator-facing copy is a better
-  // thing to pin anyway: it is what actually went missing the time this
-  // mattered, and a rename that keeps the words keeps the feature.
-  //
-  // /network has always computed `unmapped`, and a redesign once dropped it
-  // from the page — silently removing the only thing that tells you a peer
-  // started offering something you cannot ask for. The data being on the wire
-  // is tested in server.test.ts; this checks the page still does something
-  // with it, because that is the half that went missing.
-  //
-  // The words moved when the console became a graph: the count is on the peer
-  // node ("N unclaimed") and the sentence is in the inspector beside the link
-  // controls. Pinning the sentence rather than the count keeps this checking
-  // that the page EXPLAINS the state, which is the part that went missing.
-  assert.match(html, /you have not mapped, so nothing can route to them/,
-    "the page must still render unmapped peer models, and say what it means in words");
-  assert.match(html, /peers may use this model/, "the sharing toggle must survive");
-  assert.match(html, /every change saves to/,
-    "and the page says where edits land, since there is no save step to tell you");
-  assert.match(html, /restart hearth to apply/, "and what is waiting on a restart");
+  assert.match(html, /<title>hearth<\/title>/);
+  assert.ok(html.includes("/ui/data") && html.includes("/ui/events"), "the page must fetch its own endpoints");
+  assert.match(html, /restart hearth to apply/, "the page says what is waiting on a restart");
   assert.ok(!html.includes("secret-key"), "no credential may appear in the page");
-
-  // Two views, both offered at once, the choice remembered per browser. Pinned
-  // as strings, like the operator copy above: the labels are what a person
-  // clicks, and losing the second view is the regression to catch. The
-  // dashboard draws itself from the same tables and panels as the graph, so a
-  // rename that keeps these words keeps the view — there is no second copy to
-  // drift.
-  assert.match(html, /"dashboard"/, "the switcher offers the dashboard view");
-  assert.match(html, /"graph"/, "and the graph view");
-  assert.ok(html.includes("hearth.view"), "the chosen view is remembered across reloads");
+  for (const gone of ["/ui/classic", "/ui/next"]) {
+    assert.notEqual((await fetch(`${base}${gone}`)).status, 200, `${gone} is gone with the previous console`);
+  }
 }
 
 {
@@ -283,7 +211,7 @@ const base = await new Promise<string>((ready) =>
 // page can only draw a card if the server names one.
 {
   const shared = createNode(
-    parseConfig({
+    parseV1({
       name: "two-cards",
       backends: [
         { name: "swap", url: backendUrl, kind: "llama-swap", resources: ["gpu0"] },
@@ -355,7 +283,7 @@ const base = await new Promise<string>((ready) =>
     console.log("  .. skipped the off-box probe: no non-loopback interface here");
   } else {
     const wide = createNode(
-      parseConfig({
+      parseV1({
         name: "wide",
         backend: { url: backendUrl, llamaSwapExtras: false },
         listen: { host: "0.0.0.0" },
@@ -387,7 +315,7 @@ const base = await new Promise<string>((ready) =>
       });
       assert.equal(keyed.status, 403,
         `${path} stays closed for a valid api key`);
-      assert.match(await keyed.text(), /loopback-only/);
+      assert.match(await keyed.text(), /logged-in operator/);
     }
 
     // ...while a route that IS key-gated still works from the same place, so
@@ -401,115 +329,6 @@ const base = await new Promise<string>((ready) =>
   }
 }
 
-// --- the second listener ---------------------------------------------------
-//
-// uiListen exists so a headless box can see the page without a tunnel, which
-// means it gets bound somewhere reachable. The whole safety of that rests on
-// this socket serving the page AND NOTHING ELSE: no /v1, no passthrough to the
-// backend, no peer protocol, no /healthz. If this test ever goes green on a
-// path other than the page, a widened uiListen has widened the whole node.
-{
-  const withUi = createNode(
-    parseConfig({
-      name: "ui-port",
-      backend: { url: backendUrl, llamaSwapExtras: false },
-      // 0.0.0.0 on purpose: this is the risky configuration, so test that one.
-      // The port here only has to be valid; the listen below takes an ephemeral
-      // one so the test cannot collide with anything.
-      uiListen: { host: "0.0.0.0", port: 4142 },
-    }),
-    silentLogger,
-  );
-  withUi.start();
-  assert.ok(withUi.uiServer, "uiListen must produce a second server");
-  const uiPort = await new Promise<number>((ready) =>
-    withUi.uiServer!.listen(0, "0.0.0.0", () =>
-      ready((withUi.uiServer!.address() as AddressInfo).port)),
-  );
-  const ui = `http://127.0.0.1:${uiPort}`;
-
-  // The page and its data are served, with no credential and no loopback check.
-  const page = await fetch(`${ui}/ui/classic`);
-  assert.equal(page.status, 200, "the page is the point of this port");
-  assert.match(await page.text(), /<title>Hearth Console<\/title>/);
-  assert.equal((await fetch(`${ui}/`)).status, 200, "bare root serves the page too");
-  const data = await fetch(`${ui}/ui/data`);
-  assert.equal(data.status, 200);
-  const payload = (await data.json()) as {
-    net: unknown;
-    canWarm?: boolean;
-    controls?: { lending: boolean; borrowing: boolean };
-  };
-  assert.ok(payload.net, "and it carries real data");
-
-  // The standalone listener is READ-ONLY but must still be able to SHOW
-  // federation state. This is the operator's only dashboard in a headless
-  // deployment, and the page renders these as disabled indicators there.
-  //
-  // Reported 2026-08-16: the page used to render nothing at all for a direction
-  // that was ON, so the healthy case looked identical to the feature not having
-  // shipped. Absence of a control is indistinguishable from absence of the
-  // feature, which sent an operator hunting for a failed deploy.
-  assert.equal(payload.canWarm, false, "this socket cannot perform actions, and says so");
-  assert.equal(typeof payload.controls?.lending, "boolean", "but it still reports lending state");
-  assert.equal(typeof payload.controls?.borrowing, "boolean", "and borrowing state");
-
-  // Everything else is a 404 — including, especially, the paths that would
-  // otherwise reach the GPU or the backend.
-  for (const path of [
-    "/v1/models",
-    "/v1/chat/completions",
-    "/queue",
-    "/network",
-    "/healthz",
-    "/peer/state",
-    "/running",            // passthrough to the backend
-    "/upstream/m1/x",      // passthrough to the backend
-    "/ui/../v1/models",    // not a way around it either
-  ]) {
-    const r = await fetch(`${ui}${path}`);
-    assert.equal(r.status, 404, `${path} must not be reachable on the ui port`);
-  }
-
-  // Writes are OFF by default, so the control routes are not on this socket.
-  for (const p of ["/control", "/v1/warm"]) {
-    const r = await fetch(`${ui}${p}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lending: false, model: "m1" }),
-    });
-    assert.equal(r.status, 404, `${p} must not be writable unless uiListen.control says so`);
-  }
-
-  // A POST to the chat path must not reach the backend either.
-  const post = await fetch(`${ui}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "m1", messages: [] }),
-  });
-  assert.equal(post.status, 404, "no method gets you off this port");
-
-  await withUi.close();
-}
-
-// --- uiListen validation ---------------------------------------------------
-{
-  // Same socket as the main listener would fail inside listen() with an errno
-  // nobody reads. It fails here instead.
-  assert.throws(
-    () =>
-      parseConfig({
-        backend: { url: "http://127.0.0.1:9292" },
-        listen: { host: "127.0.0.1", port: 4141 },
-        uiListen: { host: "127.0.0.1", port: 4141 },
-      }),
-    /same address as listen/,
-  );
-  // Unset means no second server at all, which is the default and the safe one.
-  const plain = parseConfig({ backend: { url: "http://127.0.0.1:9292" } });
-  assert.equal(plain.uiListen, null, "no second listener unless asked for");
-}
-
 // --- the page's numbers follow the LOADED model's ceiling ------------------
 //
 // A seat with concurrency 4 fronting a model started with --parallel 2 used to
@@ -519,7 +338,7 @@ const base = await new Promise<string>((ready) =>
 // is the one it has always been given.
 {
   const capped = createNode(
-    parseConfig({
+    parseV1({
       name: "capped",
       backend: { url: backendUrl, kind: "llama-swap", concurrency: 4 },
       models: { m1: { concurrency: 2 }, m2: { concurrency: 4 } },
@@ -576,7 +395,7 @@ const base = await new Promise<string>((ready) =>
 // `routes` above.
 {
   const aliased = createNode(
-    parseConfig({
+    parseV1({
       name: "aliases",
       backend: { url: backendUrl, kind: "llama-swap" },
       models: {
@@ -608,7 +427,7 @@ const base = await new Promise<string>((ready) =>
 // sends them.
 {
   const routed = createNode(
-    parseConfig({
+    parseV1({
       name: "routing",
       backend: { url: backendUrl, kind: "llama-swap" },
       peers: [{ name: "friend", url: "http://127.0.0.1:1", token: "t", models: { shared: "shared", theirs: "theirs" } }],
@@ -642,143 +461,3 @@ await node.close();
 backend.closeAllConnections();
 backend.close();
 console.log("ui.test.ts ok");
-
-// --- uiListen.control: key -------------------------------------------------
-// Opt-in clickable controls on the standalone status listener.
-//
-// The claim being tested is narrow and worth stating exactly: this adds a
-// SOCKET, not an AUTHORITY. localCaller already accepts a valid apiKey from any
-// address, so a keyed write to /control was always possible on the main
-// listener; `control: key` serves that same gated route on the status port too.
-// What must NOT change is what an UNAUTHENTICATED caller can do there, and what
-// a PEER can do there — which is, in both cases, look at the page.
-{
-  const cfg = parseConfig({
-    name: "ui-writable",
-    backend: { url: backendUrl, llamaSwapExtras: false },
-    apiKeys: ["s3cret-key"],
-    peerTokens: { friend: "peer-token" },
-    share: ["m1"],
-    uiListen: { host: "127.0.0.1", port: 4143, control: "key" },
-  });
-  const node = createNode(cfg, silentLogger);
-  node.start();
-  const port = await new Promise<number>((ready) =>
-    node.uiServer!.listen(0, "127.0.0.1", () =>
-      ready((node.uiServer!.address() as AddressInfo).port)),
-  );
-  const ui = `http://127.0.0.1:${port}`;
-
-  // The page still loads with no credential — reading was never gated here.
-  assert.equal((await fetch(`${ui}/ui`)).status, 200, "the page is still open");
-  const boot = (await (await fetch(`${ui}/ui/data`)).json()) as { canWarm: boolean; control: string };
-  assert.equal(boot.canWarm, true, "the page is told it may write");
-  assert.equal(boot.control, "key", "and told that writes need a key");
-
-  const post = (path: string, body: unknown, auth?: string) =>
-    fetch(`${ui}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...(auth ? { Authorization: auth } : {}) },
-      body: JSON.stringify(body),
-    });
-
-  // THE property. Opening the write route must not open it to everyone.
-  assert.equal(
-    (await post("/control", { lending: false })).status,
-    401,
-    "an unauthenticated write on the status port is refused",
-  );
-
-  // A PEER token is not an api key. A borrowed connection must never be able to
-  // reach in and toggle federation, whatever socket it arrives on.
-  assert.equal(
-    (await post("/control", { lending: false }, "Bearer peer-token")).status,
-    401,
-    "a peer token grants nothing here",
-  );
-
-  // The real key works, and actually changes the state.
-  const ok = await post("/control", { lending: false }, "Bearer s3cret-key");
-  assert.equal(ok.status, 200, "a valid apiKey may write from the status port");
-  const after = (await (await fetch(`${ui}/ui/data`)).json()) as {
-    controls: { lending: boolean };
-  };
-  assert.equal(after.controls.lending, false, "and the change took effect");
-  await post("/control", { lending: true }, "Bearer s3cret-key");
-
-  // Only the two write routes, and only POST. Everything else stays 404, so
-  // enabling controls does not quietly widen the port into a general API.
-  for (const [path, method] of [
-    ["/control", "GET"],
-    ["/v1/models", "GET"],
-    ["/v1/chat/completions", "POST"],
-    ["/queue", "GET"],
-    ["/network", "GET"],
-    ["/peer/state", "GET"],
-    ["/healthz", "GET"],
-  ] as const) {
-    const r = await fetch(`${ui}${path}`, {
-      method,
-      ...(method === "POST"
-        ? { headers: { "Content-Type": "application/json", Authorization: "Bearer s3cret-key" }, body: "{}" }
-        : { headers: { Authorization: "Bearer s3cret-key" } }),
-    });
-    assert.equal(r.status, 404, `${method} ${path} must stay off the status port even with control:key`);
-  }
-
-  await node.close();
-}
-
-// --- the config combination that cannot work is refused --------------------
-// control:key with no apiKeys would render clickable controls, prompt for a key
-// and then 401 every write, because localCaller falls back to loopback-only
-// with no keys configured. Caught at --check, where a person is reading.
-{
-  assert.throws(
-    () =>
-      parseConfig({
-        name: "no-keys",
-        backend: { url: "http://127.0.0.1:1" },
-        uiListen: { host: "0.0.0.0", port: 4142, control: "key" },
-      }),
-    /requires apiKeys/,
-    "control:key without apiKeys is a config error, not a runtime surprise",
-  );
-
-  assert.throws(
-    () =>
-      parseConfig({
-        name: "bad-mode",
-        backend: { url: "http://127.0.0.1:1" },
-        apiKeys: ["k"],
-        uiListen: { host: "0.0.0.0", port: 4142, control: "trusted" },
-      }),
-    /must be false or/,
-    "there is deliberately no `trusted` mode; an unknown value is refused",
-  );
-}
-
-// callStats: the numbers the history header reports.
-{
-  const c = (ms: number, waitedMs = 0, ok = true) =>
-    ({ t: 0, model: "m", backend: "b", ms, waitedMs, ok });
-
-  const empty = callStats([]);
-  assert.equal(empty.n, 0);
-  assert.equal(empty.medianMs, null, "no calls means no median, not a zero");
-  assert.equal(callStats(undefined).n, 0, "an absent calls array is not a crash");
-
-  const one = callStats([c(400)]);
-  assert.equal(one.medianMs, 400);
-  assert.equal(one.p95Ms, 400, "nearest-rank: a single call is its own p95");
-
-  // Ten calls, 100..1000. Nearest-rank p50 is the 5th, p95 the 10th.
-  const ten = callStats(Array.from({ length: 10 }, (_, i) => c((i + 1) * 100)));
-  assert.equal(ten.medianMs, 500);
-  assert.equal(ten.p95Ms, 1000);
-
-  const mixed = callStats([c(100, 5_000), c(200, 0, false), c(300, 0, false)]);
-  assert.equal(mixed.failed, 2, "failures are counted, not folded into the timings");
-  assert.equal(mixed.maxWaitMs, 5_000, "the worst wait is reported, not the average");
-  assert.equal(mixed.medianMs, 200, "queue wait never moves the run-time median");
-}

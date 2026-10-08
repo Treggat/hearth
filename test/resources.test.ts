@@ -23,13 +23,13 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { BackendState } from "../src/backend.js";
 import { BackendPool } from "../src/pool.js";
 import { ResourceArbiter } from "../src/resources.js";
 import { Scheduler } from "../src/scheduler.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 const lanes = { chat: { priority: 0 } };
 
@@ -309,7 +309,7 @@ function pool(concurrency = 1) {
   const url = `http://127.0.0.1:${port}`;
 
   const node = createNode(
-    parseConfig({
+    parseV1({
       name: "resources",
       backends: [
         { name: "cards", url, kind: "llama-swap", resources: ["gpu0"] },
@@ -385,7 +385,7 @@ function pool(concurrency = 1) {
     return `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
   };
   const node = createNode(
-    parseConfig({
+    parseV1({
       name: "stuck",
       backends: [
         { name: "cards", url: await at(neighbour), kind: "llama-swap", resources: ["gpu0"] },
@@ -423,7 +423,7 @@ console.log("resources.test.ts ok");
 // other's models on every dispatch, since taking a resource evicts everyone
 // else holding it.
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "shared",
     resources: { gpu0: { kind: "gpu" }, cpu: { kind: "cpu", shared: true } },
     backends: [
@@ -474,7 +474,7 @@ console.log("resources.test.ts ok");
   await tick();
 
   // An undeclared name keeps meaning what it always did.
-  const bare = new BackendPool(parseConfig({
+  const bare = new BackendPool(parseV1({
     name: "bare",
     backends: [{ name: "a", url: "http://127.0.0.1:1", serves: ["m"], resources: ["gpuX"] }],
   }), silentLogger);
@@ -484,7 +484,7 @@ console.log("resources.test.ts ok");
 
 // kind is validated at startup, not discovered as a wrong icon weeks later.
 assert.throws(
-  () => parseConfig({
+  () => parseV1({
     name: "n", resources: { x: { kind: "quantum" } },
     backends: [{ name: "a", url: "http://127.0.0.1:1", serves: ["m"] }],
   }),

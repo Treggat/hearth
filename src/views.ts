@@ -27,24 +27,20 @@ export interface ViewDeps {
 
 export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode }: ViewDeps) {
   /**
-   * Everything the page draws, shared by /ui/data and the event stream. `canWarm` is whether this
-   * socket can perform actions. Uses ensureFresh, never probeAll.
+   * Everything the page draws, shared by /ui/data and the event stream. Uses ensureFresh, never probeAll.
    */
-  async function uiPayload(canWarm: boolean, operator: string | null = null): Promise<Record<string, unknown>> {
+  async function uiPayload(operator: string | null = null): Promise<Record<string, unknown>> {
     await peers.ensureFresh();
     // Declared activity paths are read only while a page is building data, never on a timer.
     for (const b of pool.all()) if (b.cfg.activity) void b.state.sampleActivity(b.cfg.activity);
     return {
-      canWarm,
-      // Who this socket signed in as, so the page can show it and offer a sign-out;
+      // Who this request signed in as, so the page can show it and offer a sign-out;
       // loopback and key callers are nobody in particular.
       operator,
-      // How this page must authenticate its writes, decided per socket rather
-      // than assumed. "off" when the socket serves no write routes at all.
-      control: canWarm ? writeMode() : "off",
-      // Pause state shows on both sockets; the buttons only where canWarm.
+      // How this page must authenticate its writes.
+      control: writeMode(),
       controls: controls.state(),
-      // What the sharing and mapping controls need, sent to the read-only listener too.
+      // What the sharing and mapping controls need.
       share: shared(),
       configuredShare: cfg.share,
       // Where every edit lands, and what is waiting on a restart; replaces the old pending-changes block.

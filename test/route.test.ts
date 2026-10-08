@@ -12,6 +12,7 @@ import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { PeerRegistry, type PeerCapacity } from "../src/peers.js";
 import { decide } from "../src/route.js";
+import { parseV1 } from "./v1.js";
 
 const base = {
   name: "me",
@@ -57,7 +58,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 // --- default is local ------------------------------------------------------
 // A model nobody configured must never leave, however healthy the peers are.
 {
-  const cfg = parseConfig({ ...base, models: {} });
+  const cfg = parseV1({ ...base, models: {} });
   const r = registry(cfg, { friend: idle, other: idle });
   const d = decide("big", cfg, r, busy);
   assert.equal(d.target, "local");
@@ -65,7 +66,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 
 // --- policy: peer ----------------------------------------------------------
 {
-  const cfg = parseConfig({ ...base, models: { big: { policy: "peer", peers: ["friend"] } } });
+  const cfg = parseV1({ ...base, models: { big: { policy: "peer", peers: ["friend"] } } });
   const r = registry(cfg, { friend: idle, other: null });
   const d = decide("big", cfg, r, free);
   assert.equal(d.target, "peer");
@@ -77,7 +78,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 
 // --- a down peer falls back locally ----------------------------------------
 {
-  const cfg = parseConfig({ ...base, models: { big: { policy: "peer", peers: ["friend"] } } });
+  const cfg = parseV1({ ...base, models: { big: { policy: "peer", peers: ["friend"] } } });
   const r = registry(cfg, { friend: null, other: null });
   assert.equal(decide("big", cfg, r, free).target, "local");
 }
@@ -87,7 +88,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 // simply not in it, which is why config rejects a policy that can never fire.
 {
   assert.throws(
-    () => parseConfig({ ...base, models: { "big-high": { policy: "peer" } } }),
+    () => parseV1({ ...base, models: { "big-high": { policy: "peer" } } }),
     /no peer maps/,
     "a policy pointing at a model no peer maps must fail at startup",
   );
@@ -98,7 +99,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 // this here" was honoured when a peer errored and ignored when a peer was down
 // which is the more common half. People set this because the box would OOM.
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     ...base,
     models: { big: { policy: "peer", peers: ["friend"], fallbackLocal: false } },
   });
@@ -107,7 +108,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
   assert.equal(d.target, "unavailable", "a down peer must not silently run it locally");
 
   // With the default (true), the same situation falls home as before.
-  const lenient = parseConfig({
+  const lenient = parseV1({
     ...base,
     models: { big: { policy: "peer", peers: ["friend"] } },
   });
@@ -119,7 +120,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 
 // --- spillover -------------------------------------------------------------
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     ...base,
     models: { big: { policy: "spillover", peers: ["friend"], spilloverAt: 2 } },
   });
@@ -132,7 +133,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 // --- fastest ---------------------------------------------------------------
 // Both sides warm unless a case says otherwise, so these isolate queue depth.
 {
-  const cfg = parseConfig({ ...base, models: { big: { policy: "fastest" } } });
+  const cfg = parseV1({ ...base, models: { big: { policy: "fastest" } } });
   const warmIdle: PeerCapacity = { ...idle, loaded: ["their-big"] };
 
   // Local idle, peer backed up: stay home. This is the case that matters to
@@ -152,7 +153,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 // The term that actually decides most real comparisons: an idle GPU holding the
 // wrong model is slower to start than a warm one with work in front of it.
 {
-  const cfg = parseConfig({ ...base, models: { big: { policy: "fastest" } } });
+  const cfg = parseV1({ ...base, models: { big: { policy: "fastest" } } });
   const warmIdle: PeerCapacity = { ...idle, loaded: ["their-big"] };
   const coldIdle: PeerCapacity = { ...idle, loaded: ["their-other"] };
 
@@ -188,7 +189,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
   );
 
   // coldPenalty: 0 turns warmth off entirely and restores depth-only ordering.
-  const flat = parseConfig({ ...base, coldPenalty: 0, models: { big: { policy: "fastest" } } });
+  const flat = parseV1({ ...base, coldPenalty: 0, models: { big: { policy: "fastest" } } });
   assert.equal(
     decide("big", flat, registry(flat, { friend: warmIdle, other: null }), cold).target,
     "local",
@@ -198,7 +199,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 
 // --- preference order is honoured ------------------------------------------
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     ...base,
     models: { big: { policy: "peer", peers: ["other", "friend"] } },
   });
@@ -210,7 +211,7 @@ const cold = { queued: 0, free: 1, slots: 1, loaded: ["something-else"] };
 
 // --- the first listed peer being down skips to the next --------------------
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     ...base,
     models: { big: { policy: "peer", peers: ["other", "friend"] } },
   });

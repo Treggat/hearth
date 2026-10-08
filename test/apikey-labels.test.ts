@@ -35,7 +35,7 @@ const beUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
 process.env.HEARTH_LABEL_TEST_KEY = "env-secret-key";
 const cfgPath = join(dir, "hearth.yaml");
 writeFileSync(cfgPath, `name: labels
-backend: { url: "${beUrl}", kind: none, serves: [mine] }
+backends: { main: { url: "${beUrl}", kind: none, serves: [mine] } }
 apiKeys:
   - plain-key
   - { key: labeled-key, label: dsh }
@@ -51,7 +51,7 @@ assert.deepEqual(cfg.apiKeyLabels, ["", "dsh", "nova"],
 
 const bad = (line: string, re: RegExp, why: string) => {
   const p = join(dir, "bad.yaml");
-  writeFileSync(p, `name: bad\nbackend: { url: "${beUrl}", kind: none, serves: [mine] }\n${line}\n`);
+  writeFileSync(p, `name: bad\nbackends: { main: { url: "${beUrl}", kind: none, serves: [mine] } }\n${line}\n`);
   assert.throws(() => loadConfig(p), re, why);
 };
 bad(`apiKeys: [{ key: k, label: "" }]`, /label must not be empty/,

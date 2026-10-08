@@ -204,12 +204,10 @@ export interface Controls {
 }
 
 export interface UiData {
-  /** Whether the write routes exist on the socket that served this page. */
-  canWarm: boolean;
-  /** The operator logged in on this socket, or null for loopback, key and status-page callers. */
+  /** The operator logged in on this request, or null for loopback and key callers. */
   operator: string | null;
-  /** How to authenticate a write here, decided per socket rather than guessed. */
-  control: "open" | "key" | "off";
+  /** How to authenticate a write here: "open" on a keyless node, else a key or a session. */
+  control: "open" | "key";
   controls: Controls;
   /** What is going out right now. */
   share: string[];

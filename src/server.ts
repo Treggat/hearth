@@ -21,7 +21,7 @@ import { BackendPool, type BackendSlot } from "./pool.js";
 import { decide, type LocalLoad } from "./route.js";
 import { History } from "./history.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit } from "./stats.js";
-import { CONSOLE_HTML, UI_HTML } from "./ui.js";
+import { CONSOLE_HTML } from "./ui.js";
 import { createViews } from "./views.js";
 import { send, type UpstreamResponse } from "./upstream.js";
 
@@ -110,8 +110,6 @@ export interface HearthNode {
   server: Server;
   /** The local backends and their queues. One entry unless `backends:` is used. */
   pool: BackendPool;
-  /** The status page on its own socket when `uiListen` is set; it answers only the page paths. */
-  uiServer: Server | null;
   peers: PeerRegistry;
   history: History;
   /** Start watching backends and polling peers. Call before listen(); without it the node silently routes everything locally. */
@@ -123,7 +121,7 @@ export interface HearthNode {
 export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   // ConfigFile swaps the live keys in whole and everything reads those per call; the rest changes
   // only with a restart, so an accidental write throws instead of going stale.
-  for (const part of [cfg.listen, cfg.backends, cfg.scheduler, cfg.uiListen, cfg.resources,
+  for (const part of [cfg.listen, cfg.backends, cfg.scheduler, cfg.resources,
                       cfg.apiKeys, cfg.apiKeyLabels, cfg.apiKeyModels, cfg.peerTokens]) deepFreeze(part);
   // One state and one queue per backend. Pushed over SSE where the backend
   // supports it, polled where it doesn't.
@@ -625,8 +623,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     if (r.auth === "open") return { ...base, peer: null, caller: "", models: null };
 
     if (r.auth === "loopback") {
-      // A logged-in operator may reach the page and its data stream from off-loopback: the page
-      // is static, and the payload is the same one the status port serves keyless.
+      // Off this machine, the page's data takes an operator session: EventSource cannot send a key.
       const op = sessionOperator(req);
       if (!isLoopback(req) && op === null) {
         refuse(res, 403, "the status page is loopback-only, or open to a logged-in operator", env);
@@ -691,9 +688,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     { path: "/logout", methods: ["POST"], auth: "open", handler: routeLogout },
 
     // The page is static — every byte of data comes from /ui/data and /ui/events — so it may go
-    // out wide; the gate that matters is the one on the data stream. The status port keeps its
-    // own frozen route table and is untouched by this.
-    { path: ["/ui", "/ui/", "/ui/next", "/ui/classic"], auth: "open", handler: routeUi },
+    // out wide; the gate that matters is the one on the data stream.
+    { path: ["/ui", "/ui/"], auth: "open", handler: routeUi },
     { path: ["/ui/data", "/ui/events"], auth: "loopback", envelope: "openai", handler: routeUi },
 
     { path: "*", auth: "local", envelope: "openai", handler: routePassthrough },
@@ -1391,11 +1387,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     const { req, res, path } = c;
     // The event stream shares the page's address-based gate.
     if (path === "/ui/events") {
-      await serveUiEvents(req, res, true, opOf(c.caller));
+      await serveUiEvents(req, res, opOf(c.caller));
       return;
     }
-    await serveUi(path, res, true, opOf(c.caller));
-    return;
+    await serveUi(path, res, opOf(c.caller));
   }
 
   /** Everything not claimed above, proxied to a backend as-is. */
@@ -1530,7 +1525,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
   /**
    * The page pushed over SSE: one snapshot, then diffs of the same object /ui/data serves, with
-   * history appended. `canWarm` and `control` are per socket and never in a patch.
+   * history appended. `operator` is per request and never in a patch.
    */
   const streams = new Set<ServerResponse>();
   let lastSent: Record<string, unknown> | null = null;
@@ -1560,7 +1555,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   ): { set?: Record<string, unknown>; add?: { hist: unknown[] } } | null {
     const set: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(next)) {
-      if (k === "hist" || k === "canWarm" || k === "control") continue;
+      if (k === "hist" || k === "operator") continue;
       if (JSON.stringify(v) !== JSON.stringify(prev[k])) set[k] = v;
     }
     let add: { hist: unknown[] } | undefined;
@@ -1587,7 +1582,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   let inBuild: Promise<Record<string, unknown>> | null = null;
 
   function build(): Promise<Record<string, unknown>> {
-    inBuild ??= uiPayload(false)
+    inBuild ??= uiPayload()
       .then((d) => { lastSent = d; return d; })
       .finally(() => { inBuild = null; });
     return inBuild;
@@ -1611,7 +1606,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     }
   }
 
-  async function serveUiEvents(req: IncomingMessage, res: ServerResponse, canWarm: boolean, operator: string | null = null): Promise<void> {
+  async function serveUiEvents(req: IncomingMessage, res: ServerResponse, operator: string | null): Promise<void> {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-store",
@@ -1625,12 +1620,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // The same baseline the patches will be diffed against, or this page
     // applies deltas to a snapshot the server never recorded.
     const snapshot = lastSent ?? await build();
-    writeFrame(res, "snapshot", {
-      ...snapshot,
-      canWarm,
-      operator,
-      control: canWarm ? writeMode() : "off",
-    });
+    writeFrame(res, "snapshot", { ...snapshot, operator });
     lastFlushAt = Date.now();
 
     streams.add(res);
@@ -1652,17 +1642,16 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     req.on("aborted", drop);
   }
 
-  /** The page and its data, the only things either listener serves to the page. */
-  async function serveUi(path: string, res: ServerResponse, canWarm = false, operator: string | null = null): Promise<void> {
+  /** The page and its data. */
+  async function serveUi(path: string, res: ServerResponse, operator: string | null): Promise<void> {
     if (path === "/ui/data") {
       // One payload rather than three fetches. It also means /network and
       // /queue keep their own auth gate untouched: nothing here relaxes them,
       // the page simply does not use them.
-      json(res, 200, await uiPayload(canWarm, operator));
+      json(res, 200, await uiPayload(operator));
       return;
     }
-    // The 2.0 console everywhere; the previous page stays at /ui/classic for one release.
-    const html = path === "/ui/classic" ? UI_HTML : CONSOLE_HTML;
+    const html = CONSOLE_HTML;
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Content-Length": Buffer.byteLength(html),
@@ -1679,46 +1668,6 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     cfg, pool, peers, history, controls, config, shared, proxying, writeMode,
   });
 
-  const uiWritable = cfg.uiListen?.control === "key";
-  /** The only paths the standalone listener serves. */
-  const UI_PATHS = new Set(["/ui", "/ui/", "/ui/next", "/ui/classic", "/ui/data", "/ui/events", "/"]);
-  /** The writes the standalone listener passes through when `uiListen.control` allows; new controls must be added here. */
-  const UI_WRITE_PATHS = new Set(["/control", "/v1/warm"]);
-  // The status listener: only UI_PATHS (plus UI_WRITE_PATHS behind localCaller), 404 for the rest.
-  const uiServer = cfg.uiListen
-    ? createServer((req, res) => {
-        const path = new URL(req.url ?? "/", "http://localhost").pathname;
-        const isWrite = uiWritable && req.method === "POST" && UI_WRITE_PATHS.has(path);
-        if (!UI_PATHS.has(path) && !isWrite) {
-          json(res, 404, { error: "only the status page is served on this port" });
-          return;
-        }
-        if (isWrite) {
-          // Straight into the main handler. Reimplementing the gate here is how
-          // the two copies drift and one of them ends up missing a check, so
-          // there is exactly one implementation of /control and one of /v1/warm.
-          void handle(req, res).catch((e) => {
-            log.error("ui.write_failed", { error: e instanceof Error ? e.message : String(e) });
-            if (!res.headersSent) json(res, 500, { error: "internal error" });
-            else res.end();
-          });
-          return;
-        }
-        if (path === "/ui/events") {
-          void serveUiEvents(req, res, uiWritable).catch((e) => {
-            log.error("ui.stream_failed", { error: e instanceof Error ? e.message : String(e) });
-            res.end();
-          });
-          return;
-        }
-        void serveUi(path === "/ui/data" || path === "/ui/classic" ? path : "/ui", res, uiWritable).catch((e) => {
-          log.error("ui.failed", { error: e instanceof Error ? e.message : String(e) });
-          if (!res.headersSent) json(res, 500, { error: "internal error" });
-          else res.end();
-        });
-      })
-    : null;
-
   /** Expired sessions, swept like any other in-memory state; unref'd so it never holds the process. */
   const sessionSweep = setInterval(() => { sessions.prune(); }, 30 * 60_000);
   sessionSweep.unref?.();
@@ -1726,7 +1675,6 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   /** Where a Save goes: the config file when writable, else the sidecar, else nowhere. */
   return {
     server,
-    uiServer,
     pool,
     peers,
     history,
@@ -1743,10 +1691,6 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       peers.stop();
       pool.stop();
       history.stop();
-      // The page is not work. Nothing is lost by dropping a poll mid-flight,
-      // and a browser holding one open would otherwise pace the whole drain.
-      uiServer?.close();
-      uiServer?.closeAllConnections?.();
       // End event streams first, so pages start reconnecting at once.
       for (const res of streams) res.end();
       for (const res of queueStreams.keys()) res.end();

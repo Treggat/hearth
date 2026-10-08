@@ -28,6 +28,7 @@ import { PeerRegistry, type PeerCapacity } from "../src/peers.js";
 import { decide } from "../src/route.js";
 import { createNode, type HearthNode } from "../src/server.js";
 import { cleanStats, fitOutput, mergeStats, needsOf, statsFromModels, statsFromProps, unfit } from "../src/stats.js";
+import { parseV1 } from "./v1.js";
 
 /* ------------------------------------------------------------ reading props */
 
@@ -205,11 +206,11 @@ import { cleanStats, fitOutput, mergeStats, needsOf, statsFromModels, statsFromP
   assert.ok(cheap.tokens < 10_000, `videoTokens replaces the flat price, got ${cheap.tokens}`);
   assert.equal(unfit({ context: 32_768 }, cheap), null);
   assert.match(unfit({ context: 32_768 }, withVideo) ?? "", /context length exceeded/);
-  const vcfg = parseConfig({ backend: { url: "http://127.0.0.1:9292" }, models: { v: { videoTokens: 8192 }, w: {} } });
+  const vcfg = parseV1({ backend: { url: "http://127.0.0.1:9292" }, models: { v: { videoTokens: 8192 }, w: {} } });
   assert.equal(vcfg.models["v"]!.videoTokens, 8192);
   assert.equal(vcfg.models["w"]!.videoTokens, undefined, "unset means the flat default");
   for (const bad of [0, 1.5, "8192"]) {
-    assert.throws(() => parseConfig({ backend: { url: "http://127.0.0.1:9292" }, models: { v: { videoTokens: bad } } }), ConfigError);
+    assert.throws(() => parseV1({ backend: { url: "http://127.0.0.1:9292" }, models: { v: { videoTokens: bad } } }), ConfigError);
   }
 
   const withTools = needsOf({
@@ -319,7 +320,7 @@ const huge = { tokens: 100_000, images: false, tools: false };
 // A peer whose model is too small for THIS request is not a candidate for it.
 // The work comes home instead of crossing the network to be refused there.
 {
-  const cfg = parseConfig(base);
+  const cfg = parseV1(base);
   const d = decide("big", cfg, registry(cfg, { friend: peerCap(32768) }), here, huge);
   assert.equal(d.target, "local", "an oversized request stays home");
   assert.ok(d.reason.includes("friend"), `and says which peer could not take it: ${d.reason}`);
@@ -327,7 +328,7 @@ const huge = { tokens: 100_000, images: false, tools: false };
 
 // Same peer, same window, a request that fits: policy wins as it always did.
 {
-  const cfg = parseConfig(base);
+  const cfg = parseV1(base);
   const d = decide("big", cfg, registry(cfg, { friend: peerCap(32768) }), here,
                    { tokens: 100, images: false, tools: false });
   assert.equal(d.target, "peer");
@@ -338,7 +339,7 @@ const huge = { tokens: 100_000, images: false, tools: false };
 // reports nothing — and reading that as "too small" would silently end
 // federation for everyone who has not upgraded.
 {
-  const cfg = parseConfig(base);
+  const cfg = parseV1(base);
   const d = decide("big", cfg, registry(cfg, { friend: peerCap(null) }), here, huge);
   assert.equal(d.target, "peer", "silence is not a limit");
 }
@@ -346,7 +347,7 @@ const huge = { tokens: 100_000, images: false, tools: false };
 // And with no `need` at all — every caller that does not deal in chat payloads
 // — the decision is exactly what it was before this existed.
 {
-  const cfg = parseConfig(base);
+  const cfg = parseV1(base);
   const d = decide("big", cfg, registry(cfg, { friend: peerCap(32768) }), here);
   assert.equal(d.target, "peer");
 }
@@ -355,7 +356,7 @@ const huge = { tokens: 100_000, images: false, tools: false };
 // not a quiet local run, and the reason names the fit rather than pretending
 // the peer is down.
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     ...base,
     models: { big: { policy: "peer" as const, peers: ["friend"], fallbackLocal: false } },
   });
@@ -421,7 +422,7 @@ function listen(node: HearthNode): Promise<string> {
 {
   const be = swapBackend();
   await be.listen();
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -502,7 +503,7 @@ function listen(node: HearthNode): Promise<string> {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const url0 = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backends: [{ name: "embed", url: url0, kind: "single", serves: ["embed"] }],
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -537,7 +538,7 @@ function listen(node: HearthNode): Promise<string> {
 {
   const be = swapBackend();
   await be.listen();
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -591,7 +592,7 @@ function listen(node: HearthNode): Promise<string> {
     res.writeHead(404); res.end("nope");
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, kind: "none" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -620,7 +621,7 @@ function listen(node: HearthNode): Promise<string> {
 // Loud, unlike the same fields arriving from a peer. A silently ignored typo in
 // a file the operator wrote is discovered months later by its absence.
 {
-  const withStats = (stats: unknown) => () => parseConfig({
+  const withStats = (stats: unknown) => () => parseV1({
     name: "me",
     backend: { url: "http://127.0.0.1:1", serves: ["m"], kind: "none" },
     models: { m: { stats } },

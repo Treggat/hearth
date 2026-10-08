@@ -1,23 +1,8 @@
-/**
- * The status page: an HTML shell with the compiled console (src/ui/, built by esbuild)
- * inlined, so it stays one response behind the same privilege gate.
- */
+/** The console: an HTML shell with the compiled bundle and stylesheet inlined, so it is one response. */
 import { readFileSync } from "node:fs";
 
-/** The compiled console, beside this file once built; the fallback serves tsx runs of src/. */
-function clientBundle(): string {
-  try {
-    return inlineable(readFileSync(new URL("./ui-client.js", import.meta.url), "utf8"));
-  } catch {
-    return inlineable(readFileSync(new URL("../dist/ui-client.js", import.meta.url), "utf8"));
-  }
-}
-
-/** Escape `</script` so the bundle can sit inside a `<script>` element. */
-const inlineable = (js: string): string => js.replace(/<\/script/gi, "<\\/script");
-
-/** The 2.0 console's bundle and stylesheet, read the same way. */
-function consoleAsset(name: string): string {
+/** A built asset beside this file; the fallback serves tsx runs of src/. */
+function asset(name: string): string {
   try {
     return readFileSync(new URL(`./${name}`, import.meta.url), "utf8");
   } catch {
@@ -25,28 +10,12 @@ function consoleAsset(name: string): string {
   }
 }
 
-/** The 2.0 console, served at /ui/next while it reaches parity with this one. */
 export const CONSOLE_HTML = `<!doctype html>
 <title>hearth</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23e65909' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3q1 4 4 6.5t3 5.5a1 1 0 0 1-14 0 5 5 0 0 1 1-3 1 1 0 0 0 5 0c0-2-1.5-3-1.5-5q0-2 2.5-4'/%3E%3C/svg%3E">
 <script>try{var t=localStorage.getItem("hearth.theme");if(t==="dark"||(!t&&matchMedia("(prefers-color-scheme: dark)").matches))document.documentElement.classList.add("dark")}catch(e){}</script>
-<style>${consoleAsset("console.css").replace(/<\/style/gi, "<\\/style")}</style>
+<style>${asset("console.css").replace(/<\/style/gi, "<\\/style")}</style>
 <div id="root"></div>
-<script>${inlineable(consoleAsset("console.js"))}</script>
-`;
-
-export const UI_HTML = `<title>Hearth Console</title>
-<!-- Without this a phone lays the page out at a 980px virtual viewport and
-     zooms out, so the responsive rules never fire — the breakpoints were dead
-     code. Caught by measuring the layout viewport on a 375px device, not by
-     reading the CSS. -->
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  /* Background before React mounts, so a dark theme does not flash white. Keep in step with src/ui/theme.ts. */
-  html { background: #EFE8DF; color-scheme: light dark; }
-  @media (prefers-color-scheme: dark) { html { background: #1a1924; } }
-  body { margin: 0; }
-</style>
-<div id="root"></div>
-<script>${clientBundle()}</script>
+<script>${asset("console.js").replace(/<\/script/gi, "<\\/script")}</script>
 `;

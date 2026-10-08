@@ -21,9 +21,9 @@ import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { parsePlacement } from "../src/kinds.js";
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 interface Offload { model: string; cpuLayers: number | null; cpuExpertsAll: boolean; cpuOnly: boolean }
 interface UiBackend { name: string; loaded?: string[]; loading?: string[]; offload?: Offload[] }
@@ -81,7 +81,7 @@ const swap = () => {
 const { s, say, hits } = swap();
 await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "load",
     resources: { gpu: { kind: "gpu" } },
     backends: [{

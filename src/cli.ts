@@ -3,20 +3,23 @@
  * hearth serve [--config path] [--check]
  * hearth init  [--config path]
  * hearth set-operator <user> <pass> [--config path]
+ * hearth migrate [--config path]
  *
  * `init` probes the usual local server ports and writes a runnable config; `serve --check`
  * validates and exits, for ExecStartPre. `set-operator` writes the login credential into the
  * config: the file holds only a scrypt salt:hash of the password, which verifies and reveals
  * nothing. The previous file is backed up beside it, and a restart picks the login up.
+ * `migrate` rewrites a v1 hearth.yaml into the v2 layout, keeping comments and a backup.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { parseArgs } from "node:util";
 
-import { ConfigError, loadConfig } from "./config.js";
+import { ConfigError, loadConfig, parseConfig } from "./config.js";
 import { writeFileAtomic } from "./configfile.js";
 import { LEVELS, createLogger, type Level } from "./log.js";
 import { hashPassword } from "./login.js";
+import { migrateDoc, v1Marker } from "./migrate.js";
 import { createNode } from "./server.js";
 import { getJson } from "./upstream.js";
 import { parseDocument } from "yaml";
@@ -53,17 +56,20 @@ listen:
   host: 127.0.0.1
   port: 4141
 
-backend:
-  # ${found ? "Found by probing." : "GUESS. Nothing answered on the usual ports, so set this yourself."}
-  url: ${backendUrl}
-  # llama-swap has /running, which lets the scheduler prefer whatever model is
-  # already loaded. Harmless to leave on elsewhere, it just never applies.
-  llamaSwapExtras: true
+backends:
+  main:
+    # ${found ? "Found by probing." : "GUESS. Nothing answered on the usual ports, so set this yourself."}
+    url: ${backendUrl}
+    # llama-swap reports what is loaded, which lets the scheduler prefer it.
+    # Use none for a server that cannot say.
+    kind: llama-swap
 
-scheduler:
+backendDefaults:
   # One GPU fits one model at a time. Only raise this if your backend really
   # does serve in parallel (vLLM batches, llama.cpp can too with --parallel).
   concurrency: 1
+
+scheduler:
   # Per caller, per lane. 0 is off, and that's the default until apiKeys can
   # tell callers apart. Without keys every request is the same identity, so a
   # cap here would be a global limit rather than fairness.
@@ -75,13 +81,8 @@ scheduler:
     chat: { priority: 0 }     # a person is watching this
     batch: { priority: 100 }  # a render nobody is waiting on
 
-# The status page is on /ui, loopback-only. On a headless box or in a container
-# there is no browser on loopback, so uncomment this to give it its own socket.
-# That port serves the page and nothing else, but it takes no credential either
-# (a browser cannot send one), so put it somewhere only you can reach.
-# uiListen:
-#   host: 127.0.0.1
-#   port: 4142
+# The console is on /ui. Off this machine it asks for a login: set one with
+# \`hearth set-operator <user> <pass>\`.
 
 # Keys allowed on the OpenAI endpoints. Empty means no auth, which is only
 # reasonable while this is bound to loopback. Setting it means loopback needs a
@@ -90,33 +91,30 @@ apiKeys: []
 
 # --- lending and borrowing (both optional) ---------------------------------
 #
-# share: models you're willing to run for a peer. Empty lends nothing.
-share: []
+# Models peers may run here. Empty lends nothing. Borrowed work enters your
+# lowest-priority lane and is capped, so a guest can't queue ahead of you.
+lending:
+  models: []
 #
-# Borrowed work is pinned to your lowest-priority lane and capped, so a guest
-# can't queue ahead of you. Override with peerLane / peerMaxConcurrent.
-#
-# peerTokens: the token each peer presents to you. Generate with
+# One entry per friend. url + token to borrow from them, accept to lend to
+# them, or both. Generate a token with
 #   node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
-peerTokens: {}
-#   friend: env:HEARTH_PEER_FRIEND
-#
-# peers: nodes YOU can send work to.
-peers: []
-#   - name: friend
+peers: {}
+#   friend:
 #     url: http://100.x.y.z:4141
-#     token: env:HEARTH_TOKEN_FRIEND
+#     token: env:HEARTH_TO_FRIEND      # you present this to them
+#     accept: env:HEARTH_FROM_FRIEND   # they present this to you
 #     models:
 #       # my id: their id. Also the allowlist: a model that isn't mapped can
 #       # never be sent to them, whatever the policy below says.
 #       my-big-model: their-big-model
 #
-# models: routing policy. Anything not listed here stays local.
+# models: routing policy and notes. Anything not listed here stays local.
 models: {}
 #   my-big-model:
 #     policy: peer        # local | peer | spillover | fastest
 #     peers: [friend]
-#     fallbackLocal: true
+#     note: the 70B, for long documents
 `;
 }
 
@@ -187,8 +185,51 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "migrate") {
+    if (!existsSync(configPath)) {
+      console.error(`${configPath} does not exist`);
+      process.exit(1);
+    }
+    const text = readFileSync(configPath, "utf8");
+    const doc = parseDocument(text);
+    if (doc.errors.length > 0) {
+      console.error(`${configPath} is not valid YAML: ${doc.errors[0]!.message}`);
+      process.exit(1);
+    }
+    const raw = doc.toJS() as Record<string, unknown> | null;
+    if (!raw || v1Marker(raw) === null) {
+      console.log(`${configPath} is already in the v2 layout; nothing to do`);
+      return;
+    }
+    let moved: string[];
+    try {
+      moved = migrateDoc(doc);
+    } catch (e) {
+      console.error(`${configPath} was left alone: ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    }
+    // Same flow style as the file had, so a migration does not respace every list.
+    const out = doc.toString({ flowCollectionPadding: /[[{] \S/.test(text), lineWidth: 0 });
+    // Checked before writing: a migration that cannot load is a bug here, not something to leave behind.
+    try {
+      parseConfig(parseDocument(out).toJS());
+    } catch (e) {
+      // An env: secret this shell cannot see is not the migration's problem; the service has it.
+      if (!(e instanceof ConfigError && /environment variable/.test(e.message))) {
+        console.error(`migrated config does not load, so ${configPath} was left alone: ${e instanceof Error ? e.message : String(e)}`);
+        process.exit(1);
+      }
+    }
+    const backup = `${configPath}.v1-${new Date().toISOString().slice(0, 10)}`;
+    writeFileSync(backup, text);
+    writeFileAtomic(configPath, out);
+    for (const line of moved) console.log(`  ${line}`);
+    console.log(`${configPath} is now v2; the v1 file is at ${backup}`);
+    return;
+  }
+
   if (command !== "serve") {
-    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator`);
+    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator | hearth migrate`);
     process.exit(1);
   }
 
@@ -247,25 +288,6 @@ async function main(): Promise<void> {
       });
     }
   });
-
-  if (node.uiServer && cfg.uiListen) {
-    const { host, port } = cfg.uiListen;
-    node.uiServer.listen(port, host, () => {
-      log.info("listening.ui", {
-        addr: `${host}:${port}`,
-        detail: "status page only; every other path on this port is a 404",
-      });
-      if (host !== "127.0.0.1") {
-        // No credential can gate this: a browser navigating to a url cannot
-        // present a bearer token. Reachable therefore means readable.
-        log.warn("listening.ui_wide", {
-          host,
-          detail:
-            "anyone who can reach this port can read the queue, caller ids and model inventory — no key required",
-        });
-      }
-    });
-  }
 
   // A second signal stops immediately instead of waiting out the grace again.
   let stopping = false;

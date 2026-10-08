@@ -18,9 +18,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 interface Frame { event: string; data: Record<string, unknown> }
 
@@ -70,7 +70,7 @@ await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
 const backendUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
 
 const node = createNode(
-  parseConfig({ name: "sse", backends: [{ name: "b", url: backendUrl, serves: ["m"] }] }),
+  parseV1({ name: "sse", backends: [{ name: "b", url: backendUrl, serves: ["m"] }] }),
   silentLogger,
 );
 node.start();
@@ -87,7 +87,7 @@ const s = await listen(`${base}/ui/events`);
   for (const k of ["net", "q", "hist", "catalog", "config", "controls", "histKeep"]) {
     assert.ok(k in first!.data, `snapshot carries ${k}`);
   }
-  assert.equal(first!.data.canWarm, true, "and the socket's own capability, which no patch repeats");
+  assert.equal(first!.data.control, "open", "and how a write authenticates here");
   assert.equal(first!.data.histKeep, 120, "plus the ring size, so the page trims as we do");
 }
 
@@ -105,8 +105,7 @@ const s = await listen(`${base}/ui/events`);
   assert.ok(set, "a patch says what changed");
   assert.equal((set.calls as unknown[]).length, 1, "the call that just finished");
   assert.ok(!("hist" in set), "and does not resend history for a call");
-  assert.ok(!("canWarm" in set) && !("control" in set),
-    "socket facts belong to the connection, not the node — they never repeat");
+  assert.ok(!("operator" in set), "the signed-in operator is per connection and never repeats");
 }
 
 // --- a new sample is appended, not resent ----------------------------------
@@ -154,7 +153,7 @@ backend.close();
 // it is the only thing standing between a broken EventSource and a blank page.
 {
   const bundle = await import("node:fs").then((fs) =>
-    fs.readFileSync(new URL("../dist/ui-client.js", import.meta.url), "utf8"));
+    fs.readFileSync(new URL("../dist/console.js", import.meta.url), "utf8"));
   for (const needle of ["/ui/events", "EventSource", "/ui/data"]) {
     assert.ok(bundle.includes(needle), `the built page references ${needle}`);
   }

@@ -22,9 +22,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 let release: () => void = () => {};
 const held = () => new Promise<void>((r) => { release = r; });
@@ -65,7 +65,7 @@ const backendUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`
 
 // No apiKeys: loopback is trusted, so the passthrough needs no credential here.
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "pt-test",
     backends: [{
       name: "img", url: backendUrl, kind: "llama-swap",

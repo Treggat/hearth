@@ -21,14 +21,15 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { BackendPool } from "../src/pool.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 // --- config: shorthand, defaults, and the mistakes worth naming ------------
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "t",
     backends: [{ name: "sd", url: "http://127.0.0.1:7860", routes: ["/sdapi/v1/txt2img"] }],
   });
@@ -43,7 +44,7 @@ import { createNode } from "../src/server.js";
 }
 
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "t",
     scheduler: { lanes: { chat: { priority: 0 }, video: { priority: 150 } } },
     backends: [
@@ -67,7 +68,7 @@ for (const [bad, why] of [
   [{ routes: [{ path: "/x", lane: "nope" }] }, "an unknown lane is a typo, not a new lane"],
 ] as const) {
   assert.throws(
-    () => parseConfig({ name: "t", backends: [{ name: "b", url: "http://127.0.0.1:1", ...bad }] }),
+    () => parseV1({ name: "t", backends: [{ name: "b", url: "http://127.0.0.1:1", ...bad }] }),
     ConfigError,
     why,
   );
@@ -75,7 +76,7 @@ for (const [bad, why] of [
 
 assert.throws(
   () =>
-    parseConfig({
+    parseV1({
       name: "t",
       backends: [
         { name: "a", url: "http://127.0.0.1:1", routes: ["/gen"] },
@@ -139,7 +140,7 @@ await new Promise<void>((r) => other.listen(0, "127.0.0.1", r));
 const otherUrl = `http://127.0.0.1:${(other.address() as AddressInfo).port}`;
 
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "routes",
     scheduler: { lanes: { chat: { priority: 0 }, video: { priority: 150 } } },
     backends: [
@@ -270,7 +271,7 @@ console.log("routes.test.ts ok");
 // overridden: the captured segment IS the model id, and the route only matches
 // when the backend actually serves it.
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "pat",
     backends: [
       {
@@ -311,7 +312,7 @@ console.log("routes.test.ts ok");
 // passthrough, and a `routes:` entry silently did nothing on the model it was
 // written for -- while the console drew an idle backend and a free card.
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "alias-pat",
     backends: [{
       name: "img", url: "http://127.0.0.1:1", serves: ["image"],
@@ -338,7 +339,7 @@ for (const bad of [
   { path: "/a/{lane}/b", why: "an unknown placeholder" },
 ]) {
   assert.throws(
-    () => parseConfig({
+    () => parseV1({
       name: "n", backends: [{ name: "b", url: "http://127.0.0.1:1", routes: [{ path: bad.path }] }],
     }),
     /at most one \{model\}|whole path segment|only placeholder is \{model\}/,
@@ -346,7 +347,7 @@ for (const bad of [
   );
 }
 assert.throws(
-  () => parseConfig({
+  () => parseV1({
     name: "n",
     backends: [{
       name: "b", url: "http://127.0.0.1:1",
@@ -401,7 +402,7 @@ assert.throws(
   const url = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
 
   const node = createNode(
-    parseConfig({
+    parseV1({
       name: "alias",
       backends: [{
         name: "ollama", url, serves: [wire, "plain"],
@@ -491,7 +492,7 @@ assert.throws(
   const url = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
 
   const node = createNode(
-    parseConfig({
+    parseV1({
       name: "two-embedders",
       backends: [{
         name: "ollama", url, kind: "ollama", concurrency: 2,

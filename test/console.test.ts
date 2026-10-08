@@ -6,11 +6,11 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
-const node = createNode(parseConfig({
+const node = createNode(parseV1({
   name: "n", apiKeys: ["secret-key"], backend: { url: "http://127.0.0.1:1", kind: "none", serves: ["m"] },
 }), silentLogger);
 await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));
@@ -20,7 +20,7 @@ assert.equal(r.status, 200);
 assert.match(r.headers.get("content-type") ?? "", /text\/html/);
 assert.match(html, /<div id="root"><\/div>/);
 assert.match(html, /<style>[^]*--accent[^]*<\/style>/, "the stylesheet is inlined, so nothing loads from elsewhere");
-assert.ok(!/<script src=|<link [^>]*href=/.test(html), "no external assets");
+assert.ok(!/<script src=|<link [^>]*href="(?!data:)/.test(html), "no external assets: an icon is a data: URI");
 assert.ok(!html.includes("secret-key"), "no credential may appear in the page");
 await node.close();
 

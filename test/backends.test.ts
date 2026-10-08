@@ -16,10 +16,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { BackendPool } from "../src/pool.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A backend that can be told to hold a generation open. */
 function fake(label: string, models: string[]) {
@@ -67,7 +67,7 @@ await gpu.listen();
 await side.listen();
 
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "two-backends",
     backends: [
       { name: "gpu", url: gpu.url(), kind: "llama-swap", concurrency: 1 },
@@ -220,7 +220,7 @@ side.close();
   await mute.listen();
 
   const n4 = createNode(
-    parseConfig({
+    parseV1({
       name: "warmth",
       backends: [
         { name: "oll", url: ollamaUrl, kind: "ollama" },
@@ -280,7 +280,7 @@ side.close();
   await bare.listen();
 
   const n3 = createNode(
-    parseConfig({
+    parseV1({
       name: "declared",
       backends: [
         { name: "swap", url: swap.url(), llamaSwapExtras: false },
@@ -358,7 +358,7 @@ side.close();
   await local.listen();
 
   const n2 = createNode(
-    parseConfig({
+    parseV1({
       name: "borrower",
       backend: { url: local.url(), llamaSwapExtras: false },
       peers: [{ name: "vintage", url: `http://127.0.0.1:${peerPort}`, token: "t",
@@ -395,22 +395,22 @@ side.close();
 {
   const url = "http://127.0.0.1:9292";
   assert.throws(
-    () => parseConfig({ backend: { url }, backends: [{ name: "a", url }] }),
-    /not both/,
-    "backend and backends together is ambiguous, so it is refused",
+    () => parseV1({ backend: { url }, backends: [{ name: "a", url }] }),
+    /v1 layout \(it has backend\)/,
+    "backend and backends together is ambiguous, so migration leaves it for the operator",
   );
-  assert.throws(() => parseConfig({ backends: [] }), /must not be empty/);
+  assert.throws(() => parseV1({ backends: [] }), /must not be empty/);
   assert.throws(
-    () => parseConfig({ backends: [{ name: "a", url }, { name: "a", url }] }),
+    () => parseV1({ backends: [{ name: "a", url }, { name: "a", url }] }),
     /both named/,
   );
   assert.throws(
-    () => parseConfig({ backends: [{ name: "a", url }], models: { m: { backend: "b" } } }),
+    () => parseV1({ backends: [{ name: "a", url }], models: { m: { backend: "b" } } }),
     /not a configured backend/,
     "a typo'd backend name must fail at startup, not at request time",
   );
   assert.throws(
-    () => parseConfig({ backends: [
+    () => parseV1({ backends: [
       { name: "a", url, serves: ["m"] }, { name: "b", url, serves: ["m"] }] }),
     /both declare they serve/,
     "one id cannot mean two backends",
@@ -418,24 +418,24 @@ side.close();
 
   // The old boolean still maps onto the new kinds, and mixing the two spellings
   // is refused rather than silently resolved.
-  assert.equal(parseConfig({ backend: { url, llamaSwapExtras: true } }).backends[0]!.kind, "llama-swap");
-  assert.equal(parseConfig({ backend: { url, llamaSwapExtras: false } }).backends[0]!.kind, "none");
-  assert.equal(parseConfig({ backend: { url } }).backends[0]!.kind, "llama-swap", "unchanged default");
+  assert.equal(parseV1({ backend: { url, llamaSwapExtras: true } }).backends[0]!.kind, "llama-swap");
+  assert.equal(parseV1({ backend: { url, llamaSwapExtras: false } }).backends[0]!.kind, "none");
+  assert.equal(parseV1({ backend: { url } }).backends[0]!.kind, "llama-swap", "unchanged default");
   assert.throws(
-    () => parseConfig({ backend: { url, kind: "ollama", llamaSwapExtras: false } }),
+    () => parseV1({ backend: { url, kind: "ollama", llamaSwapExtras: false } }),
     /not both/,
   );
-  assert.throws(() => parseConfig({ backend: { url, kind: "vllm" } }),
+  assert.throws(() => parseV1({ backend: { url, kind: "vllm" } }),
     /expected llama-swap, ollama, single, none/);
 
   // Back-compat: a bare `backend:` is exactly a list of one, still named.
-  const one = parseConfig({ backend: { url }, scheduler: { concurrency: 3 } });
+  const one = parseV1({ backend: { url }, scheduler: { concurrency: 3 } });
   assert.equal(one.backends.length, 1);
   assert.equal(one.backends[0]!.name, "default");
   assert.equal(one.backends[0]!.concurrency, 3, "scheduler.concurrency is the default per backend");
 
   // Per-backend concurrency overrides it.
-  const many = parseConfig({
+  const many = parseV1({
     scheduler: { concurrency: 2 },
     backends: [{ name: "a", url }, { name: "b", url, concurrency: 9 }],
   });
@@ -456,7 +456,7 @@ side.close();
   const only = fake("only", ["real"]);
   await only.listen();
   const declared = createNode(
-    parseConfig({
+    parseV1({
       name: "declared",
       backends: [{ name: "gpu", url: only.url(), serves: ["real"] }],
     }),
@@ -486,7 +486,7 @@ side.close();
 
   // The control: a backend that did NOT declare its models keeps the old
   // fallback, because nothing here can prove the id is wrong.
-  const discovering = new BackendPool(parseConfig({
+  const discovering = new BackendPool(parseV1({
     name: "discovering",
     backends: [{ name: "a", url: only.url() }],
   }), silentLogger);

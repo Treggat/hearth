@@ -17,12 +17,12 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { Controls } from "../src/controls.js";
 import { silentLogger } from "../src/log.js";
 import { link, setShare, unlink } from "../src/configfile.js";
 import { decide } from "../src/route.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /* --------------------------------------------- the objects, in isolation */
 
@@ -33,7 +33,7 @@ import { createNode } from "../src/server.js";
   assert.deepEqual(c.share(["a", "b"]), [], "the master switch wins: a pause lends nothing");
 
   // Per-model lending edits share: itself, keeping the file's order and appending new ids.
-  const cfg = parseConfig({ name: "me", backend: { url: "http://127.0.0.1:1", serves: ["a", "b", "c"] }, share: ["a", "b"] });
+  const cfg = parseV1({ name: "me", backend: { url: "http://127.0.0.1:1", serves: ["a", "b", "c"] }, share: ["a", "b"] });
   setShare(cfg, "a", false);
   assert.deepEqual(cfg.share, ["b"], "withholding one leaves the rest");
   setShare(cfg, "c", true);
@@ -44,7 +44,7 @@ import { createNode } from "../src/server.js";
 {
   // A link is TWO writes. The route is the half that gets forgotten, so it is
   // asserted through decide() rather than by reading cfg back.
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: "http://127.0.0.1:1", serves: ["local-only"], kind: "none" },
     peers: [{ name: "friend", url: "http://127.0.0.1:2", token: "t", models: { known: "known" } }],
@@ -78,7 +78,7 @@ import { createNode } from "../src/server.js";
   // survived pointing at a peer it no longer had — and then would not save,
   // with an error about a line nobody had touched.
   {
-    const two = parseConfig({
+    const two = parseV1({
       name: "me",
       backend: { url: "http://127.0.0.1:1", serves: ["local-only"], kind: "none" },
       peers: [
@@ -96,7 +96,7 @@ import { createNode } from "../src/server.js";
   // Narrowing a list is not the same as emptying it: `peers: []` means "anyone
   // who maps it", which is WIDER than the list we started from.
   {
-    const three = parseConfig({
+    const three = parseV1({
       name: "me",
       backend: { url: "http://127.0.0.1:1", serves: ["x"], kind: "none" },
       peers: [
@@ -113,7 +113,7 @@ import { createNode } from "../src/server.js";
   // an unlink threw away a batch size and a backend pin that had nothing to do
   // with the peer — silently, and irreversibly once the config was written.
   {
-    const rich = parseConfig({
+    const rich = parseV1({
       name: "me",
       backends: [
         { name: "gpu", url: "http://127.0.0.1:1", serves: ["vllm-model"], kind: "none" },
@@ -132,7 +132,7 @@ import { createNode } from "../src/server.js";
   // the only thing that can check a model nobody has loaded. An unlink that
   // deleted the entry would take the window with it.
   {
-    const declared = parseConfig({
+    const declared = parseV1({
       name: "me",
       backend: { url: "http://127.0.0.1:1", serves: ["small"], kind: "none" },
       peers: [{ name: "a", url: "http://127.0.0.1:2", token: "t", models: { small: "theirs" } }],
@@ -176,7 +176,7 @@ function stubBackend() {
 const be = stubBackend();
 await be.listen();
 
-const cfg = parseConfig({
+const cfg = parseV1({
   name: "node-under-test",
   backend: { url: be.url(), kind: "none" },
   share: ["mine"],

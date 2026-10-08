@@ -9,7 +9,7 @@ import {
 import { CircuitBoard, Cpu, Flame, Globe, Server } from "lucide-react";
 import { memo, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 
-import type { Backend, Node as NetNode, Resource, UiData } from "../ui/types.js";
+import type { Backend, Node as NetNode, Resource, UiData } from "./types.js";
 import { control, select, useStore } from "./store.js";
 import { cx, Dot, type Tone } from "./ui.js";
 

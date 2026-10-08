@@ -7,9 +7,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { KINDS, type KindName } from "../src/kinds.js";
 import { silentLogger } from "../src/log.js";
+import { parseV1 } from "./v1.js";
 
 /** Paths the fake backend was asked, and how it answers an unload. */
 const asked: string[] = [];
@@ -56,7 +57,7 @@ for (const [name, k] of Object.entries(KINDS) as [KindName, (typeof KINDS)[KindN
   }
 
   // --- config: a kind that holds a model it cannot unload never shares a contested card
-  const shared = () => parseConfig({
+  const shared = () => parseV1({
     name: "t",
     resources: { gpu0: { kind: "gpu" } },
     backends: [
@@ -69,7 +70,7 @@ for (const [name, k] of Object.entries(KINDS) as [KindName, (typeof KINDS)[KindN
 }
 
 // --- the escape hatches the refusal names both work ---------------------------------
-parseConfig({
+parseV1({
   name: "t",
   resources: { gpu0: { kind: "gpu" } },
   backends: [
@@ -77,7 +78,7 @@ parseConfig({
     { name: "b", url, kind: "llama-swap", serves: ["b"], resources: ["gpu0"] },
   ],
 });
-parseConfig({
+parseV1({
   name: "t",
   resources: { cpu: { kind: "cpu", shared: true } },
   backends: [

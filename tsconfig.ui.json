@@ -1,7 +1,7 @@
 {
   // The browser half. Separate because it needs the DOM lib and JSX, and
-  // because tsc must NOT emit it: esbuild bundles src/ui/ into
-  // dist/ui-client.js, and a parallel set of loose .js files in dist would be
+  // because tsc must NOT emit it: esbuild bundles src/console/ into
+  // dist/console.js, and a parallel set of loose .js files in dist would be
   // dead weight that `files` would happily ship. noEmit here, typecheck only.
   "extends": "./tsconfig.json",
   "compilerOptions": {
@@ -11,5 +11,5 @@
     "types": []
   },
   "exclude": ["dist", "node_modules"],
-  "include": ["src/ui/**/*", "src/console/**/*"]
+  "include": ["src/console/**/*"]
 }

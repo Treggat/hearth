@@ -7,10 +7,10 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { networkInterfaces } from "node:os";
 
-import { parseConfig } from "../src/config.js";
 import { hashPassword } from "../src/login.js";
 import { createNode } from "../src/server.js";
 import { silentLogger } from "../src/log.js";
+import { parseV1 } from "./v1.js";
 
 const iface = Object.values(networkInterfaces())
   .flat()
@@ -20,7 +20,7 @@ if (!iface) {
   process.exit(0);
 }
 
-const cfg = parseConfig({
+const cfg = parseV1({
   backend: { url: "http://127.0.0.1:9292" },
   listen: { host: iface.address },
   // A key is set, as it is on the real box: loopback then needs one too, which is the
@@ -157,7 +157,7 @@ await node.close();
 
 // --- loopback is unchanged, and a node with no operator has no login ---------
 {
-  const plain = createNode(parseConfig({ backend: { url: "http://127.0.0.1:9292" } }), silentLogger);
+  const plain = createNode(parseV1({ backend: { url: "http://127.0.0.1:9292" } }), silentLogger);
   await new Promise<void>((r) => plain.server.listen(0, "127.0.0.1", r));
   const purl = `http://127.0.0.1:${(plain.server.address() as AddressInfo).port}`;
   const d = await fetch(`${purl}/ui/data`);

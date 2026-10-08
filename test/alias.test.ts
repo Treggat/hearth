@@ -15,9 +15,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A backend that only answers to its OWN id, like the real thing. */
 function pickyBackend(realId: string) {
@@ -78,7 +78,7 @@ const NICE = "nomic-embed";
 const be = pickyBackend(REAL);
 await be.listen();
 
-const cfg = parseConfig({
+const cfg = parseV1({
   name: "me",
   backends: [{ name: "ollama", url: be.url(), kind: "ollama" }],
   models: { [NICE]: { backend: "ollama", as: REAL } },
@@ -140,7 +140,7 @@ await node.pool.first().state.refresh();
 
 // --- a model without `as` is completely unaffected -------------------------
 {
-  const plain = parseConfig({ name: "p", backend: { url: be.url() } });
+  const plain = parseV1({ name: "p", backend: { url: be.url() } });
   assert.equal(plain.models["anything"]?.as ?? null, null);
 }
 
@@ -153,7 +153,7 @@ await node.pool.first().state.refresh();
 // wants both, and refusing it made the console's link button unusable for
 // exactly the models most worth linking.
 {
-  const both = parseConfig({
+  const both = parseV1({
     name: "x",
     backend: { url: be.url() },
     peers: [{ name: "f", url: "http://127.0.0.1:1", token: "t", models: { m: "their-m" } }],

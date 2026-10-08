@@ -15,10 +15,11 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { Scheduler } from "../src/scheduler.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 const lanes = {
   chat: { priority: 0 },
@@ -174,15 +175,15 @@ async function drain(jobs: Held[]): Promise<void> {
 // --- config -----------------------------------------------------------------
 {
   const base = { backend: { url: "http://127.0.0.1:9292" } };
-  const cfg = parseConfig({ ...base, scheduler: { lanes: { chat: { priority: 0 }, memory: { priority: 100, concurrency: 2 } } } });
+  const cfg = parseV1({ ...base, scheduler: { lanes: { chat: { priority: 0 }, memory: { priority: 100, concurrency: 2 } } } });
   assert.equal(cfg.scheduler.lanes["memory"]!.concurrency, 2);
   assert.equal(cfg.scheduler.lanes["chat"]!.concurrency, undefined, "unset means no ceiling");
   assert.equal(cfg.scheduler.lanes["warm"]!.concurrency, undefined, "the lane hearth adds itself has none");
-  assert.equal(parseConfig(base).scheduler.lanes["batch"]!.concurrency, undefined, "nor do the default lanes");
+  assert.equal(parseV1(base).scheduler.lanes["batch"]!.concurrency, undefined, "nor do the default lanes");
 
   for (const bad of [0, -1, 1.5, "2", true]) {
     assert.throws(
-      () => parseConfig({ ...base, scheduler: { lanes: { chat: { priority: 0 }, memory: { priority: 100, concurrency: bad } } } }),
+      () => parseV1({ ...base, scheduler: { lanes: { chat: { priority: 0 }, memory: { priority: 100, concurrency: bad } } } }),
       (e: unknown) => e instanceof ConfigError && /scheduler\.lanes\.memory\.concurrency/.test(e.message),
       `concurrency: ${JSON.stringify(bad)} must be refused, naming the key`,
     );
@@ -213,7 +214,7 @@ async function drain(jobs: Held[]): Promise<void> {
   const beUrl = `http://127.0.0.1:${(be.address() as AddressInfo).port}`;
 
   const node = createNode(
-    parseConfig({
+    parseV1({
       name: "me",
       backends: [{ name: "swap", url: beUrl, kind: "none", concurrency: 4 }],
       scheduler: { lanes: { chat: { priority: 0 }, memory: { priority: 100, concurrency: 1 } } },
