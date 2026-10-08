@@ -58,6 +58,16 @@ function findings(d: UiData): Finding[] {
       go: () => { go("topology"); select({ kind: "peer", id: p.name }); },
     });
   }
+  // A link to a model the peer no longer lends routes nowhere: every request for it fails or falls back.
+  for (const p of d.net.nodes.filter((n) => !n.self && n.up)) {
+    const dead = Object.keys(p.map ?? {}).filter((m) => !(p.serves ?? []).includes(m));
+    if (dead.length) {
+      out.push({
+        tone: "warn", text: `${p.name} no longer offers ${dead.slice(0, 2).join(", ")}${dead.length > 2 ? ` and ${dead.length - 2} more` : ""} — relink or remove`,
+        go: () => { go("topology"); select({ kind: "peer", id: p.name }); },
+      });
+    }
+  }
   for (const b of self.backends ?? []) {
     if (b.answering === false) out.push({ tone: "bad", text: `${b.name} not answering`, go: () => { go("topology"); select({ kind: "backend", id: b.name }); } });
   }

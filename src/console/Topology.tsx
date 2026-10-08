@@ -10,7 +10,7 @@ import { CircuitBoard, Cpu, Flame, Globe, Server } from "lucide-react";
 import { memo, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 
 import type { Backend, Node as NetNode, Resource, UiData } from "../ui/types.js";
-import { select, useStore } from "./store.js";
+import { control, select, useStore } from "./store.js";
 import { cx, Dot, type Tone } from "./ui.js";
 
 type Card = { title: string; sub: string; tone: Tone; icon: ReactNode; meter?: [number, number]; busy?: boolean; selected?: boolean };
@@ -73,10 +73,32 @@ const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
   );
 });
 
-const nodeTypes = { card: CardNode, hardware: GroupNode };
+/** A model a peer lends: solid when linked, a ghost when only on offer, red when the link no longer resolves. */
+type Ghost = { label: string; state: "linked" | "offered" | "dead"; warm: boolean; busy: boolean; hint: string; onClick: () => void };
+
+const GhostNode = memo(function GhostNode({ data }: NodeProps<Node<Ghost>>) {
+  return (
+    <button title={data.hint} onClick={(e) => { e.stopPropagation(); data.onClick(); }}
+            className={cx(
+              "flex h-[30px] w-[190px] items-center gap-1.5 rounded-lg border px-2 text-left text-[11px] transition-colors",
+              data.state === "linked" && "border-line bg-panel shadow-sm",
+              data.state === "offered" && "border-dashed border-line/80 bg-transparent text-dim opacity-60 hover:opacity-100 hover:border-info",
+              data.state === "dead" && "border-bad/60 bg-bad/5 text-bad",
+              data.busy && "border-info",
+            )}>
+      <Dot tone={data.state === "dead" ? "bad" : data.busy ? "info" : data.warm ? "ok" : "dim"} pulse={data.busy} />
+      <span className="truncate font-mono">{data.label}</span>
+      {data.state === "offered" && <span className="ml-auto shrink-0 text-[10px] text-info">+ link</span>}
+      {data.state === "dead" && <span className="ml-auto shrink-0 text-[10px]">gone</span>}
+      <Handle type="source" position={Position.Right} />
+    </button>
+  );
+});
+
+const nodeTypes = { card: CardNode, hardware: GroupNode, ghost: GhostNode };
 
 type Pulse = { key: string; back: boolean; t: number };
-type Flow = { jobs: string[]; pulses: Pulse[]; color?: string; reverse?: boolean; dashed?: boolean };
+type Flow = { jobs: string[]; pulses: Pulse[]; color?: string; reverse?: boolean; dashed?: boolean; ghost?: boolean };
 
 const TRIP_MS = 900;
 
@@ -149,7 +171,7 @@ const FlowEdge = memo(function FlowEdge({ id, sourceX, sourceY, targetX, targetY
     <>
       <BaseEdge id={id} path={path} style={{
         stroke: hot ? color : data?.dashed ? "var(--bad)" : "var(--border)",
-        strokeWidth: hot ? 2 : 1, strokeDasharray: data?.dashed ? "4 4" : undefined, opacity: hot ? 0.45 : 0.8,
+        strokeWidth: hot ? 2 : 1, strokeDasharray: data?.dashed || data?.ghost ? "4 4" : undefined, opacity: hot ? 0.45 : data?.ghost ? 0.5 : 0.8,
       }} />
       {(data?.pulses ?? []).map((p) => (
         // Out runs source to target unless the edge is drawn the other way round; back is the opposite.
@@ -191,9 +213,14 @@ function layout(d: UiData, sel: { kind: string; id: string } | null) {
 
   const runningIds = new Map<string, string[]>();
   const peerIds = new Map<string, string[]>();
+  const peerModelIds = new Map<string, string[]>();
   for (const j of d.q.jobs) {
     if (j.state !== "running") continue;
-    if (j.offbox && j.peer) peerIds.set(j.peer, [...(peerIds.get(j.peer) ?? []), j.id]);
+    if (j.offbox && j.peer) {
+      peerIds.set(j.peer, [...(peerIds.get(j.peer) ?? []), j.id]);
+      const k = `${j.peer}\u0000${j.model}`;
+      peerModelIds.set(k, [...(peerModelIds.get(k) ?? []), j.id]);
+    }
     else if (j.backend) runningIds.set(j.backend, [...(runningIds.get(j.backend) ?? []), j.id]);
   }
 
@@ -265,9 +292,22 @@ function layout(d: UiData, sel: { kind: string; id: string } | null) {
       selected: is("self", self.name),
     } satisfies Card,
   });
+  // Each peer gets a block tall enough for its offer: linked models first, then what is only on offer.
+  const offerOf = (p: NetNode) => {
+    const served = new Set(p.serves ?? []);
+    const linked = Object.entries(p.map ?? {}).map(([mine, theirs]) => ({ mine, theirs, dead: p.up && !served.has(mine) }));
+    return { linked, offered: p.up ? (p.unmapped ?? []) : [] };
+  };
+  const CHIP = 38;
+  const blocks = peers.map((p) => {
+    const o = offerOf(p);
+    return Math.max(H, (o.linked.length + o.offered.length) * CHIP - 8);
+  });
+  let py = mid - (blocks.reduce((a, b) => a + b, 0) + GAP * (peers.length - 1)) / 2;
   peers.forEach((p: NetNode, i) => {
+    const block = blocks[i]!;
     nodes.push({
-      id: `peer:${p.name}`, type: "card", position: { x: X.peer, y: mid - (peers.length * (H + GAP)) / 2 + i * (H + GAP) },
+      id: `peer:${p.name}`, type: "card", position: { x: X.peer, y: py + (block - H) / 2 },
       data: {
         title: p.name, icon: <Globe size={14} />, tone: p.up ? "ok" : "bad",
         sub: p.up ? `${Object.keys(p.map ?? {}).length} linked · ${p.free ?? 0}/${p.slots ?? 0} free` : "down",
@@ -279,6 +319,35 @@ function layout(d: UiData, sel: { kind: string; id: string } | null) {
       id: `e:peer:${p.name}`, source: `peer:${p.name}`, target: "self", type: "flow",
       data: { jobs: peerIds.get(p.name) ?? [], pulses: pulsesFor(`e:peer:${p.name}`, peerIds.get(p.name) ?? []), color: "var(--info)", reverse: true, dashed: !p.up },
     });
+
+    // What they lend, as chips to their left; our requests carry on through the peer into the model they asked for.
+    const o = offerOf(p);
+    const chips = [
+      ...o.linked.map((l) => ({ key: l.mine, label: l.mine === l.theirs ? l.mine : `${l.mine} → ${l.theirs}`, state: (l.dead ? "dead" : "linked") as Ghost["state"], mine: l.mine, theirs: l.theirs })),
+      ...o.offered.map((m) => ({ key: m, label: m, state: "offered" as const, mine: m, theirs: m })),
+    ];
+    chips.forEach((c, k) => {
+      const id = `ghost:${p.name}:${c.key}`;
+      const jobs = c.state === "offered" ? [] : peerModelIds.get(`${p.name}\u0000${c.mine}`) ?? [];
+      const ctx = p.stats?.[c.mine]?.context;
+      nodes.push({
+        id, type: "ghost", position: { x: X.peer - 230, y: py + k * CHIP },
+        data: {
+          label: c.label, state: c.state, warm: (p.loaded ?? []).includes(c.mine), busy: jobs.length > 0,
+          hint: c.state === "dead" ? `${p.name} no longer offers ${c.theirs} — this link routes nowhere`
+            : c.state === "offered" ? `${p.name} offers ${c.theirs} — click to borrow it`
+            : `linked${ctx ? ` · ${Math.round(ctx / 1024)}k context` : ""}${(p.loaded ?? []).includes(c.mine) ? " · warm" : ""}`,
+          onClick: c.state === "offered"
+            ? () => void control({ link: { peer: p.name, mine: c.theirs, theirs: c.theirs } }, `linked ${c.theirs} from ${p.name}`)
+            : () => select({ kind: "peer", id: p.name }),
+        } satisfies Ghost,
+      });
+      edges.push({
+        id: `e:${id}`, source: id, target: `peer:${p.name}`, type: "flow",
+        data: { jobs, pulses: pulsesFor(`e:${id}`, jobs), color: "var(--info)", reverse: true, dashed: c.state === "dead", ghost: c.state === "offered" },
+      });
+    });
+    py += block + GAP;
   });
   return { nodes, edges };
 }
@@ -298,6 +367,7 @@ export function Topology() {
       colorMode={dark ? "dark" : "light"} proOptions={{ hideAttribution: true }}
       onNodeClick={(_, n) => {
         const [kind, ...rest] = n.id.split(":");
+        if (kind === "ghost") return;
         select(kind === "self" ? { kind: "self", id: data.net.nodes.find((x) => x.self)!.name } : { kind: kind as "peer", id: rest.join(":") });
       }}
       onPaneClick={() => select(null)}
