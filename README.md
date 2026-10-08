@@ -122,6 +122,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `scheduler.maxPerCaller` | `0`, or `2` with apiKeys | queued-or-running jobs per caller per lane. Off without apiKeys, where every local caller is one identity |
 | `models.<id>` | — | routing policy per model. Anything unlisted stays local |
 | `models.<id>.note` | unset | what the model is for. Shown to borrowers and as `description` on `/v1/models`. A note alone routes nothing |
+| `canary` | unset | ask named models a question with one right answer, on a schedule, so a seat that answers `200` with nothing worth reading is taken out of rotation instead of called healthy. Off unless configured; restart-only. See [A seat that answers 200 with nothing](#a-seat-that-answers-200-with-nothing) |
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
 | `models.<id>.follow` | `false` | go out as whatever the pinned backend has loaded, and as `as` when nothing is (or when `as` is among several loaded). Needs `backend` and `as`. It follows any model, a non-chat one included, so pin it to a backend that serves one kind |
 | `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. See below |
@@ -354,13 +355,18 @@ gone:
 ```json
 {"ok":true,"name":"web",
  "backends":{"total":9,"watched":2,"connected":2},
- "peers":{"total":1,"up":1}}
+ "peers":{"total":1,"up":1},
+ "canary":{"enabled":true,"degraded":0}}
 ```
 
 `watched` is the backends whose event stream hearth holds open — llama-swap,
 today. That connection is the signal: when the backend dies the stream drops,
 and hearth knows within a reconnect without having asked it anything. `503`
 means every one of them is gone.
+
+`canary`, when a canary is configured, is how many models are **degraded** —
+answering, but not with an answer. See below; this endpoint is unauthenticated,
+so it is a count here and the name is on the page.
 
 What this is deliberately NOT built on is "have we heard from it lately". On an
 idle box nothing is heard from anything, so that reads silent across the board
@@ -380,6 +386,164 @@ health.
 It is unauthenticated and the main port may be bound wide, so it reports counts
 and never names. Model ids, backend names and peer names stay behind the page's
 gate.
+
+## A seat that answers 200 with nothing
+
+Every check above asks whether the backend is reachable. None of them asks
+whether it still knows anything, and on 2026-10-07 that gap cost hours: a vLLM
+seat on a B70 returned `200 OK` with nothing but `!` characters for every
+request, `finish_reason: length`, while llama-swap said `ready`, vLLM's metrics
+counted the requests as successes, and `/healthz` said `ok`. The seat was up. It
+was just not answering. Everything downstream of hearth — agents, memory steps,
+anything with a retry budget — spent that morning reading exclamation marks.
+
+A canary closes it. Off unless you configure it, because a heartbeat that talks
+to a model on its own schedule is not something to switch on for someone:
+
+```yaml
+canary:
+  # The question, and what a correct answer must match. These defaults are the
+  # ones card B was measured with; the capital of France needs one word.
+  prompt: "What is the capital of France? Reply with the city name only."
+  expect: "Paris"            # a regex, case-insensitive
+  maxTokens: 512             # a reasoning model's trace shares this budget
+  timeoutMs: 30000
+  intervalMs: 30000          # between probes of one model
+  failureThreshold: 2        # consecutive failures before `degraded`
+  recoverAfter: 1            # consecutive clean probes before back in rotation
+  passive: true              # count degenerate output in real traffic too
+
+  # Which models to ask. Opting in is naming one.
+  models:
+    gpu2: {}                 # gpt-oss reasons before it answers: give it room
+    gpt-oss:
+      maxTokens: 1024
+
+  # Or an entire backend at once: every model it serves.
+  # backends:
+  #   cardb: {}
+
+  notify:
+    url: "http://192.168.1.3:9876/api/notifications"
+    headers:
+      x-api-key: "env:UNRAID_API_KEY"   # env:NAME keeps the key out of the file
+    timeoutMs: 5000
+
+  recovery:
+    unload: true             # drop just that model; the next request reloads it
+    cooldownMs: 600000
+```
+
+A probe is a real chat completion through the model's own lane, at the warm
+lane's lowest priority, so it yields to everything real. It is skipped — never
+queued, never retried in a loop — when the seat is busy or the model is not
+resident. **A canary never loads a model and never evicts one**: probing a cold
+model through llama-swap would load it, so a cold model is simply not asked, and
+the probe job is submitted without a hardware claim so it cannot clear a
+neighbour off the card.
+
+### What a verdict means
+
+Each answer is one of:
+
+| reason | what it means | counts? |
+|---|---|---|
+| `ok` | matched `expect`, and reads like language | no |
+| `empty` | nothing came back in the content channel | yes |
+| `degenerate` | one character or one token repeated, near-zero distinct characters, or the token cap reached without answering | yes |
+| `missing` | a real answer that does not answer the question | yes |
+| `transport` / `timeout` | the request failed or ran past `timeoutMs` | yes |
+| `thinking` | the budget went to the reasoning channel and `content` is empty — the probe asked for too little | **no** |
+| `skipped` | the probe could not take a lane | **no** |
+
+The last two are the ones that keep this from being a false-alarm generator. A
+reasoning model given 16 tokens to answer in will produce an empty `content`
+with `finish_reason: length` while being perfectly healthy; that is our mistake
+and it is reported as inconclusive. So is a full queue. Neither degrades a seat.
+
+`passive: true` watches completions **as they are relayed** and counts a
+degenerate one immediately, through the same counters — so under a broken seat
+the second real client request is enough, without waiting for a probe. It
+observes, it does not filter: the bytes reach the client unchanged and undelayed,
+and a mangled answer is still the client's to see. The bar for calling real
+traffic degenerate is deliberately higher than for a canary answer (32 repeated
+characters, 8 repeated tokens), because refusing a working seat is worse than
+the outage.
+
+### When a model is degraded
+
+New requests get a fast `503` instead of junk, with the facts attached:
+
+```json
+{"error":{
+  "message":"model \"gpu2\" is degraded on cardb: the answer repeats itself (200 of the same character in a row) (since 2026-10-07T23:10:04.221Z). hearth refuses new requests rather than serving broken output; it returns to rotation after a clean canary probe.",
+  "type":"server_error",
+  "code":"model_degraded",
+  "model":"gpu2","backend":"cardb",
+  "reason":"degenerate",
+  "detail":"the answer repeats itself (200 of the same character in a row)",
+  "sample":"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+  "since":"2026-10-07T23:10:04.221Z",
+  "failures":2}}
+```
+
+`/v1/models` reports it as `status: {value: "degraded"}` rather than `loaded` —
+it is loaded, it is just not answering anything true — with the reason in
+`description`. `/healthz` counts it. The console's **Canary** panel names it,
+shows the sample, and says how long it has been out. Probes continue while
+degraded, and `recoverAfter` consecutive clean ones put it back.
+
+Peers are refused too: a degraded model is out of rotation for everyone.
+
+### Telling a human
+
+`notify` POSTs a JSON body on every state change. The four fields UnraidClaw's
+notification endpoint reads are always present, so this works as written —
+swap in your own key via `env:` and it belongs in the config file:
+
+```bash
+curl -X POST http://192.168.1.3:9876/api/notifications \
+  -H 'x-api-key: YOUR_KEY' -H 'Content-Type: application/json' \
+  -d '{"title":"hearth: gpu2 is degraded","subject":"gpu2 on cardb is answering, but not with an answer",
+       "description":"... 200 of the same character in a row. It returned: \"!!!!...\"",
+       "importance":"warning"}'
+```
+
+`title`, `subject`, `description` and `importance` carry the prose;
+`event`, `node`, `model`, `backend`, `reason`, `detail`, `sample`, `since`,
+`failures` (and `downMs` on recovery) carry the same thing structured, for
+whatever else you point it at. The hook is fire-and-forget: a webhook that is
+slow, wrong or down gets a line in the log and changes nothing else.
+
+### Gentle recovery, and what it actually does
+
+`recovery:` is its own opt-in, off unless declared, and it does exactly one
+thing: for a backend that can drop a single model, ask it to. This is
+llama-swap's own `POST /api/models/unload/<model_id>` (verified against its
+documentation, and held to a contract in `test/kinds.test.ts`) — **not**
+`/api/models/unload`, which clears the whole card and would evict a model that
+was working. The next request for the dropped model reloads it, which is the
+point: reloading is the gentlest thing that might fix a wedged seat.
+
+It is attempted at most once per `cooldownMs`, only while the model is resident,
+and **never on a busy seat** — no running job, nothing queued. The probe that
+follows is allowed to load the model back, but only while the card is otherwise
+empty, so the reload cannot evict a neighbour that real traffic loaded in the
+meantime. If the card is not free the reload waits and is logged; the model stays
+degraded and the human has already been told.
+
+If the backend cannot drop one model — `kind: vllm`, `ollama`, `single`, `none`
+— recovery is inert and the log says so. Recovery then means "notify only". For a
+seat where the whole process is wedged, restarting it is the operator's call, not
+hearth's.
+
+### What it costs
+
+One small completion per watched model per `intervalMs`, only while that model is
+resident and the seat is idle — a handful of tokens, through the lowest-priority
+lane. With the defaults above that is one probe every 30s per model, and none at
+all while the seat is busy. Nothing is sent when no canary is configured, and
+nothing about the passthrough paths changes.
 
 ## The status page
 

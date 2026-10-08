@@ -11,6 +11,12 @@ export class Refusal extends Error {
     readonly status: number,
     message: string,
     readonly type: string = "invalid_request_error",
+    /**
+     * Extra fields for the error envelope. A degraded model needs more than a
+     * sentence: the client should be able to read the reason and the bad output
+     * without going to the logs.
+     */
+    readonly extra: Record<string, unknown> | null = null,
   ) {
     super(message);
     this.name = "Refusal";

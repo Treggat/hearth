@@ -10,6 +10,33 @@ import type { PeerRegistry } from "./peers.js";
 import type { BackendPool } from "./pool.js";
 import type { ModelStats } from "./stats.js";
 
+/** One watched model, as the page draws it. */
+export interface CanaryModelView {
+  backend: string;
+  health: "ok" | "degraded";
+  failures: number;
+  lastProbeAt: number;
+  /** Why it is out, when it is. */
+  reason: string | null;
+  detail: string | null;
+  /** A bounded sample of the bad output. */
+  sample: string | null;
+  since: number | null;
+  /** A recovery drop happened and a clean probe has not confirmed the reload. */
+  reloadPending: boolean;
+  recoveryCount: number;
+}
+
+/** The canary, for the page. Always present, so "off" is visible rather than blank. */
+export interface CanaryView {
+  enabled: boolean;
+  /** Watching relayed traffic as well as probing. */
+  passive: boolean;
+  /** The gentle recovery is armed. */
+  recovery: boolean;
+  models: Record<string, CanaryModelView>;
+}
+
 export interface ViewDeps {
   cfg: HearthConfig;
   pool: BackendPool;
@@ -23,9 +50,11 @@ export interface ViewDeps {
   proxying: ReadonlySet<{ id: string; backend: string; model: string | null }>;
   /** How the page must authenticate its writes. */
   writeMode: () => "open" | "key";
+  /** The canary's state, and whether one is configured at all. */
+  canary: () => CanaryView;
 }
 
-export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode }: ViewDeps) {
+export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode, canary }: ViewDeps) {
   /**
    * Everything the page draws, shared by /ui/data and the event stream. Uses ensureFresh, never probeAll.
    */
@@ -46,6 +75,9 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
       // Where every edit lands, and what is waiting on a restart; replaces the old pending-changes block.
       config: config.status(),
       catalog: pool.catalog(),
+      // The canary's verdict per model. Present even when no canary is
+      // configured, so the page can say "off" instead of drawing nothing.
+      canary: canary(),
       contexts: (() => {
         const out: Record<string, number> = {};
         for (const id of pool.catalog()) {
