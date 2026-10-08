@@ -39,7 +39,6 @@ first, and a job earns priority the longer it waits so nothing starves.
 
 ```yaml
 scheduler:
-  concurrency: 1
   lanes:
     chat:  { priority: 0 }     # a person is watching this
     batch: { priority: 100 }   # a render nobody is waiting on
@@ -54,7 +53,7 @@ OpenAI schema, so hearth strips it before the request reaches your backend:
 
 Leave it out and the request lands in the first lane you declared.
 
-Peers don't get to choose. Borrowed work is pinned to `peerLane`, which defaults
+Peers don't get to choose. Borrowed work is pinned to `lending.lane`, which defaults
 to your lowest-priority lane. Lanes express the host's priorities, and a guest
 doesn't get a vote in them.
 
@@ -86,19 +85,34 @@ node with two backends lets the lane hold two slots on each.
 
 ## Configuration
 
-Every key with its default. Only `backend.url` is required.
+Every key with its default. Only one backend's `url` is required. A key hearth
+does not know is refused at startup, with the nearest real one suggested, so a
+typo never loads as a default.
+
+```yaml
+name: box
+backends:
+  main: { url: "http://127.0.0.1:8080", kind: llama-swap }
+```
+
+A file in the earlier layout (`backend:`, `share:`, `peerTokens:`, lists for
+`backends:` and `peers:`) is refused with one line pointing at `hearth migrate`,
+which rewrites it in place, comments kept, with the original saved beside it.
 
 | key | default | what it does |
 |---|---|---|
 | `name` | hostname | how this node identifies itself to peers |
 | `listen.host` / `.port` | `127.0.0.1` / `4141` | widening the host is deliberate, see Security |
-| `backend.url` | — | the OpenAI-compatible server you front. Shorthand for a `backends:` list of one |
-| `backend.llamaSwapExtras` | `true` | old spelling of `kind`: `true` is `llama-swap`, `false` is `none` |
-| `backends` | — | several local backends, each with its own queue. See below |
-| `backends[].serves` | discover | model ids this backend serves. Declaring replaces discovery and acts as an allowlist |
-| `backends[].kind` | `llama-swap` | where warm state comes from: `llama-swap`, `ollama`, `single`, `none` |
-| `backends[].activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
-| `scheduler.concurrency` | `1` | default jobs-at-once per backend; a backend can override it |
+| `backends.<name>` | — | a server hearth fronts, with its own queue. At least one. See below |
+| `backends.<name>.url` | — | the OpenAI-compatible server |
+| `backends.<name>.kind` | `llama-swap` | where warm state comes from: `llama-swap`, `ollama`, `single`, `none` |
+| `backends.<name>.serves` | discover | model ids this backend serves. Declaring replaces discovery and acts as an allowlist |
+| `backends.<name>.concurrency` | `backendDefaults` | jobs at once on this backend |
+| `backends.<name>.firstByteMs` / `.idleMs` | `backendDefaults` | per-backend deadlines. A sidecar that renders a clip before it answers at all needs a longer one than a chat server |
+| `backends.<name>.activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
+| `backendDefaults.concurrency` | `1` | jobs at once per backend, unless it sets its own |
+| `backendDefaults.firstByteMs` | `900000` | how long a backend may take to start answering. Catches one that accepts the connection and then never answers, which would otherwise hold its slot — and its card — until a restart. `0` waits forever |
+| `backendDefaults.idleMs` | `600000` | how long a backend may go silent once its answer has started. Catches a generation that hangs mid-stream. `0` waits forever |
 | `scheduler.lanes` | `chat`, `batch` | named lanes and their base priority |
 | `scheduler.lanes.<lane>.concurrency` | unset | the most slots of one backend this lane may hold at once. Unset is no ceiling. See Lanes |
 | `scheduler.lanes.<lane>.maxWaitMs` | unset | fail a queued job in this lane with a 503 once nothing on its backend has started for this long. A guard against a wedged backend, not a deadline: a slow queue that keeps moving never trips it |
@@ -106,33 +120,32 @@ Every key with its default. Only `backend.url` is required.
 | `scheduler.warmBonus` | `40` | priority discount for a model already loaded |
 | `scheduler.maxPerLane` | `100` | how long one lane's queue may get before new work is refused. Off-box jobs are bounded separately, on their own count |
 | `scheduler.maxPerCaller` | `0`, or `2` with apiKeys | queued-or-running jobs per caller per lane. Off without apiKeys, where every local caller is one identity |
-| `apiKeys` | `[]` | keys allowed on `/v1/*`. Empty means loopback only. Setting it means loopback needs a key too, including any local tool you point at this. An entry may be `{ key, label }` to name a caller — see below |
-| `uiListen` | unset | give the status page its own `{host, port}`. Unset keeps it on the main port, loopback-only |
-| `maxBodyBytes` | `33554432` | largest accepted request body |
-| `share` | `[]` | models you'll run for a peer. Empty lends nothing |
-| `notes` | `{}` | `model: text` telling borrowers what a model is for. Shown on their `/ui` and as `description` on `/v1/models` |
-| `peerTokens` | `{}` | `name: token` a peer presents to you |
-| `peerLane` | lowest-priority lane | which lane borrowed work enters |
-| `peerMaxConcurrent` | `2` | jobs one peer may have in flight |
-| `peerRateLimit` | `600` | peer inference requests per hour. Capacity polling has its own budget |
-| `peerFreshMs` | `4000` | how long a good peer reading is reused before a routing decision asks again |
-| `peerDownMs` | `30000` | how long a failed probe is remembered, so an outage doesn't make every local request pay the timeout |
-| `peerPollMs` / `peerStaleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
-| `peerFirstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
-| `backendFirstByteMs` | `900000` | the same for a local backend. Catches one that accepts the connection and then never answers, which would otherwise hold its slot — and its card — until a restart. `0` waits forever |
-| `backendIdleMs` | `600000` | how long a local backend may go silent once its answer has started. Catches a generation that hangs mid-stream, which would otherwise hold its slot and card until the client gives up. `0` waits forever |
-| `backends[].idleMs` | node default | per-backend override, for a sidecar that sends its headers early and then works silently |
-| `backends[].firstByteMs` | node default | per-backend override. A sidecar that renders a clip before it answers at all needs a longer one than a chat server, and a single number cannot be right for both |
-| `coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
-| `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them, which is what it used to do |
-| `peers` | `[]` | nodes you can send work to |
+| `models.<id>` | — | routing policy per model. Anything unlisted stays local |
+| `models.<id>.note` | unset | what the model is for. Shown to borrowers and as `description` on `/v1/models`. A note alone routes nothing |
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
-| `stateFile` | `null` | a sidecar from earlier versions. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 | `models.<id>.follow` | `false` | go out as whatever the pinned backend has loaded, and as `as` when nothing is (or when `as` is among several loaded). Needs `backend` and `as`. It follows any model, a non-chat one included, so pin it to a backend that serves one kind |
-| `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. `batch` is the older name for it. See below |
+| `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. See below |
 | `models.<id>.shareAfterMs` | unset | a turn joins this model's running turns only once each has run this long, so two turns started together do not both pay for sharing the card. Only matters where `concurrency` is above 1 |
 | `models.<id>.videoTokens` | `49152` | what one video costs this model when checking a request fits its context window. Size it from the seat: frames sampled per clip × tokens per frame |
-| `models` | `{}` | routing policy per model. Anything unlisted stays local |
+| `peers.<name>` | — | one entry per friend: `url` and `token` to borrow from them, `accept` to lend to them, or both |
+| `peers.<name>.url` | — | the peer's hearth, main port |
+| `peers.<name>.token` | — | what you present when borrowing from them |
+| `peers.<name>.accept` | — | what they present when borrowing from you. Without it they cannot |
+| `peers.<name>.models` | `{}` | `your id: their id` for each model you borrow. Also the allowlist |
+| `lending.models` | `[]` | models peers may run here. Empty lends nothing |
+| `lending.lane` | lowest-priority lane | which lane borrowed work enters |
+| `lending.maxConcurrent` | `2` | jobs one peer may have in flight |
+| `lending.rateLimit` | `600` | peer inference requests per hour. Capacity polling has its own budget |
+| `borrowing.firstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
+| `borrowing.freshMs` | `4000` | how long a good peer reading is reused before a routing decision asks again |
+| `borrowing.downMs` | `30000` | how long a failed probe is remembered, so an outage doesn't make every local request pay the timeout |
+| `borrowing.pollMs` / `.staleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
+| `borrowing.coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
+| `apiKeys` | `[]` | keys allowed on `/v1/*`. Empty means loopback only. Setting it means loopback needs a key too, including any local tool you point at this. An entry may be `{ key, label }` to name a caller — see below |
+| `operator` | unset | the console login, `{user, passHash}`. Written by `hearth set-operator`; see [The console](#the-console) |
+| `maxBodyBytes` | `33554432` | largest accepted request body |
+| `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them |
+| `stateFile` | unset | a console sidecar from before 2.0. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 
 Tokens accept `env:NAME`, so the config stays committable.
 
@@ -156,9 +169,9 @@ later entry unreachable because the first match wins. Both are refused at
 startup.
 
 The label is your word, not a secret, so it is never taken through `env:` and
-never hashed — and it appears wherever caller ids do, a widened `uiListen`
-port included. That is the one thing to weigh: name the keys you are content to
-see named on whatever the status page is reachable from. Leave a key bare and
+never hashed — and it appears wherever caller ids do, the console included.
+That is the one thing to weigh: name the keys you are content to see named by
+whoever can sign in to the console. Leave a key bare and
 it stays a hash.
 
 A key can also be **scoped** with `models:`. Every key above is a full local
@@ -183,16 +196,16 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 
 | path | who | what |
 |---|---|---|
-| `/ui` | loopback | the console: topology with live request flow, models and sharing, the queue and recent requests, and the config file by section. ⌘K jumps anywhere |
+| `/ui` | anyone | the console, a static shell; its data takes loopback or a login: topology with live request flow, models and sharing, the queue and recent requests, and the config file by section. ⌘K jumps anywhere |
 | `/control` | local | read or change what leaves this node: lending, borrowing, per-model sharing, peer model maps |
 | `/queue/events` | local | the caller's own jobs, pushed over SSE: a `snapshot` on connect, then `jobs` whenever the list changes (queued, started, finished, moved in line). One connection serves every job a client has, so it never needs to poll |
 | `X-Hearth-Job: <id>` | request header | the client's own id for this request (letters, digits, `._:-`, up to 128). It comes back as the job's `id` on `/queue` and `/queue/events`, so a client can match updates to its own work |
 | `X-Hearth-Queue: stream` | request header | on a streamed chat, open the stream while the request waits and send `: hearth-queue {"position":N}` comments (how many are ahead, the running turn included). OpenAI-style parsers skip comments. A failure after that arrives as an SSE `data: {"error": …}` frame, since the 200 is already sent |
 | `/config` | local | the config file itself: `GET` its text and status, `PATCH` paths or the whole text |
-| `/ui/classic` | loopback | the previous console, kept for one release |
+| `/login`, `/logout` | anyone | `POST {user, pass}` for the operator session cookie; 404 with no `operator` set |
 | `/network` | local | every node, what each one serves, and what's **loaded right now**. Also lists peer models you haven't mapped, which is usually the config mistake people actually make |
 | `/queue` | local | jobs in flight, with lane, caller and position |
-| `/ui/events` | same as `/ui` | the page's data, pushed. A snapshot then diffs |
+| `/ui/data`, `/ui/events` | loopback, or a login | the page's data, pushed. A snapshot then diffs |
 | `/healthz` | anyone | whether this node can serve. `503` when it can't. The one unauthenticated endpoint |
 | `/peer/hello`, `/peer/state` | peers | identity and capacity, per model |
 
@@ -220,8 +233,8 @@ nothing at all.
 
 A patch is a diff of the same object `/ui/data` serves, built by the same
 function, so the two transports cannot drift: add a field and both carry it.
-`canWarm` and `control` are the exception — they describe the SOCKET rather
-than the node, so they are stamped on the snapshot and never repeated.
+`operator` is the exception — it describes the connection rather than the
+node, so it is stamped on the snapshot and never repeated.
 
 `/ui/data` is unchanged and is still there. EventSource is the one transport an
 extension or a proxy can break in a way that looks like silence, so a stream
@@ -295,7 +308,7 @@ the count:
 
 ```yaml
 backends:
-  - name: comfy
+  comfy:
     url: http://127.0.0.1:8188
     kind: none
     resources: [gpu0]
@@ -397,11 +410,11 @@ Three of those are clickable on the main listener, and every one of them is a
 **runtime override that a restart discards**:
 
 - **lending** and **borrowing**, the two directions of federation, as separate
-  switches. Pausing lending empties your share list, so peers see a healthy node
+  switches. Pausing lending empties what you lend, so peers see a healthy node
   offering nothing and stop choosing you, rather than a wall of 403s that looks
   like a revoked token. Pausing borrowing removes peers as routing candidates,
   so a model with `fallbackLocal: false` refuses cleanly.
-- **lent / held per model**, on top of the `share:` list. You can hold back one
+- **lent / held per model**, on top of `lending.models`. You can hold back one
   model without pausing the rest, or lend one the file never listed. A model no
   backend here serves is refused — advertising it would 404 every request, and
   the peer's operator cannot tell that from a broken link.
@@ -468,7 +481,7 @@ and, if the file on disk does not load, `error`. `PATCH /config` edits it:
 ```bash
 # set or delete paths; anything the edit did not touch may have changed meanwhile
 curl -X PATCH localhost:4141/config -H 'content-type: application/json' \
-  -d '{"baseHash": "<hash>", "ops": [{"path": ["backendIdleMs"], "value": 300000}]}'
+  -d '{"baseHash": "<hash>", "ops": [{"path": ["backendDefaults", "idleMs"], "value": 300000}]}'
 
 # replace the whole file; refused with 409 unless baseHash is current
 curl -X PATCH localhost:4141/config -H 'content-type: application/json' \
@@ -479,45 +492,35 @@ Add `"dryRun": true` to see the resulting text without writing it. A refusal is
 `{"error": {"message", "path"}}`: 422 for a config that would not load (with the
 field), 409 for a conflict.
 
-The ui-only listener serves the page **without** these controls unless you set
-`uiListen.control: key`. It still states every fact, including the ones you
-cannot change there, and says where the control does live — a status page whose
-job is to state the state has to do that even when the state is boring.
-
 The history is a fixed ring of 120 samples taken every 5s, held in memory. It
 dies with the process, exactly like the queue does. Keeping it across restarts
 would mean choosing a storage engine, which is a much larger decision than
 "draw me a line".
 
-**The page is loopback-only, and `apiKeys` does not open it.** A browser loading
-a page cannot present a bearer token, and the alternatives are worse: a key in
-the query string ends up in logs and history, and one baked into the HTML is a
-live credential in a response body.
+### The console
 
-The simplest way to see it from elsewhere is a tunnel, which still arrives as
-loopback:
+`/ui` is open to anyone who can reach the port, but it is only a shell: every
+byte of data comes from `/ui/data` and `/ui/events`, and those answer loopback
+or a signed-in operator. **An api key does not open them.** A browser cannot
+send a bearer token on an `EventSource`, and the alternatives are worse: a key
+in the query string ends up in logs and history.
+
+From loopback the console needs nothing. From anywhere else, set a login once:
 
 ```bash
-ssh -N -L 4141:127.0.0.1:4141 you@your-box
+hearth set-operator admin 'a long passphrase'   # writes operator: {user, passHash}
 ```
 
-On a headless box or in a container, where there is no browser on loopback to
-tunnel to, give the page its own socket instead:
+The page then asks for it. A session is an HttpOnly, SameSite=Lax cookie that
+slides for 30 days and lives in memory, so a restart signs everyone out. It is a
+full local identity — `/control`, `/config` and the passthrough included — so
+treat the password like an unscoped api key. Failed logins are throttled per
+user and per address, and an unknown user costs the same scrypt as a known one.
 
-```yaml
-uiListen:
-  host: 100.64.0.5   # a tailnet address, not a LAN one
-  port: 4142
-```
-
-That is a second listener which serves `/ui` and `/ui/data` **and answers 404 to
-everything else** — no `/v1`, no passthrough to your backend, no peer protocol,
-no `/healthz`. Widening it cannot widen anything but the page, which is the
-whole reason it is a separate socket rather than a looser check on the main one.
-
-It still takes no credential, because it cannot. Anyone who can reach that port
-can read your queue, your caller ids and your model inventory. Put it behind a
-tailnet ACL and never on a LAN.
+The console is on the main port, so it is reachable wherever that port is. Bind
+it to a tailnet address rather than a LAN one, and never put a proxy in front of
+hearth: it decides local trust by source address, and a proxy makes every
+caller look like loopback.
 
 ## More than one local backend
 
@@ -528,8 +531,8 @@ port, under one federation identity:
 
 ```yaml
 backends:
-  - { name: gpu,  url: "http://127.0.0.1:8080",  llamaSwapExtras: true, concurrency: 1 }
-  - { name: side, url: "http://127.0.0.1:11434", llamaSwapExtras: false, concurrency: 4 }
+  gpu: { url: "http://127.0.0.1:8080", concurrency: 1, kind: llama-swap }
+  side: { url: "http://127.0.0.1:11434", concurrency: 4, kind: none }
 ```
 
 **Each backend is its own queue.** Its own concurrency, its own warm state, its
@@ -554,9 +557,9 @@ Say what each backend consumes and the ones that overlap take turns:
 
 ```yaml
 backends:
-  - { name: swap,       url: "http://127.0.0.1:9292", resources: [gpu0] }
-  - { name: swap-image, url: "http://127.0.0.1:9293", resources: [gpu1] }
-  - { name: deep,       url: "http://127.0.0.1:9294", resources: [gpu0, gpu1] }
+  swap: { url: "http://127.0.0.1:9292", resources: [gpu0] }
+  swap-image: { url: "http://127.0.0.1:9293", resources: [gpu1] }
+  deep: { url: "http://127.0.0.1:9294", resources: [gpu0, gpu1] }
 ```
 
 `swap` and `swap-image` never wait for each other. `deep` waits for both, and
@@ -613,9 +616,9 @@ resources:
   cpu:  { kind: cpu, shared: true }
 
 backends:
-  - { name: swap,  url: "...", resources: [gpu0] }
-  - { name: guard, url: "...", resources: [cpu] }
-  - { name: judge, url: "...", resources: [cpu] }
+  swap: { url: "...", resources: [gpu0] }
+  guard: { url: "...", resources: [cpu] }
+  judge: { url: "...", resources: [cpu] }
 ```
 
 `shared: true` means several backends may use it at once, and hearth does not
@@ -652,8 +655,8 @@ land on top of it. Mark it resident:
 
 ```yaml
 backends:
-  - { name: swap-image, url: "...", resources: [gpu1] }
-  - name: memory
+  swap-image: { url: "...", resources: [gpu1] }
+  memory:
     url: "http://127.0.0.1:18087"
     kind: none
     resources: [gpu1]
@@ -679,8 +682,8 @@ Naming the path is what identifies it:
 
 ```yaml
 backends:
-  - { name: llm, url: "http://127.0.0.1:11434", resources: [gpu0] }
-  - name: sd
+  llm: { url: "http://127.0.0.1:11434", resources: [gpu0] }
+  sd:
     url: "http://127.0.0.1:7860"
     resources: [gpu0]
     routes:
@@ -724,7 +727,7 @@ ceiling therefore belongs to the model, not the port:
 
 ```yaml
 backends:
-  - name: seat
+  seat:
     concurrency: 4       # what a model gets unless it says otherwise
 models:
   vllm-qwen:   { concurrency: 32 }   # vLLM's --max-num-seqs, or lower to cap latency
@@ -754,7 +757,7 @@ and one per model:
 
 ```yaml
 backends:
-  - name: ollama
+  ollama:
     kind: ollama
     concurrency: 2       # two models resident, so two streams
 models:
@@ -814,9 +817,11 @@ models:
 ```
 
 A request for `nomic-embed` is dispatched to the backend as
-`nomic-embed-text-v2-moe:latest`. This is the same rewrite `peers[].models`
-already does for a peer, applied to a local backend — so `as:` is refused on a
-model with a peer policy, where the peer's own mapping already owns the id.
+`nomic-embed-text-v2-moe:latest`. This is the same rewrite `peers.<name>.models`
+already does for a peer, applied to a local backend. The two never meet: `as:`
+applies only on the way to a local backend, and a request sent to a peer takes
+its id from that peer's own map. So one model can have both, which is what
+`fastest` across a local backend and a peer needs.
 
 The rewrite applies to **every** dispatch path, which is the part that matters:
 chat completions go through the router, while `/v1/embeddings` and the other
@@ -932,17 +937,12 @@ resident and serves them concurrently, so every member of that set is warm and
 there is no thrash to avoid. The status page drops its thrash warning entirely
 when nothing in the node evicts.
 
-`llamaSwapExtras: true` is still accepted and means `kind: llama-swap`; `false`
-means `kind: none`. Setting both is an error. Note that `false` no longer polls
-`/running`: it used to, which was contradictory, and if you want warm state from
-llama-swap you should say `kind: llama-swap`.
-
 If a backend names its models badly, name them yourself:
 
 ```yaml
 backends:
-  - { name: swap,  url: "http://127.0.0.1:8080" }
-  - { name: guard, url: "http://127.0.0.1:18081", llamaSwapExtras: false, serves: [guard] }
+  swap: { url: "http://127.0.0.1:8080" }
+  guard: { url: "http://127.0.0.1:18081", serves: [guard], kind: none }
 ```
 
 A bare `llama-server` reports the gguf path it was launched with, so discovery
@@ -1023,8 +1023,8 @@ without probing for it.
   resident model at a moment you did not choose. A peer that must obey is a peer
   who can thrash your GPU from across the tailnet.
 
-It is also gated by `share` — the same opt-in as chat, so a warm cannot reach a
-model you did not lend — and counts against `peerRateLimit`. A peer's warm is
+It is also gated by `lending.models` — the same opt-in as chat, so a warm cannot
+reach a model you did not lend — and counts against `lending.rateLimit`. A peer's warm is
 never routed onward: two nodes that each preferred the other would otherwise
 bounce one between them.
 
@@ -1034,9 +1034,9 @@ Both ends run hearth. Yours:
 
 ```yaml
 peers:
-  - name: friend
+  friend:
     url: http://100.x.y.z:4141
-    token: env:HEARTH_TOKEN_FRIEND
+    token: env:HEARTH_TOKEN_FRIEND   # you present this to them
     models:
       # my id: their id. Also the allowlist: a model that isn't mapped can
       # never be sent to them, whatever the policy below says.
@@ -1052,12 +1052,20 @@ models:
 Theirs, to accept it:
 
 ```yaml
-peerTokens:
-  you: env:HEARTH_PEER_YOU
-share: [their-big-model]   # empty by default, since lending is opt-in per model
-notes:
-  their-big-model: "Agent/coding work. 128k context; send reasoning_effort for harder tasks."
+peers:
+  you:
+    accept: env:HEARTH_PEER_YOU   # what you present, checked here
+
+lending:
+  models: [their-big-model]   # empty by default, since lending is opt-in per model
+
+models:
+  their-big-model:
+    note: "Agent/coding work. 128k context; send reasoning_effort for harder tasks."
 ```
+
+One entry per friend holds both directions: add `accept` to yours and `url` with
+a `token` to theirs, and each of you can borrow from the other.
 
 Both blocks can also be edited from `/ui` or `curl` while it runs, which is
 usually how they get written in the first place. Each change is live at once and
@@ -1347,7 +1355,7 @@ Measured against a real node in that configuration, with one model shared:
 | **no token, `/ui`** | **200** |
 
 A peer holding a valid token is still gated correctly — the token is checked
-before the address, so `share` holds. The hole is the unauthenticated case: it
+before the address, so `lending.models` holds. The hole is the unauthenticated case: it
 needs no credential, and it reaches `/v1`, `/queue`, `/network`, the passthrough
 and the status page.
 
@@ -1358,7 +1366,7 @@ then required from everyone.
 
 There's no TLS here and no defence against a determined attacker. Don't put this
 on the public internet. If you must, terminate TLS in front of it, set `apiKeys`,
-and lower `peerRateLimit`.
+and lower `lending.rateLimit`.
 
 Prompts sent to a peer leave your machine and land in their logs. The startup
 line names every model that can leave and every model you accept, so that fact
@@ -1383,9 +1391,9 @@ It asks on demand rather than on a timer, because routing is the only thing that
 consumes peer state, and something needed when asked should be fetched when
 asked. A timer spends requests whether or not anyone is using the thing, and
 still hands the decision a reading a whole interval old. Three guards keep that
-from costing more than it saves: a good reading is reused for `peerFreshMs`,
+from costing more than it saves: a good reading is reused for `borrowing.freshMs`,
 concurrent requests coalesce onto one probe, and a failure is remembered for
-`peerDownMs` so a broken peer can't make your local requests slower. An idle
+`borrowing.downMs` so a broken peer can't make your local requests slower. An idle
 node makes no peer traffic at all.
 
 Unknown always means local. A probe that doesn't answer in time is unknown.
@@ -1425,13 +1433,13 @@ backpressured. That leaked a scheduler slot, and at `concurrency: 1` it wedged
 the whole node until restart without logging a thing.
 
 [`test/ui.test.ts`](test/ui.test.ts) binds a node to every interface and knocks
-on `/ui` from this machine's own LAN address, with a valid api key, to prove the
-loopback gate holds anyway. It skips itself on a host with no routable
+on `/ui/data` from this machine's own LAN address, with a valid api key, to prove
+the gate holds anyway. It skips itself on a host with no routable
 interface rather than pretending to have checked.
 
-The page lives in [`src/ui/`](src/ui/) as ordinary `.tsx`.
+The page lives in [`src/console/`](src/console/) as ordinary `.tsx`.
 [`src/ui.ts`](src/ui.ts) is only the HTML shell, and it reads
-`dist/ui-client.js` — the esbuild bundle — in at import time. So `npm test`
+`dist/console.js` and `dist/console.css` in at import time. So `npm test`
 builds the browser half first (`pretest`), and `npm run typecheck` checks it
 against [`tsconfig.ui.json`](tsconfig.ui.json), which is also the tsconfig
 esbuild is pointed at: the JSX setting has to be one fact, or the bundle

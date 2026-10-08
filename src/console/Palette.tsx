@@ -34,13 +34,11 @@ export function Palette() {
     for (const b of self.backends ?? []) out.push({ id: `b:${b.name}`, label: b.name, hint: "backend", run: () => { go("topology"); select({ kind: "backend", id: b.name }); } });
     for (const p of d.net.nodes.filter((n) => !n.self)) out.push({ id: `n:${p.name}`, label: p.name, hint: p.up ? "peer" : "peer · down", run: () => { go("topology"); select({ kind: "peer", id: p.name }); } });
     for (const r of d.net.resources ?? []) out.push({ id: `r:${r.name}`, label: r.name, hint: r.holder ? `hardware · ${r.holder}` : "hardware", run: () => { go("topology"); select({ kind: "resource", id: r.name }); } });
-    if (d.canWarm) {
-      out.push({ id: "c:lend", label: d.controls.lending ? "Pause lending" : "Resume lending", hint: "switch", run: () => void control({ lending: !d.controls.lending }, d.controls.lending ? "lending paused" : "lending resumed") });
-      out.push({ id: "c:borrow", label: d.controls.borrowing ? "Pause borrowing" : "Resume borrowing", hint: "switch", run: () => void control({ borrowing: !d.controls.borrowing }, d.controls.borrowing ? "borrowing paused" : "borrowing resumed") });
-      for (const m of d.catalog) {
-        const lent = d.configuredShare.includes(m);
-        out.push({ id: `s:${m}`, label: `${lent ? "Hold" : "Lend"} ${m}`, hint: "sharing", run: () => void control({ share: { [m]: !lent } }, lent ? `holding ${m}` : `lending ${m}`) });
-      }
+    out.push({ id: "c:lend", label: d.controls.lending ? "Pause lending" : "Resume lending", hint: "switch", run: () => void control({ lending: !d.controls.lending }, d.controls.lending ? "lending paused" : "lending resumed") });
+    out.push({ id: "c:borrow", label: d.controls.borrowing ? "Pause borrowing" : "Resume borrowing", hint: "switch", run: () => void control({ borrowing: !d.controls.borrowing }, d.controls.borrowing ? "borrowing paused" : "borrowing resumed") });
+    for (const m of d.catalog) {
+      const lent = d.configuredShare.includes(m);
+      out.push({ id: `s:${m}`, label: `${lent ? "Hold" : "Lend"} ${m}`, hint: "sharing", run: () => void control({ share: { [m]: !lent } }, lent ? `holding ${m}` : `lending ${m}`) });
     }
     return out;
   }, [d]);

@@ -17,12 +17,12 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { BackendState } from "../src/backend.js";
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
+import { parseV1 } from "./v1.js";
 
 // --- config: parsing, defaults, and the path rule it shares with routes: ----
 {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "t",
     backends: [{
       name: "comfy", url: "http://127.0.0.1:1", kind: "none",
@@ -34,7 +34,7 @@ import { silentLogger } from "../src/log.js";
     "the block parses whole");
 
   // queued is optional; a backend with one queue just names running.
-  const one = parseConfig({
+  const one = parseV1({
     name: "t",
     backends: [{ name: "c", url: "http://127.0.0.1:1", kind: "none",
       activity: { path: "/q", running: "n" } }],
@@ -42,12 +42,12 @@ import { silentLogger } from "../src/log.js";
   assert.equal(one.backends[0]!.activity?.queued, null, "queued defaults to null");
 
   // A backend that speaks /v1 declares no activity, and that is the common case.
-  const none = parseConfig({ name: "t", backend: { url: "http://127.0.0.1:1", kind: "none" } });
+  const none = parseV1({ name: "t", backend: { url: "http://127.0.0.1:1", kind: "none" } });
   assert.equal(none.backends[0]!.activity, null, "absent means null, not a throw");
 }
 
 const bad = (activity: unknown, re: RegExp, why: string) =>
-  assert.throws(() => parseConfig({
+  assert.throws(() => parseV1({
     name: "t",
     backends: [{ name: "c", url: "http://127.0.0.1:1", kind: "none", activity }],
   }), re, why);

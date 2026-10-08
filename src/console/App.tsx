@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { Config } from "./config.js";
 import { History, Inspector, Models, Queue } from "./pages.js";
 import { Palette } from "./Palette.js";
-import type { UiData } from "../ui/types.js";
+import type { UiData } from "./types.js";
 import { go, login, logout, select, useStore, type Page } from "./store.js";
 import { Topology } from "./Topology.js";
 import { Button, Card, cx, Pill } from "./ui.js";
@@ -261,18 +261,17 @@ export default function App() {
           </button>
         ))}
         <div className="mt-auto px-2 text-[11px] text-dim max-md:hidden">
-          <div className="mb-2"><kbd className="rounded border border-line px-1">⌘K</kbd> to jump</div>
-          <a href="/ui/classic" className="hover:text-fg">classic console</a>
+          <div><kbd className="rounded border border-line px-1">⌘K</kbd> to jump</div>
         </div>
       </nav>
 
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-3 border-b border-line px-5">
-          <span className="font-semibold">{self?.name ?? "…"}</span>
+          <span className="shrink-0 font-semibold">{self?.name ?? "…"}</span>
           {dead ? <Pill tone="bad">unreachable</Pill> : <Pill tone={live ? "ok" : "warn"} pulse={live}>{live ? "live" : "polling"}</Pill>}
-          {data?.operator && <Pill tone="ok">signed in as {data.operator}</Pill>}
-          <div className="ml-4 min-w-0"><Health /></div>
-          <div className="ml-auto flex items-center gap-3">
+          {data?.operator && <span className="max-sm:hidden"><Pill tone="ok">signed in as {data.operator}</Pill></span>}
+          <div className="ml-2 min-w-0 flex-1 overflow-hidden"><Health /></div>
+          <div className="flex shrink-0 items-center gap-3">
             {data?.operator && (
               <button onClick={() => { void logout(); }} className="flex items-center gap-1.5 text-[12px] text-dim hover:text-fg" title="end this browser's session">
                 <LogOut size={14} /> sign out

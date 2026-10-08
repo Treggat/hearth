@@ -16,9 +16,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A backend that records exactly what it was sent. */
 function recordingBackend(realIds: string[]) {
@@ -79,7 +80,7 @@ const HIDDEN = "raw-hidden";  // a backend id that exists only to be renamed
 const be = recordingBackend([SEAT, HIDDEN]);
 await be.listen();
 
-const cfg = parseConfig({
+const cfg = parseV1({
   name: "me",
   backends: [{ name: "swap", url: be.url(), kind: "none" }],
   models: {
@@ -104,15 +105,15 @@ await node.pool.first().state.refresh();
 {
   const base = { name: "x", backend: { url: be.url() } };
   assert.throws(
-    () => parseConfig({ ...base, models: { m: { params: { model: "other" } } } }),
+    () => parseV1({ ...base, models: { m: { params: { model: "other" } } } }),
     (e: unknown) => e instanceof ConfigError && /use `as`/.test((e as Error).message),
     "stamping `model` is what `as` is for",
   );
-  assert.throws(() => parseConfig({ ...base, models: { m: { params: { messages: [] } } } }), ConfigError);
-  assert.throws(() => parseConfig({ ...base, models: { m: { params: { stream: true } } } }), ConfigError);
-  assert.throws(() => parseConfig({ ...base, models: { m: { params: { lane: "batch" } } } }), ConfigError);
-  assert.throws(() => parseConfig({ ...base, models: { m: { params: "low" } } }), ConfigError, "must be an object");
-  assert.equal(parseConfig({ ...base, models: { m: { params: {} } } }).models.m!.params, null, "empty is absent");
+  assert.throws(() => parseV1({ ...base, models: { m: { params: { messages: [] } } } }), ConfigError);
+  assert.throws(() => parseV1({ ...base, models: { m: { params: { stream: true } } } }), ConfigError);
+  assert.throws(() => parseV1({ ...base, models: { m: { params: { lane: "batch" } } } }), ConfigError);
+  assert.throws(() => parseV1({ ...base, models: { m: { params: "low" } } }), ConfigError, "must be an object");
+  assert.equal(parseV1({ ...base, models: { m: { params: {} } } }).models.m!.params, null, "empty is absent");
 }
 
 // --- the catalog lists every id that fronts the seat, AND the seat itself -----
@@ -207,7 +208,7 @@ be.close();
   const swapUrl = `http://127.0.0.1:${(swap.address() as AddressInfo).port}`;
 
   const n2 = createNode(
-    parseConfig({
+    parseV1({
       name: "me",
       backends: [{ name: "swap", url: swapUrl, kind: "llama-swap", concurrency: 1 }],
       models: {
@@ -264,7 +265,7 @@ be.close();
   // peer scoring it.
   {
     const n3 = createNode(
-      parseConfig({
+      parseV1({
         name: "me",
         backends: [{ name: "swap", url: swapUrl, kind: "llama-swap", concurrency: 4 }],
         models: {

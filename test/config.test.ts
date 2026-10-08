@@ -9,7 +9,8 @@ import assert from "node:assert/strict";
 
 import { ConfigError, parseConfig, peersMapping, type PeerConfig } from "../src/config.js";
 
-const minimal = { backend: { url: "http://127.0.0.1:9292" } };
+const minimal = { backends: { main: { url: "http://127.0.0.1:9292" } } };
+const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2:4141", token: "t", models });
 
 // --- defaults are safe -----------------------------------------------------
 {
@@ -21,40 +22,76 @@ const minimal = { backend: { url: "http://127.0.0.1:9292" } };
   assert.deepEqual(cfg.models, {}, "nothing is routed away by default");
 }
 
-// --- backend is mandatory, and must be a url -------------------------------
+// --- a backend is mandatory, and must be a url -----------------------------
 {
-  assert.throws(() => parseConfig({}), ConfigError);
-  assert.throws(() => parseConfig({ backend: { url: "127.0.0.1:9292" } }), /must start with http/);
+  assert.throws(() => parseConfig({}), /backends is required/);
+  assert.throws(() => parseConfig({ backends: {} }), /must not be empty/);
+  assert.throws(() => parseConfig({ backends: { main: { url: "127.0.0.1:9292" } } }), /must start with http/);
   // A trailing slash would otherwise produce //v1/chat/completions.
-  assert.equal(parseConfig({ backend: { url: "http://x:1/" } }).backends[0]!.url, "http://x:1");
+  assert.equal(parseConfig({ backends: { main: { url: "http://x:1/" } } }).backends[0]!.url, "http://x:1");
+  assert.equal(parseConfig(minimal).backends[0]!.name, "main", "the key is the name");
+  // A removed key fails loudly instead of quietly closing the port it used to open.
+  assert.throws(() => parseConfig({ ...minimal, uiListen: { host: "127.0.0.1", port: 4142 } }),
+    /uiListen was removed.*set-operator/);
+}
+
+// --- a v1 file is named as one, with the way out --------------------------
+{
+  assert.throws(() => parseConfig({ backend: { url: "http://x:1" } }), /v1 layout \(it has backend\).*hearth migrate/);
+  assert.throws(() => parseConfig({ ...minimal, share: [] }), /v1 layout \(it has share\)/);
+  assert.throws(() => parseConfig({ backends: [{ name: "a", url: "http://x:1" }] }), /v1 layout \(it has backends as a list\)/);
+}
+
+// --- one entry per peer: borrow, lend, or both -------------------------------
+{
+  process.env.HEARTH_TEST_ACCEPT = "from-them";
+  const cfg = parseConfig({
+    ...minimal,
+    peers: {
+      both: { ...friend({ m: "m" }), accept: "env:HEARTH_TEST_ACCEPT" },
+      borrowOnly: friend(),
+      lendOnly: { accept: "lend-token" },
+    },
+  });
+  assert.deepEqual(cfg.peers.map((p) => p.name), ["both", "borrowOnly"], "only peers with a url are borrowed from");
+  assert.deepEqual(cfg.peerTokens, { both: "from-them", lendOnly: "lend-token" }, "accept is who may borrow from us");
+  delete process.env.HEARTH_TEST_ACCEPT;
+
+  assert.throws(() => parseConfig({ ...minimal, peers: { x: {} } }), /peers\.x needs url .* or accept/);
+  assert.throws(() => parseConfig({ ...minimal, peers: { x: { accept: "a", token: "t" } } }),
+    /peers\.x\.token is only used to borrow from x, which needs its url/);
+  assert.throws(() => parseConfig({ ...minimal, peers: { x: { url: "http://x:1" } } }), /peers\.x\.token/,
+    "borrowing needs the token you present");
 }
 
 // --- a peer with no model map is legal, and is a state you can click into ---
-// This used to refuse, on the reasoning that polling a peer nothing can route
-// to is pointless. The console changed that: unlinking a peer's last model is
-// one click, the poll is what feeds the list of things you could borrow next,
-// and refusing left you unable to save a state you had reached in the UI.
+// The console's "unlink" leaves exactly this, and the poll is what feeds the list of things
+// you could borrow next.
 {
-  const cfg = parseConfig({
-    ...minimal,
-    peers: [{ name: "friend", url: "http://10.0.0.2:4141", token: "t", models: {} }],
-  });
+  const cfg = parseConfig({ ...minimal, peers: { friend: friend() } });
   assert.deepEqual(cfg.peers[0]!.models, {}, "an empty map loads");
   assert.equal(cfg.peers[0]!.token, "t", "and the trust decision it holds is untouched");
 }
 
 // --- an alias and a peer policy are two destinations, not a conflict -------
 // `as` is applied by pool.outboundId() and only on the way to a local backend;
-// a peer dispatch takes its id from that peer's own map. No request is subject
-// to both, and `fastest` across the two is the case that wants it.
+// a peer dispatch takes its id from that peer's own map.
 {
   const cfg = parseConfig({
     ...minimal,
-    peers: [{ name: "friend", url: "http://10.0.0.2:4141", token: "t", models: { coder: "their-coder" } }],
+    peers: { friend: friend({ coder: "their-coder" }) },
     models: { coder: { as: "qwen3-coder:latest", policy: "fastest" } },
   });
   assert.equal(cfg.models.coder!.as, "qwen3-coder:latest");
   assert.equal(cfg.models.coder!.policy, "fastest");
+}
+
+// --- a note describes a model; alone it is not a route ----------------------
+{
+  const cfg = parseConfig({ ...minimal, models: { a: { note: " for long documents " }, b: { policy: "local", note: "x" } } });
+  assert.deepEqual(cfg.notes, { a: "for long documents", b: "x" });
+  assert.deepEqual(Object.keys(cfg.models), ["b"], "a note-only entry routes nothing");
+  assert.throws(() => parseConfig({ ...minimal, models: { a: { note: "x".repeat(10_000) } } }), /models\.a\.note is \d+ characters/);
 }
 
 // --- pool: a bare number, or tokens plus an output cap ---------------------
@@ -77,28 +114,24 @@ const minimal = { backend: { url: "http://127.0.0.1:9292" } };
     throw new Error("expected a ConfigError");
   };
   const path = (raw: unknown): string | null => thrown(raw).path;
-  assert.equal(path({ ...minimal, backend: { url: "127.0.0.1:9292" } }), "backend.url");
+  assert.equal(path({ backends: { main: { url: "127.0.0.1:9292" } } }), "backends.main.url");
   assert.equal(path({ ...minimal, listen: { port: -1 } }), "listen.port");
-  assert.equal(path({ ...minimal, share: 5 }), "share");
-  assert.equal(path({ ...minimal, notes: { n: 5 } }), "notes.n");
+  assert.equal(path({ ...minimal, lending: { models: 5 } }), "lending.models");
+  assert.equal(path({ ...minimal, models: { n: { note: 5 } } }), "models.n.note");
   assert.equal(path({ ...minimal, scheduler: { lanes: {} } }), "scheduler.lanes");
   assert.equal(path({ ...minimal, models: { m: { lane: "nope" } } }), "models.m.lane");
-  assert.equal(path({ ...minimal, peerLane: "nope" }), "peerLane");
+  assert.equal(path({ ...minimal, lending: { lane: "nope" } }), "lending.lane");
   assert.equal(path({ ...minimal, models: ["m"] }), "models", "a whole-section finding names the section");
   assert.equal(path({ ...minimal, models: { m: { params: { model: "x" } } } }), "models.m.params.model");
-  assert.equal(path({ backend: { url: "http://x" }, backends: [{ name: "a", url: "http://y" }] }), null, "a whole-config one carries none");
+  assert.equal(path({ ...minimal, models: { m: { polcy: "peer" } } }), "models.m.polcy", "an unknown key is named");
+  assert.equal(path({ backend: { url: "http://x" } }), null, "a whole-config one carries none");
   assert.equal(thrown({ ...minimal, models: { c: { pool: 0 } } }).message, "models.c.pool must be a whole number >= 1 (got 0)", "and the sentence keeps the field for a journal line");
 }
 
 // --- a policy that can never fire is a typo, not a preference --------------
 {
   assert.throws(
-    () =>
-      parseConfig({
-        ...minimal,
-        peers: [{ name: "friend", url: "http://10.0.0.2:4141", token: "t", models: { a: "a" } }],
-        models: { b: { policy: "peer" } },
-      }),
+    () => parseConfig({ ...minimal, peers: { friend: friend({ a: "a" }) }, models: { b: { policy: "peer" } } }),
     /no peer maps "b"/,
   );
 }
@@ -106,41 +139,20 @@ const minimal = { backend: { url: "http://127.0.0.1:9292" } };
 // --- naming a peer that does not exist -------------------------------------
 {
   assert.throws(
-    () =>
-      parseConfig({
-        ...minimal,
-        peers: [{ name: "friend", url: "http://10.0.0.2:4141", token: "t", models: { a: "a" } }],
-        models: { a: { policy: "peer", peers: ["freind"] } },
-      }),
-    /not a configured peer/,
+    () => parseConfig({
+      ...minimal,
+      peers: { friend: friend({ a: "a" }) },
+      models: { a: { policy: "peer", peers: ["freind"] } },
+    }),
+    /not a peer you borrow from/,
     "a misspelled peer name must be caught, not silently ignored",
-  );
-}
-
-// --- duplicate peer names --------------------------------------------------
-{
-  assert.throws(
-    () =>
-      parseConfig({
-        ...minimal,
-        peers: [
-          { name: "a", url: "http://1.1.1.1:1", token: "t", models: { m: "m" } },
-          { name: "a", url: "http://1.1.1.2:1", token: "t", models: { m: "m" } },
-        ],
-      }),
-    /both named/,
   );
 }
 
 // --- an unknown policy is refused with the valid set -----------------------
 {
   assert.throws(
-    () =>
-      parseConfig({
-        ...minimal,
-        peers: [{ name: "f", url: "http://1.1.1.1:1", token: "t", models: { m: "m" } }],
-        models: { m: { policy: "remote" } },
-      }),
+    () => parseConfig({ ...minimal, peers: { f: friend({ m: "m" }) }, models: { m: { policy: "remote" } } }),
     /expected local, peer, spillover or fastest/,
   );
 }
@@ -148,30 +160,14 @@ const minimal = { backend: { url: "http://127.0.0.1:9292" } };
 // --- env: indirection ------------------------------------------------------
 {
   process.env.HEARTH_TEST_TOKEN = "s3cret";
-  const cfg = parseConfig({
-    ...minimal,
-    peers: [
-      {
-        name: "f",
-        url: "http://1.1.1.1:1",
-        token: "env:HEARTH_TEST_TOKEN",
-        models: { m: "m" },
-      },
-    ],
-  });
+  const cfg = parseConfig({ ...minimal, peers: { f: { ...friend({ m: "m" }), token: "env:HEARTH_TEST_TOKEN" } } });
   assert.equal(cfg.peers[0]!.token, "s3cret");
 
   // A missing variable is fatal: starting with an empty token would mean every
   // call to that peer silently 401s.
   delete process.env.HEARTH_TEST_TOKEN;
   assert.throws(
-    () =>
-      parseConfig({
-        ...minimal,
-        peers: [
-          { name: "f", url: "http://1.1.1.1:1", token: "env:HEARTH_TEST_TOKEN", models: { m: "m" } },
-        ],
-      }),
+    () => parseConfig({ ...minimal, peers: { f: { ...friend({ m: "m" }), token: "env:HEARTH_TEST_TOKEN" } } }),
     /is not set/,
   );
 }
@@ -241,54 +237,41 @@ const minimal = { backend: { url: "http://127.0.0.1:9292" } };
   assert.throws(() => parseConfig({ ...minimal, scheduler: { lanes: {} } }), /at least one lane/);
 }
 
+// --- backendDefaults is what every backend takes unless it says otherwise ---
+{
+  const cfg = parseConfig({
+    backends: { a: { url: "http://x:1" }, b: { url: "http://x:2", concurrency: 9, idleMs: 5 } },
+    backendDefaults: { concurrency: 2, idleMs: 1000 },
+  });
+  assert.deepEqual(cfg.backends.map((b) => b.concurrency), [2, 9]);
+  assert.equal(cfg.backendIdleMs, 1000);
+  assert.deepEqual(cfg.backends.map((b) => b.idleMs), [null, 5], "an override is kept as its own value");
+}
+
 // --- tuning weights are checked, not just typed ----------------------------
 //
 // The ones plain type-checking waves straight through. A negative agePerSecond
 // inverts aging into guaranteed starvation, a negative warmBonus makes the
 // scheduler prefer to swap models, and a negative coldPenalty sends `fastest`
-// looking for whichever node has to load the weights. All three used to start
-// up fine and then misbehave quietly.
+// looking for whichever node has to load the weights.
 {
-  assert.throws(
-    () => parseConfig({ ...minimal, scheduler: { agePerSecond: -1 } }),
-    /agePerSecond must be >= 0/,
-  );
-  assert.throws(
-    () => parseConfig({ ...minimal, scheduler: { warmBonus: -40 } }),
-    /warmBonus must be >= 0/,
-  );
-  assert.throws(() => parseConfig({ ...minimal, coldPenalty: -2 }), /coldPenalty must be >= 0/);
-  assert.throws(
-    () => parseConfig({ ...minimal, peerFirstByteMs: -1 }),
-    /peerFirstByteMs must be >= 0/,
-  );
+  assert.throws(() => parseConfig({ ...minimal, scheduler: { agePerSecond: -1 } }), /agePerSecond must be >= 0/);
+  assert.throws(() => parseConfig({ ...minimal, scheduler: { warmBonus: -40 } }), /warmBonus must be >= 0/);
+  assert.throws(() => parseConfig({ ...minimal, borrowing: { coldPenalty: -2 } }), /borrowing\.coldPenalty must be >= 0/);
+  assert.throws(() => parseConfig({ ...minimal, borrowing: { firstByteMs: -1 } }), /borrowing\.firstByteMs must be >= 0/);
   // Fractions are still fine. Half a point of aging per second is a real ask.
   assert.equal(parseConfig({ ...minimal, scheduler: { agePerSecond: 0.5 } }).scheduler.agePerSecond, 0.5);
-  // 0 keeps its meaning in each case: no aging, no warm preference, no
-  // deadline.
-  assert.equal(parseConfig({ ...minimal, peerFirstByteMs: 0 }).peerFirstByteMs, 0);
+  // 0 keeps its meaning: no deadline.
+  assert.equal(parseConfig({ ...minimal, borrowing: { firstByteMs: 0 } }).peerFirstByteMs, 0);
 }
 
-// --- a model's own slot count, under either spelling -----------------------
-//
-// `batch` was the name when it could only raise a model above its backend.
-// `concurrency` is the name now that it can lower one too, and old configs
-// keep working — but a file saying both is a ceiling that reads as one number
-// and enforces the other.
+// --- a model's own slot count ----------------------------------------------
 {
-  const with_ = (entry: unknown) =>
-    parseConfig({ ...minimal, models: { m: entry } }).models.m!.concurrency;
+  const with_ = (entry: unknown) => parseConfig({ ...minimal, models: { m: entry } }).models.m!.concurrency;
   assert.equal(with_({ policy: "local" }), null, "undeclared inherits the backend");
   assert.equal(with_({ concurrency: 2 }), 2, "and may be lower than one");
-  assert.equal(with_({ batch: 32 }), 32, "the old name still lands in the same field");
-  assert.throws(
-    () => with_({ concurrency: 2, batch: 4 }),
-    /same setting/,
-    "two different numbers for one ceiling is a mistake, not a merge",
-  );
-  // Saying both and agreeing is somebody mid-rename. Nothing is ambiguous.
-  assert.equal(with_({ concurrency: 4, batch: 4 }), 4);
   assert.throws(() => with_({ concurrency: 0 }), /whole number >= 1/);
+  assert.throws(() => with_({ batch: 4 }), /models\.m\.batch is not a setting/, "the old name is migrated, not read");
 }
 
 // --- one rule for "which peers could serve this": empty `peers` means any --
@@ -302,8 +285,8 @@ const minimal = { backend: { url: "http://127.0.0.1:9292" } };
   assert.deepEqual(peersMapping("x", ["c", "b", "a"], peers), ["c", "a"], "named peers keep their order");
   assert.deepEqual(peersMapping("y", [], peers), []);
   assert.throws(
-    () => parseConfig({ backend: { url: "http://127.0.0.1:1" }, peers: [{ name: "a", url: "http://a", token: "t", models: { x: "" } }] }),
-    /peers\[0\]\.models\.x is empty/,
+    () => parseConfig({ ...minimal, peers: { a: { url: "http://a", token: "t", models: { x: "" } } } }),
+    /peers\.a\.models\.x is empty/,
   );
 }
 

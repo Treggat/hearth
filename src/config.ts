@@ -5,6 +5,8 @@ import { parse as parseYaml } from "yaml";
 
 import { EMULATIONS, type Emulation } from "./emulate.js";
 import { KINDS, type KindName } from "./kinds.js";
+import { FIELDS, nearest, SECTION_KEYS, type Scope } from "./fields.js";
+import { v1Marker } from "./migrate.js";
 import { known, NOTE_MAX, type ModelStats } from "./stats.js";
 
 export type RoutePolicy = "local" | "peer" | "spillover" | "fastest";
@@ -22,12 +24,6 @@ export interface PeerConfig {
 
 /** A backend's `kind`, one of the entries in kinds.ts. */
 export type WarmSource = KindName;
-
-/**
- * Whether the standalone status listener also serves the write routes: "off" (page only), or
- * "key", behind the same apiKey gate as the main listener. The socket alone never grants authority.
- */
-export type UiControl = "off" | "key";
 
 /**
  * What a named resource is. `kind` is display only; `shared` resources (a CPU running several
@@ -74,22 +70,21 @@ export interface BackendConfig {
   name: string;
   /** The OpenAI-compatible server this backend fronts. */
   url: string;
-  /** Where warm state comes from. `llamaSwapExtras: true/false` is the old
-   *  spelling of `llama-swap`/`none` and still works. */
+  /** Where warm state comes from. */
   kind: WarmSource;
   /**
    * The model ids this backend serves, instead of discovering them from /v1/models. Also an
    * allowlist; declare them for a server that reports a file path as its id.
    */
   serves: string[];
-  /** Jobs allowed on this backend at once; defaults to scheduler.concurrency. */
+  /** Jobs allowed on this backend at once; defaults to backendDefaults.concurrency. */
   concurrency: number;
   /**
    * How long to wait for this backend's first byte, in ms; 0 waits forever. Defaults to
-   * `backendFirstByteMs`. Size it for the slowest honest reply behind this port.
+   * `backendDefaults.firstByteMs`. Size it for the slowest honest reply behind this port.
    */
   firstByteMs: number | null;
-  /** How long this backend may go silent mid-answer, in ms; 0 waits forever. Defaults to `backendIdleMs`. */
+  /** How long this backend may go silent mid-answer, in ms; 0 waits forever. Defaults to `backendDefaults.idleMs`. */
   idleMs: number | null;
   /**
    * Hardware this backend consumes (names are yours), so backends whose sets overlap take
@@ -190,11 +185,6 @@ export interface HearthConfig {
     /** Cap per caller per lane; 0 turns it off. Defaults to 0 without apiKeys, where every caller is one. */
     maxPerCaller: number;
   };
-  /**
-   * A second listener serving only `/ui` and `/ui/data`, or null. Whoever reaches it can read
-   * the queue and callers, so bind it to a tailnet address with an ACL, not a LAN.
-   */
-  uiListen: { host: string; port: number; control: UiControl } | null;
   /** Keys allowed on the OpenAI surface. Empty means no auth, which only makes
    *  sense on loopback. Setting it also means loopback needs a key. */
   apiKeys: string[];
@@ -205,7 +195,7 @@ export interface HearthConfig {
    * key to chat and `/v1/models` for exactly those routed ids.
    */
   apiKeyModels: (string[] | null)[];
-  /** Tokens peers present to us, by peer name. Kept separate from apiKeys so
+  /** Tokens peers present to us, by peer name (`peers.<name>.accept`). Kept separate from apiKeys so
    *  peer traffic is attributable and can be capped on its own. */
   peerTokens: Record<string, string>;
   /**
@@ -214,21 +204,22 @@ export interface HearthConfig {
    * exist — the address and the keys are the only doors in.
    */
   operator: { user: string; passHash: string } | null;
-  /** Models we'll serve to peers. Empty means none, since lending is opt-in. */
+  /** Models we'll serve to peers (`lending.models`). Empty means none, since lending is opt-in. */
   share: string[];
-  /** What each model is for, shown to peers beside it. */
+  /** What each model is for, shown to peers beside it (`models.<id>.note`). */
   notes?: Record<string, string>;
-  /** Requests per hour one peer may send us. */
+  /** Requests per hour one peer may send us (`lending.rateLimit`). */
   peerRateLimit: number;
-  /** The lane borrowed work lands in, whatever the peer asks; defaults to the lowest-priority one. */
+  /** The lane borrowed work lands in, whatever the peer asks (`lending.lane`); defaults to the lowest-priority one. */
   peerLane: string;
-  /** Jobs one peer may have queued or running at once, whether or not apiKeys are set. */
+  /** Jobs one peer may have queued or running at once (`lending.maxConcurrent`). */
   peerMaxConcurrent: number;
   /** Biggest request body we'll take. Multi-image vision payloads get close to
    *  the old hardcoded 32MB, so it's a knob now instead of a constant. */
   maxBodyBytes: number;
   peers: PeerConfig[];
   models: Record<string, ModelRoute>;
+  // The peer timings below are `borrowing.*` in hearth.yaml, and the backend ones `backendDefaults.*`.
   /** How long a good peer reading is reused before routing asks again; concurrent requests share one probe. */
   peerFreshMs: number;
   /** How long a failed probe is remembered, so an outage does not slow every local request. */
@@ -267,7 +258,7 @@ const WARM_LANE_PRIORITY = 200;
 export { WARM_LANE };
 
 /**
- * A validation finding. `path` is the field it is about (e.g. `backends[0].kind`),
+ * A validation finding. `path` is the field it is about (e.g. `backends.card.kind`),
  * or null for a whole-config one; the sentence keeps the field too, because a
  * journal line has nothing else to say where it came from.
  */
@@ -283,6 +274,16 @@ export class ConfigError extends Error {
 
 function bad(path: string | null, text: string): ConfigError {
   return new ConfigError(path, path !== null && !text.startsWith(path) ? `${path} ${text}` : text);
+}
+
+/** Refuse a key this place does not take: a typo would otherwise load as the default, silently. */
+function only(rec: Record<string, unknown>, allowed: Scope | readonly string[], where: string): void {
+  const keys = typeof allowed === "string" ? Object.keys(FIELDS[allowed]) : allowed;
+  for (const k of Object.keys(rec)) {
+    if (keys.includes(k)) continue;
+    const near = nearest(k, keys);
+    throw bad(where ? `${where}.${k}` : k, `is not a setting${where ? ` of ${where}` : ""}${near ? ` — did you mean ${near}?` : ""}`);
+  }
 }
 
 /** `env:NAME` indirection, so tokens live in the environment and the config
@@ -377,18 +378,10 @@ function modelParams(raw: unknown, id: string): Record<string, unknown> | null {
   return Object.keys(rec).length === 0 ? null : rec;
 }
 
-/** A model's own slot count from `concurrency` or the older `batch`; both at once must agree. */
+/** A model's own slot count, or null to take its backend's. */
 function modelConcurrency(entry: Record<string, unknown>, id: string): number | null {
-  const has = (k: string) => entry[k] !== undefined && entry[k] !== null;
-  if (has("concurrency") && has("batch") && entry.concurrency !== entry.batch) {
-    throw bad(
-      `models.${id}`, `sets both concurrency and batch, which are the same setting ` +
-        `(${String(entry.concurrency)} vs ${String(entry.batch)}) — keep concurrency`,
-    );
-  }
-  const key = has("concurrency") ? "concurrency" : "batch";
-  if (!has(key)) return null;
-  return count(entry[key], `models.${id}.${key}`, 1, 1);
+  if (entry.concurrency === undefined || entry.concurrency === null) return null;
+  return count(entry.concurrency, `models.${id}.concurrency`, 1, 1);
 }
 
 /** `pool: 144000`, or `pool: { tokens: 144000, output: 8192 }`. */
@@ -396,6 +389,7 @@ function modelPool(v: unknown, id: string): ModelRoute["pool"] {
   if (v === undefined || v === null) return null;
   if (typeof v === "number") return { tokens: count(v, `models.${id}.pool`, 1, 1), output: null };
   const p = asRecord(v, `models.${id}.pool`);
+  only(p, "pool", `models.${id}.pool`);
   return {
     tokens: count(p.tokens, `models.${id}.pool.tokens`, 0, 1),
     output: p.output === undefined || p.output === null ? null : count(p.output, `models.${id}.pool.output`, 1, 1),
@@ -411,23 +405,13 @@ function atLeast(v: unknown, where: string, fallback: number, min = 0): number {
 
 const WARM_SOURCES = Object.keys(KINDS) as WarmSource[];
 
-/** `kind`, or the `llamaSwapExtras` boolean it replaced; not both. */
+/** A backend's `kind`, defaulting to llama-swap. */
 function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
-  const kind = str(entry.kind, `${where}.kind`, "");
-  const legacy = entry.llamaSwapExtras;
-  if (kind !== "" && legacy !== undefined) {
-    throw bad(
-      where, `set kind or llamaSwapExtras, not both — ` +
-        `llamaSwapExtras: ${String(legacy)} is the old spelling of kind: ${legacy === false ? "none" : "llama-swap"}`,
-    );
+  const kind = str(entry.kind, `${where}.kind`, "llama-swap");
+  if (!WARM_SOURCES.includes(kind as WarmSource)) {
+    throw bad(`${where}.kind`, `is "${kind}" — expected ${WARM_SOURCES.join(", ")}`);
   }
-  if (kind !== "") {
-    if (!WARM_SOURCES.includes(kind as WarmSource)) {
-      throw bad(`${where}.kind`, `is "${kind}" — expected ${WARM_SOURCES.join(", ")}`);
-    }
-    return kind as WarmSource;
-  }
-  return bool(legacy, `${where}.llamaSwapExtras`, true) ? "llama-swap" : "none";
+  return kind as WarmSource;
 }
 
 function bool(v: unknown, where: string, fallback: boolean): boolean {
@@ -488,6 +472,7 @@ function apiKeyList(
       return;
     }
     const entry = asRecord(raw, at);
+    only(entry, ["key", "label", "models"], at);
     const key = resolveSecret(str(entry.key, `${at}.key`), `${at}.key`);
     // A blank label is a typo, not "no label" — the string form is how you say
     // no label — so it is refused rather than silently falling back to the hash.
@@ -528,6 +513,7 @@ function requirePath(path: string, at: string): void {
 function activityDecl(v: unknown, where: string): ActivityDecl | null {
   if (v === undefined || v === null) return null;
   const o = asRecord(v, where);
+  only(o, "activity", where);
   const path = str(o.path, `${where}.path`);
   requirePath(path, where);
   return {
@@ -542,6 +528,7 @@ function residentDecl(v: unknown, where: string): ResidentDecl | null {
   if (v === undefined || v === null || v === false) return null;
   if (v === true) return { yield: "/yield", resume: "/resume" };
   const o = asRecord(v, where);
+  only(o, ["yield", "resume"], where);
   const out = { yield: str(o.yield, `${where}.yield`, "/yield"), resume: str(o.resume, `${where}.resume`, "/resume") };
   requirePath(out.yield, `${where}.yield`);
   requirePath(out.resume, `${where}.resume`);
@@ -555,6 +542,7 @@ function routeList(v: unknown, where: string): RouteRule[] {
   return v.map((raw, i) => {
     const at = `${where}[${i}]`;
     const entry = typeof raw === "string" ? { path: raw } : asRecord(raw, at);
+    only(entry, ["path", "lane", "model", "queue"], at);
     const path = str(entry.path, `${at}.path`);
     requirePath(path, at);
     // One placeholder, standing for one whole segment. More than one, or one
@@ -599,21 +587,27 @@ export function peersMapping(id: string, named: readonly string[], peers: readon
 
 export function parseConfig(raw: unknown): HearthConfig {
   const root = asRecord(raw, "config");
+  const v1 = v1Marker(root);
+  if (v1 !== null) {
+    throw new ConfigError(null, `this hearth.yaml is in the v1 layout (it has ${v1}) — run \`hearth migrate\` to rewrite it; the original is kept beside it`);
+  }
+  if (root.uiListen !== undefined) {
+    throw bad("uiListen", "was removed: the console is on the main port now, open off-loopback " +
+      "to a signed-in operator. Delete uiListen, and run `hearth set-operator` if you have not");
+  }
+  only(root, [...Object.keys(FIELDS.node), ...SECTION_KEYS], "");
 
   const listen = asRecord(root.listen ?? {}, "listen");
+  only(listen, "listen", "listen");
   const sched = asRecord(root.scheduler ?? {}, "scheduler");
-  const defaultConcurrency = count(sched.concurrency, "scheduler.concurrency", 1, 1);
-
-  // `backend:` (one) and `backends:` (many). Both is a mistake worth naming,
-  // since silently preferring one of them is how you end up fronting a server
-  // you thought you had replaced.
-  if (root.backend !== undefined && root.backends !== undefined) {
-    throw new ConfigError(
-      null,
-      "set either backend: (one) or backends: (a list), not both — " +
-        "`backend` is just shorthand for a list of one",
-    );
-  }
+  only(sched, "scheduler", "scheduler");
+  const defaults = asRecord(root.backendDefaults ?? {}, "backendDefaults");
+  only(defaults, "backendDefaults", "backendDefaults");
+  const lending = asRecord(root.lending ?? {}, "lending");
+  only(lending, "lending", "lending");
+  const borrowing = asRecord(root.borrowing ?? {}, "borrowing");
+  only(borrowing, "borrowing", "borrowing");
+  const defaultConcurrency = count(defaults.concurrency, "backendDefaults.concurrency", 1, 1);
 
   /** Declared hardware, validated up front so --check catches a typo. */
   const resourceDecls: Record<string, ResourceDecl> = {};
@@ -622,6 +616,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     for (const [name, raw] of Object.entries(rd)) {
       const at = `resources.${name}`;
       const entry = asRecord(raw ?? {}, at);
+      only(entry, "resource", at);
       const kind = str(entry.kind, `${at}.kind`, "gpu");
       if (kind !== "gpu" && kind !== "cpu" && kind !== "other") {
         throw bad(`${at}.kind`, `must be gpu, cpu or other (got ${JSON.stringify(kind)})`);
@@ -631,73 +626,42 @@ export function parseConfig(raw: unknown): HearthConfig {
   }
 
   const backends: BackendConfig[] = [];
-  if (root.backends !== undefined) {
-    if (!Array.isArray(root.backends)) throw bad("backends", "must be a list");
-    if (root.backends.length === 0) throw bad("backends", "must not be empty");
-    for (const [i, b] of root.backends.entries()) {
-      const entry = asRecord(b, `backends[${i}]`);
-      backends.push({
-        name: str(entry.name, `backends[${i}].name`),
-        url: trimUrl(str(entry.url, `backends[${i}].url`), `backends[${i}].url`),
-        kind: warmSource(entry, `backends[${i}]`),
-        serves: strList(entry.serves, `backends[${i}].serves`),
-        concurrency: count(entry.concurrency, `backends[${i}].concurrency`, defaultConcurrency, 1),
-        firstByteMs: entry.firstByteMs === undefined
-          ? null
-          : atLeast(entry.firstByteMs, `backends[${i}].firstByteMs`, 0),
-        idleMs: entry.idleMs === undefined
-          ? null
-          : atLeast(entry.idleMs, `backends[${i}].idleMs`, 0),
-        resources: strList(entry.resources, `backends[${i}].resources`),
-        routes: routeList(entry.routes, `backends[${i}].routes`),
-        activity: activityDecl(entry.activity, `backends[${i}].activity`),
-        resident: residentDecl(entry.resident, `backends[${i}].resident`),
-      });
-    }
-    const seen = new Set<string>();
-    for (const b of backends) {
-      if (seen.has(b.name)) throw new ConfigError("backends", `two backends are both named "${b.name}"`);
-      seen.add(b.name);
-    }
-    // Two backends claiming the same id outright is a typo. Discovery can
-    // collide at runtime and picks the first with a warning, but a declared
-    // clash is someone meaning two different things by one name.
-    const claimed = new Map<string, string>();
-    for (const b of backends) {
-      for (const m of b.serves) {
-        const owner = claimed.get(m);
-        if (owner) {
-          throw new ConfigError(
-            "backends",
-            `backends "${owner}" and "${b.name}" both declare they serve "${m}" — ` +
-              `one id cannot mean two backends`,
-          );
-        }
-        claimed.set(m, b.name);
-      }
-    }
-  } else {
-    const backend = asRecord(root.backend ?? {}, "backend");
+  if (root.backends === undefined) throw bad("backends", "is required: name at least one server for hearth to front");
+  for (const [name, b] of Object.entries(asRecord(root.backends, "backends"))) {
+    const at = `backends.${name}`;
+    const entry = asRecord(b, at);
+    only(entry, "backend", at);
     backends.push({
-      // Named so status output and error messages have something to say, and so
-      // a config that later grows a second backend does not have to rename the
-      // first one.
-      name: str(backend.name, "backend.name", "default"),
-      url: trimUrl(str(backend.url, "backend.url"), "backend.url"),
-      kind: warmSource(backend, "backend"),
-      serves: strList(backend.serves, "backend.serves"),
-      concurrency: count(backend.concurrency, "backend.concurrency", defaultConcurrency, 1),
-      firstByteMs: backend.firstByteMs === undefined
-        ? null
-        : atLeast(backend.firstByteMs, "backend.firstByteMs", 0),
-      idleMs: backend.idleMs === undefined
-        ? null
-        : atLeast(backend.idleMs, "backend.idleMs", 0),
-      resources: strList(backend.resources, "backend.resources"),
-      routes: routeList(backend.routes, "backend.routes"),
-      activity: activityDecl(backend.activity, "backend.activity"),
-      resident: residentDecl(backend.resident, "backend.resident"),
+      name,
+      url: trimUrl(str(entry.url, `${at}.url`), `${at}.url`),
+      kind: warmSource(entry, at),
+      serves: strList(entry.serves, `${at}.serves`),
+      concurrency: count(entry.concurrency, `${at}.concurrency`, defaultConcurrency, 1),
+      firstByteMs: entry.firstByteMs === undefined ? null : atLeast(entry.firstByteMs, `${at}.firstByteMs`, 0),
+      idleMs: entry.idleMs === undefined ? null : atLeast(entry.idleMs, `${at}.idleMs`, 0),
+      resources: strList(entry.resources, `${at}.resources`),
+      routes: routeList(entry.routes, `${at}.routes`),
+      activity: activityDecl(entry.activity, `${at}.activity`),
+      resident: residentDecl(entry.resident, `${at}.resident`),
     });
+  }
+  if (backends.length === 0) throw bad("backends", "must not be empty");
+  // Two backends claiming the same id outright is a typo. Discovery can
+  // collide at runtime and picks the first with a warning, but a declared
+  // clash is someone meaning two different things by one name.
+  const claimed = new Map<string, string>();
+  for (const b of backends) {
+    for (const m of b.serves) {
+      const owner = claimed.get(m);
+      if (owner) {
+        throw new ConfigError(
+          "backends",
+          `backends "${owner}" and "${b.name}" both declare they serve "${m}" — ` +
+            `one id cannot mean two backends`,
+        );
+      }
+      claimed.set(m, b.name);
+    }
   }
   const backendNames = new Set(backends.map((b) => b.name));
   // A resident on shared hardware (or none) would never be asked to yield, which is its only job.
@@ -726,6 +690,7 @@ export function parseConfig(raw: unknown): HearthConfig {
   const lanes: Record<string, { priority: number; concurrency?: number; maxWaitMs?: number }> = {};
   for (const [lane, v] of Object.entries(lanesRaw)) {
     const entry = asRecord(v, `scheduler.lanes.${lane}`);
+    only(entry, "lane", `scheduler.lanes.${lane}`);
     lanes[lane] = { priority: num(entry.priority, `scheduler.lanes.${lane}.priority`, 0) };
     // Left off when unset rather than defaulted: no number here means the lane has no ceiling of its own.
     if (entry.concurrency !== undefined) {
@@ -750,11 +715,11 @@ export function parseConfig(raw: unknown): HearthConfig {
     .filter(([n]) => n !== WARM_LANE)
     .sort((a, b) => b[1].priority - a[1].priority)[0]![0];
   const claimedPaths = new Map<string, string>();
-  for (const [bi, b] of backends.entries()) {
+  for (const b of backends) {
     for (const [ri, r] of b.routes.entries()) {
       if (r.lane === "") r.lane = fallbackLane;
       else if (!(r.lane in lanes)) {
-        throw bad(`backends[${bi}].routes[${ri}].lane`, `names lane "${r.lane}", which is not in scheduler.lanes`);
+        throw bad(`backends.${b.name}.routes[${ri}].lane`, `names lane "${r.lane}", which is not in scheduler.lanes`);
       }
       // Reported under the backend's name, except {model} routes, which take the id from the request.
       if (r.model === "" && !r.path.includes("{model}")) r.model = b.name;
@@ -773,37 +738,48 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
   }
 
+  // One entry per friend: url and token to borrow from it, accept to lend to it, either or both.
   const peers: PeerConfig[] = [];
-  const peersRaw = root.peers === undefined ? [] : root.peers;
-  if (!Array.isArray(peersRaw)) throw bad("peers", "must be a list");
-  for (const [i, p] of peersRaw.entries()) {
-    const entry = asRecord(p, `peers[${i}]`);
-    const name = str(entry.name, `peers[${i}].name`);
-    const models = asRecord(entry.models ?? {}, `peers[${i}].models`);
-    const map: Record<string, string> = {};
-    for (const [mine, theirs] of Object.entries(models)) {
-      map[mine] = str(theirs, `peers[${i}].models.${mine}`);
-      if (map[mine] === "") throw bad(`peers[${i}].models.${mine}`, "is empty: name the peer's id for it");
+  const peerTokens: Record<string, string> = {};
+  for (const [name, p] of Object.entries(asRecord(root.peers ?? {}, "peers"))) {
+    const at = `peers.${name}`;
+    const entry = asRecord(p, at);
+    only(entry, "peer", at);
+    if (entry.accept !== undefined) peerTokens[name] = resolveSecret(str(entry.accept, `${at}.accept`), `${at}.accept`);
+    if (entry.url === undefined) {
+      if (entry.accept === undefined) throw bad(at, "needs url (to borrow from it) or accept (to lend to it)");
+      for (const k of ["token", "models"]) {
+        if (entry[k] !== undefined) throw bad(`${at}.${k}`, `is only used to borrow from ${name}, which needs its url`);
+      }
+      continue;
     }
-    // A peer mapping nothing is valid: the state between trusting someone and borrowing from them.
+    const map: Record<string, string> = {};
+    for (const [mine, theirs] of Object.entries(asRecord(entry.models ?? {}, `${at}.models`))) {
+      map[mine] = str(theirs, `${at}.models.${mine}`);
+      if (map[mine] === "") throw bad(`${at}.models.${mine}`, "is empty: name the peer's id for it");
+    }
     peers.push({
       name,
-      url: trimUrl(str(entry.url, `peers[${i}].url`), `peers[${i}].url`),
-      token: resolveSecret(str(entry.token, `peers[${i}].token`), `peers[${i}].token`),
+      url: trimUrl(str(entry.url, `${at}.url`), `${at}.url`),
+      token: resolveSecret(str(entry.token, `${at}.token`), `${at}.token`),
       models: map,
     });
   }
-
-  const names = new Set<string>();
-  for (const p of peers) {
-    if (names.has(p.name)) throw new ConfigError("peers", `two peers are both named "${p.name}"`);
-    names.add(p.name);
-  }
+  const names = new Set(peers.map((p) => p.name));
 
   const models: Record<string, ModelRoute> = {};
   const modelsRaw = root.models === undefined ? {} : asRecord(root.models, "models");
+  const notes: Record<string, string> = {};
   for (const [id, v] of Object.entries(modelsRaw)) {
     const entry = asRecord(v, `models.${id}`);
+    only(entry, "model", `models.${id}`);
+    if (entry.note !== undefined) {
+      const note = str(entry.note, `models.${id}.note`).trim();
+      if (note.length > NOTE_MAX) throw bad(`models.${id}.note`, `is ${note.length} characters -- keep it under ${NOTE_MAX}`);
+      if (note !== "") notes[id] = note;
+    }
+    // A note alone describes a model; it is not a route.
+    if (entry.note !== undefined && Object.keys(entry).length === 1) continue;
     const policy = str(entry.policy, `models.${id}.policy`, "local") as RoutePolicy;
     if (!["local", "peer", "spillover", "fastest"].includes(policy)) {
       throw bad(`models.${id}.policy`, `is "${policy}" — expected local, peer, spillover or fastest`);
@@ -811,7 +787,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     const named = strList(entry.peers, `models.${id}.peers`);
     for (const n of named) {
       if (!names.has(n)) {
-        throw bad(`models.${id}.peers`, `names "${n}", which is not a configured peer`);
+        throw bad(`models.${id}.peers`, `names "${n}", which is not a peer you borrow from (one with a url)`);
       }
     }
     // Catching it here instead of at request time is the reason this validation
@@ -877,12 +853,6 @@ export function parseConfig(raw: unknown): HearthConfig {
   const { keys: apiKeys, labels: apiKeyLabels, models: apiKeyModels } =
     apiKeyList(root.apiKeys, "apiKeys", new Set(Object.keys(models)));
 
-  const peerTokensRaw = asRecord(root.peerTokens ?? {}, "peerTokens");
-  const peerTokens: Record<string, string> = {};
-  for (const [name, v] of Object.entries(peerTokensRaw)) {
-    peerTokens[name] = resolveSecret(str(v, `peerTokens.${name}`), `peerTokens.${name}`);
-  }
-
   const mainListen = {
     // Loopback by default. Anyone who wants it on the network says so, and
     // knows they said it.
@@ -895,6 +865,7 @@ export function parseConfig(raw: unknown): HearthConfig {
   let operator: { user: string; passHash: string } | null = null;
   if (root.operator !== undefined && root.operator !== null) {
     const e = asRecord(root.operator, "operator");
+    only(e, "operator", "operator");
     const user = str(e.user, "operator.user").trim();
     if (user === "") throw bad("operator.user", "must not be empty");
     const passHash = str(e.passHash, "operator.passHash");
@@ -904,45 +875,13 @@ export function parseConfig(raw: unknown): HearthConfig {
     operator = { user, passHash };
   }
 
-  let uiListen: { host: string; port: number; control: UiControl } | null = null;
-  if (root.uiListen !== undefined && root.uiListen !== null) {
-    const u = asRecord(root.uiListen, "uiListen");
-    // `false` (default) serves the page only; `key` adds the write routes behind the apiKey gate.
-    const rawControl = u.control ?? false;
-    if (rawControl !== false && rawControl !== "key") {
-      throw bad("uiListen.control", `must be false or "key" (got ${JSON.stringify(rawControl)})`);
-    }
-    const control: UiControl = rawControl === "key" ? "key" : "off";
-    uiListen = {
-      host: str(u.host, "uiListen.host", "127.0.0.1"),
-      port: count(u.port, "uiListen.port", 4142, 1),
-      control,
-    };
-    // Clickable controls with no apiKeys could only ever 401 off-loopback, so refuse at --check.
-    if (control === "key" && apiKeys.length === 0) {
-      throw bad(
-        "uiListen.control", `key requires apiKeys — without one, writes on the status ` +
-          `port fall back to loopback-only and every click from the LAN would be refused`,
-      );
-    }
-    // Same socket twice is a listen() failure at startup with a errno nobody
-    // reads. Say it here instead.
-    if (uiListen.port === mainListen.port && uiListen.host === mainListen.host) {
-      throw new ConfigError(
-        "uiListen",
-        `uiListen is the same address as listen (${uiListen.host}:${uiListen.port}) — ` +
-          `give the status page its own port, or drop uiListen and reach it on the main one`,
-      );
-    }
-  }
-
+  // A removed key is refused, not ignored: ignoring it would close the page's port with no word why.
   return {
     name: str(root.name, "name", "hearth"),
     // Set by loadConfig, which is the only caller that knows one.
     configPath: null,
     stateFile: str(root.stateFile, "stateFile", "") || null,
     listen: mainListen,
-    uiListen,
     resources: resourceDecls,
     backends,
     scheduler: {
@@ -959,26 +898,15 @@ export function parseConfig(raw: unknown): HearthConfig {
     apiKeyModels,
     peerTokens,
     operator,
-    share: strList(root.share, "share"),
-    notes: (() => {
-      const raw = root.notes === undefined ? {} : asRecord(root.notes, "notes");
-      const out: Record<string, string> = {};
-      for (const [id, v] of Object.entries(raw)) {
-        const note = str(v, `notes.${id}`).trim();
-        if (note.length > NOTE_MAX) {
-          throw bad(`notes.${id}`, `is ${note.length} characters -- keep it under ${NOTE_MAX}`);
-        }
-        if (note !== "") out[id] = note;
-      }
-      return out;
-    })(),
-    peerRateLimit: count(root.peerRateLimit, "peerRateLimit", 600, 1),
+    share: strList(lending.models, "lending.models"),
+    notes,
+    peerRateLimit: count(lending.rateLimit, "lending.rateLimit", 600, 1),
     peerLane: (() => {
-      const named = str(root.peerLane, "peerLane", "");
+      const named = str(lending.lane, "lending.lane", "");
       if (named !== "") {
         if (!(named in lanes)) {
           throw bad(
-            "peerLane", `is "${named}", which is not one of your lanes (${Object.keys(lanes).join(", ")})`,
+            "lending.lane", `is "${named}", which is not one of your lanes (${Object.keys(lanes).join(", ")})`,
           );
         }
         return named;
@@ -988,21 +916,21 @@ export function parseConfig(raw: unknown): HearthConfig {
       const pick = eligible.length > 0 ? eligible : Object.entries(lanes);
       return pick.sort((a, b) => b[1].priority - a[1].priority)[0]![0];
     })(),
-    peerMaxConcurrent: count(root.peerMaxConcurrent, "peerMaxConcurrent", 2, 1),
+    peerMaxConcurrent: count(lending.maxConcurrent, "lending.maxConcurrent", 2, 1),
     maxBodyBytes: count(root.maxBodyBytes, "maxBodyBytes", 32 * 1024 * 1024, 1024),
     peers,
     models,
-    peerFreshMs: count(root.peerFreshMs, "peerFreshMs", 4_000, 100),
-    peerDownMs: count(root.peerDownMs, "peerDownMs", 30_000, 1000),
+    peerFreshMs: count(borrowing.freshMs, "borrowing.freshMs", 4_000, 100),
+    peerDownMs: count(borrowing.downMs, "borrowing.downMs", 30_000, 1000),
     // Slower than it used to be, since on-demand probing does the real work.
-    peerPollMs: count(root.peerPollMs, "peerPollMs", 60_000, 1000),
-    peerStaleMs: count(root.peerStaleMs, "peerStaleMs", 60_000, 1000),
+    peerPollMs: count(borrowing.pollMs, "borrowing.pollMs", 60_000, 1000),
+    peerStaleMs: count(borrowing.staleMs, "borrowing.staleMs", 60_000, 1000),
     // Same family. A negative here quietly disabled the deadline, which looks
     // like working peer failover right up until a peer hangs.
-    peerFirstByteMs: atLeast(root.peerFirstByteMs, "peerFirstByteMs", 180_000),
-    backendFirstByteMs: atLeast(root.backendFirstByteMs, "backendFirstByteMs", 900_000),
-    backendIdleMs: atLeast(root.backendIdleMs, "backendIdleMs", 600_000),
-    coldPenalty: atLeast(root.coldPenalty, "coldPenalty", 2),
+    peerFirstByteMs: atLeast(borrowing.firstByteMs, "borrowing.firstByteMs", 180_000),
+    backendFirstByteMs: atLeast(defaults.firstByteMs, "backendDefaults.firstByteMs", 900_000),
+    backendIdleMs: atLeast(defaults.idleMs, "backendDefaults.idleMs", 600_000),
+    coldPenalty: atLeast(borrowing.coldPenalty, "borrowing.coldPenalty", 2),
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.
     shutdownGraceMs: atLeast(root.shutdownGraceMs, "shutdownGraceMs", 30_000),

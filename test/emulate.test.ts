@@ -8,9 +8,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 const USAGE = { prompt_tokens: 100, completion_tokens: 11, total_tokens: 111, prompt_tokens_details: { cached_tokens: 60 } };
 
@@ -82,7 +83,7 @@ function events(text: string): Record<string, unknown>[] {
 const be = vllmBackend();
 await be.listen();
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "me",
     backends: [{ name: "v", url: be.url(), kind: "none" }],
     models: { vm: { backend: "v", emulate: "llama-server" }, plain: { backend: "v" } },
@@ -95,8 +96,8 @@ await node.pool.first().state.refresh();
 // --- config: only known emulations parse ------------------------------------
 {
   const base = { name: "x", backend: { url: be.url() } };
-  assert.throws(() => parseConfig({ ...base, models: { m: { emulate: "ollama" } } }), ConfigError);
-  assert.equal(parseConfig({ ...base, models: { m: {} } }).models.m!.emulate, null);
+  assert.throws(() => parseV1({ ...base, models: { m: { emulate: "ollama" } } }), ConfigError);
+  assert.equal(parseV1({ ...base, models: { m: {} } }).models.m!.emulate, null);
 }
 
 // --- non-streamed: reasoning renamed, timings rebuilt from usage --------------

@@ -19,9 +19,9 @@ import { createServer } from "node:http";
 import { connect } from "node:net";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** Far more than any socket buffer holds, so the far side is definitely
  *  mid-backpressure when we cut it off. */
@@ -53,7 +53,7 @@ await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
 const backendUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
 
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "wedge-test",
     backend: { url: backendUrl, llamaSwapExtras: false },
     scheduler: { concurrency: 1 },
@@ -142,7 +142,7 @@ backend.close();
   const hurl = `http://127.0.0.1:${(blackhole.address() as AddressInfo).port}`;
 
   const hung = createNode(
-    parseConfig({
+    parseV1({
       name: "hung",
       backend: { url: hurl },
       // Short enough to assert against; the production default is 15 minutes,
@@ -190,7 +190,7 @@ backend.close();
   // and the node-wide number is sized for a chat server — so the per-backend
   // one has to win, or the deadline meant to catch a hang cuts off real work.
   const perBackend = createNode(
-    parseConfig({
+    parseV1({
       name: "per-backend",
       backendFirstByteMs: 300,
       backends: [{ name: "slow", url: hurl, serves: ["m"], firstByteMs: 30_000 }],

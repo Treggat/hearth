@@ -15,10 +15,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { Controls } from "../src/controls.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /* ---------------------------------------------- the object, in isolation */
 
@@ -99,7 +99,7 @@ const be = stubBackend("from-local");
 await peer.listen();
 await be.listen();
 
-const cfg = parseConfig({
+const cfg = parseV1({
   name: "node-under-test",
   backend: { url: be.url(), llamaSwapExtras: false },
   share: ["mine"],

@@ -2,12 +2,11 @@
 import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import type { UiData } from "../ui/types.js";
+import type { UiData } from "./types.js";
 import { control, select, useStore } from "./store.js";
 import { ago, Card, cx, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
 
 const selfOf = (d: UiData) => d.net.nodes.find((n) => n.self)!;
-const canWrite = (d: UiData) => d.canWarm;
 
 /* ------------------------------------------------------------- inspector */
 
@@ -31,8 +30,8 @@ export function Inspector() {
   if (sel.kind === "self") {
     body = (
       <>
-        <Row k="lending"><Switch label="lending" disabled={!canWrite(d)} on={d.controls.lending} onChange={(on) => void control({ lending: on }, on ? "lending resumed" : "lending paused")} /></Row>
-        <Row k="borrowing"><Switch label="borrowing" disabled={!canWrite(d)} on={d.controls.borrowing} onChange={(on) => void control({ borrowing: on }, on ? "borrowing resumed" : "borrowing paused")} /></Row>
+        <Row k="lending"><Switch label="lending" on={d.controls.lending} onChange={(on) => void control({ lending: on }, on ? "lending resumed" : "lending paused")} /></Row>
+        <Row k="borrowing"><Switch label="borrowing" on={d.controls.borrowing} onChange={(on) => void control({ borrowing: on }, on ? "borrowing resumed" : "borrowing paused")} /></Row>
         <p className="mt-2 text-[11px] text-dim">Pausing applies at once and is not written to the config; a restart clears it.</p>
         <Row k="lent">{d.share.length ? d.share.join(", ") : "nothing"}</Row>
       </>
@@ -61,12 +60,10 @@ export function Inspector() {
           {Object.entries(p.map ?? {}).length === 0 ? "nothing borrowed" : Object.entries(p.map ?? {}).map(([mine, theirs]) => (
             <div key={mine} className="flex items-center gap-2">
               <span className={mono}>{mine}{theirs !== mine ? ` → ${theirs}` : ""}</span>
-              {canWrite(d) && (
-                <button className="ml-auto text-dim hover:text-bad" aria-label={`unlink ${mine}`}
-                        onClick={() => void control({ unlink: { peer: p.name, mine } }, `unlinked ${mine}`)}>
-                  <X size={14} />
-                </button>
-              )}
+              <button className="ml-auto text-dim hover:text-bad" aria-label={`unlink ${mine}`}
+                      onClick={() => void control({ unlink: { peer: p.name, mine } }, `unlinked ${mine}`)}>
+                <X size={14} />
+              </button>
             </div>
           ))}
         </Row>
@@ -75,10 +72,8 @@ export function Inspector() {
             {p.unmapped!.map((m) => (
               <div key={m} className="flex items-center gap-2">
                 <span className={mono}>{m}</span>
-                {canWrite(d) && (
-                  <button className="ml-auto text-[11px] text-accent hover:underline"
-                          onClick={() => void control({ link: { peer: p.name, mine: m, theirs: m } }, `linked ${m}`)}>link</button>
-                )}
+                <button className="ml-auto text-[11px] text-accent hover:underline"
+                        onClick={() => void control({ link: { peer: p.name, mine: m, theirs: m } }, `linked ${m}`)}>link</button>
               </div>
             ))}
           </Row>
@@ -113,10 +108,9 @@ export function Inspector() {
 
 /* ---------------------------------------------------------------- models */
 
-function NoteCell({ model, note, editable }: { model: string; note: string; editable: boolean }) {
+function NoteCell({ model, note }: { model: string; note: string }) {
   const [draft, setDraft] = useState(note);
   useEffect(() => setDraft(note), [note]);
-  if (!editable) return <span className="text-dim">{note}</span>;
   const commit = () => {
     if (draft.trim() === note.trim()) return;
     void control({ notes: { [model]: draft.trim() === "" ? null : draft } }, "note saved");
@@ -170,10 +164,10 @@ export function Models() {
                 <td className="tabular px-2 py-2 text-dim">{stats?.context ? `${Math.round(stats.context / 1024)}k` : "—"}</td>
                 <td className="px-2 py-2">
                   {local.has(m)
-                    ? <Switch label={`lend ${m}`} disabled={!canWrite(d)} on={lent} onChange={(on) => void control({ share: { [m]: on } }, on ? `lending ${m}` : `holding ${m}`)} />
+                    ? <Switch label={`lend ${m}`} on={lent} onChange={(on) => void control({ share: { [m]: on } }, on ? `lending ${m}` : `holding ${m}`)} />
                     : <span className="text-dim">—</span>}
                 </td>
-                <td className="px-2 py-1">{local.has(m) ? <NoteCell model={m} note={stats?.note ?? ""} editable={canWrite(d)} /> : null}</td>
+                <td className="px-2 py-1">{local.has(m) ? <NoteCell model={m} note={stats?.note ?? ""} /> : null}</td>
               </tr>
             );
           })}

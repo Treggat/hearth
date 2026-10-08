@@ -23,9 +23,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A backend whose /running answer we control, including whether the id it
  *  reports is one the config declared. */
@@ -51,7 +51,7 @@ const backend = fake(() => reported);
 await backend.listen();
 
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "residency",
     backends: [
       {

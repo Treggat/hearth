@@ -6,19 +6,20 @@
  */
 import assert from "node:assert/strict";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
 import { cleanStats, NOTE_MAX } from "../src/stats.js";
+import { parseV1 } from "./v1.js";
 
 const base = { backend: { url: "http://x:1" } };
 
-assert.deepEqual(parseConfig(base).notes, {});
+assert.deepEqual(parseV1(base).notes, {});
 assert.deepEqual(
-  parseConfig({ ...base, notes: { coder: "  fast agent model  ", empty: "" } }).notes,
+  parseV1({ ...base, notes: { coder: "  fast agent model  ", empty: "" } }).notes,
   { coder: "fast agent model" },
   "trimmed, and an empty note is no note",
 );
-assert.throws(() => parseConfig({ ...base, notes: { coder: 3 } }), ConfigError);
-assert.throws(() => parseConfig({ ...base, notes: { coder: "x".repeat(NOTE_MAX + 1) } }), /keep it under/);
+assert.throws(() => parseV1({ ...base, notes: { coder: 3 } }), ConfigError);
+assert.throws(() => parseV1({ ...base, notes: { coder: "x".repeat(NOTE_MAX + 1) } }), /keep it under/);
 
 // A note alone is worth sending, and a peer's is capped rather than trusted.
 assert.deepEqual(cleanStats({ note: "use for code" }), { note: "use for code" });

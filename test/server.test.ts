@@ -11,9 +11,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** Pretend inference server. Records what it was asked for, streams SSE back
  *  the way llama.cpp does, and can be told to break. */
@@ -144,7 +144,7 @@ await mine.listen();
 await theirs.listen();
 
 // THEIR node: shares one model, and only that one.
-const theirCfg = parseConfig({
+const theirCfg = parseV1({
   name: "friend",
   backend: { url: theirs.url(), llamaSwapExtras: false },
   peerTokens: { me: "token-from-me" },
@@ -154,7 +154,7 @@ const theirNode = createNode(theirCfg, silentLogger);
 const theirUrl = await listen(theirNode);
 
 // MY node: routes `big` to them, under their id.
-const myCfg = parseConfig({
+const myCfg = parseV1({
   name: "me",
   backend: { url: mine.url(), llamaSwapExtras: false },
   peers: [{ name: "friend", url: theirUrl, token: "token-from-me", models: { big: "their-big" } }],
@@ -297,7 +297,7 @@ step("nodes up");
   // test should fail on the gate, not on a hung upstream.
   const guardBackend = fakeBackend("guard-gpu");
   await guardBackend.listen();
-  const guardCfg = parseConfig({
+  const guardCfg = parseV1({
     name: "guarded",
     backend: { url: guardBackend.url(), llamaSwapExtras: false },
     peerTokens: { me: "token-from-me" },
@@ -377,7 +377,7 @@ step("nodes up");
   await mineBe.listen();
   await theirBe.listen();
 
-  const themCfg = parseConfig({
+  const themCfg = parseV1({
     name: "friend",
     backend: { url: theirBe.url(), llamaSwapExtras: true },
     peerTokens: { me: "tok" },
@@ -387,7 +387,7 @@ step("nodes up");
   const themUrl = await listen(them);
   await them.pool.first().state.refresh();
 
-  const usCfg = parseConfig({
+  const usCfg = parseV1({
     name: "me",
     backend: { url: mineBe.url(), llamaSwapExtras: true },
     // G is mapped; S deliberately is NOT, to prove unmapped capacity is
@@ -472,7 +472,7 @@ step("nodes up");
   step("peer-lane");
   const be = fakeBackend("lane-gpu");
   await be.listen();
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "host",
     backend: { url: be.url(), llamaSwapExtras: false },
     peerTokens: { guest: "gtok" },
@@ -521,7 +521,7 @@ step("nodes up");
     { id: "private-thing", state: "ready" },
   ]);
   await be.listen();
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "tight",
     backend: { url: be.url(), llamaSwapExtras: false },
     peerTokens: { me: "tok" },
@@ -629,7 +629,7 @@ step("nodes up");
 
   const be = fakeBackend("local-gpu");
   await be.listen();
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "borrower",
     backend: { url: be.url(), llamaSwapExtras: false },
     peers: [{ name: "stubborn", url: stubbornUrl, token: "t", models: { big: "their-big" } }],
@@ -672,7 +672,7 @@ step("nodes up");
   await new Promise<void>((r) => failing.listen(0, "127.0.0.1", r));
   const failingUrl = `http://127.0.0.1:${(failing.address() as AddressInfo).port}`;
 
-  const cfg2 = parseConfig({
+  const cfg2 = parseV1({
     name: "borrower2",
     backend: { url: be.url(), llamaSwapExtras: false },
     peers: [{ name: "failing", url: failingUrl, token: "t", models: { big: "their-big" } }],

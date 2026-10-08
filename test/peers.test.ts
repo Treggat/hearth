@@ -10,9 +10,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { PeerRegistry } from "../src/peers.js";
+import { parseV1 } from "./v1.js";
 
 /** A peer whose health and auth we can steer from the test. */
 let answering = true;
@@ -52,7 +52,7 @@ await new Promise<void>((ready) => peer.listen(0, "127.0.0.1", ready));
 const peerUrl = `http://127.0.0.1:${(peer.address() as AddressInfo).port}`;
 
 function build(staleMs = 60_000) {
-  const cfg = parseConfig({
+  const cfg = parseV1({
     backend: { url: "http://127.0.0.1:9292" },
     peerStaleMs: staleMs,
     peers: [{ name: "friend", url: peerUrl, token: "shared-token", models: { big: "their-big" } }],

@@ -13,9 +13,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** A mock llama-swap backend that tracks calls to /upstream/<id>/props. */
 function swapBackend() {
@@ -156,7 +156,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   const be = swapBackend();
   await be.listen();
   be.setLoaded("alpha");
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -188,7 +188,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   const be = swapBackend();
   await be.listen();
   be.setLoaded("alpha");
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -223,7 +223,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   await be.listen();
   // Ollama does not serve /v1/models; declare the model explicitly so the
   // catalog is populated from config rather than a failed catalog query.
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "ollama", serves: ["qwen3:8b"] },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -253,7 +253,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   const be = ollamaBackend();
   await be.listen();
   be.setNumCtx(null);
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "ollama", serves: ["qwen3:8b"] },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -282,7 +282,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
 {
   const be = singleBackend();
   await be.listen();
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "single" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -308,7 +308,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   const be = swapBackend();
   await be.listen();
   be.setLoaded("alpha");
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     models: { fast: { as: "alpha" } },
@@ -341,7 +341,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   const be = swapBackend();
   await be.listen();
   be.setLoaded("alpha");
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -381,7 +381,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   const be = swapBackend();
   await be.listen();
   be.setLoaded("alpha");
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -436,7 +436,7 @@ async function waitForContext(url: string, id: string, timeout = 3000): Promise<
   });
   await new Promise<void>((r) => peer.listen(0, "127.0.0.1", r));
   const peerUrl = `http://127.0.0.1:${(peer.address() as AddressInfo).port}`;
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },

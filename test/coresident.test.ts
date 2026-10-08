@@ -8,10 +8,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { BackendPool } from "../src/pool.js";
 import { Scheduler } from "../src/scheduler.js";
+import { parseV1 } from "./v1.js";
 
 const lanes = { chat: { priority: 0 }, batch: { priority: 100 } };
 /** Two embedders, one request each at a time. */
@@ -160,7 +160,7 @@ const tick = () => new Promise((r) => setImmediate(r));
 // backend serves a resident set. Through parseConfig and the pool's own
 // schedulers, so this tests the wiring rather than a flag the test set itself.
 {
-  const embedders = (kind: string) => new BackendPool(parseConfig({
+  const embedders = (kind: string) => new BackendPool(parseV1({
     name: "n",
     backends: [{ name: "embed", url: "http://127.0.0.1:1", kind, concurrency: 2 }],
     models: {
@@ -206,7 +206,7 @@ const tick = () => new Promise((r) => setImmediate(r));
   });
   await new Promise<void>((r) => fake.listen(0, "127.0.0.1", r));
   const url = `http://127.0.0.1:${(fake.address() as AddressInfo).port}`;
-  const pool = new BackendPool(parseConfig({
+  const pool = new BackendPool(parseV1({
     name: "n",
     backends: [{ name: "embed", url, kind: "ollama", concurrency: 2 }],
     models: {

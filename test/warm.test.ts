@@ -13,9 +13,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
+import { parseV1 } from "./v1.js";
 
 /** llama-swap enough for this: /running, and an /upstream/<m>/health that both
  *  answers and marks the model loaded, the way starting a server does. */
@@ -81,7 +81,7 @@ const warmReq = (url: string, model: string) =>
 
 const be = swapBackend();
 await be.listen();
-const cfg = parseConfig({
+const cfg = parseV1({
   name: "me",
   backend: { url: be.url(), kind: "llama-swap" },
   scheduler: { concurrency: 1, lanes: { chat: { priority: 0 } } },
@@ -153,7 +153,7 @@ assert.ok(
 {
   const be2 = swapBackend();
   await be2.listen();
-  const c2 = parseConfig({ name: "s", backend: { url: be2.url(), kind: "single" }, });
+  const c2 = parseV1({ name: "s", backend: { url: be2.url(), kind: "single" }, });
   const n2 = createNode(c2, silentLogger);
   const u2 = await listen(n2);
   await n2.pool.first().state.refresh();
@@ -168,13 +168,13 @@ assert.ok(
 // construction — so adding it silently filed every peer's inference behind
 // speculative preloading until this was excluded.
 {
-  const c = parseConfig({
+  const c = parseV1({
     name: "h", backend: { url: be.url() },
     peerTokens: { g: "t" }, share: ["alpha"],
     scheduler: { lanes: { chat: { priority: 0 }, batch: { priority: 100 } } },
   });
   assert.equal(c.peerLane, "batch", "peers go to the lowest REAL lane, not warm");
-  const explicit = parseConfig({
+  const explicit = parseV1({
     name: "h", backend: { url: be.url() },
     peerTokens: { g: "t" }, share: ["alpha"], peerLane: "warm",
     scheduler: { lanes: { chat: { priority: 0 } } },
@@ -190,7 +190,7 @@ assert.ok(
 {
   const hostBe = swapBackend();
   await hostBe.listen();
-  const hostCfg = parseConfig({
+  const hostCfg = parseV1({
     name: "host", backend: { url: hostBe.url(), kind: "llama-swap" },
     peerTokens: { guest: "gtok" }, share: ["alpha"],
     scheduler: { concurrency: 1, lanes: { chat: { priority: 0 } } },
@@ -261,7 +261,7 @@ assert.ok(
 {
   const be3 = swapBackend();
   await be3.listen();
-  const c3 = parseConfig({
+  const c3 = parseV1({
     name: "f", backend: { url: be3.url(), kind: "llama-swap" },
     scheduler: { concurrency: 1, maxPerLane: 1, lanes: { chat: { priority: 0 } } },
   });

@@ -21,7 +21,7 @@ import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 import { yamlScalar as yq } from "../src/yamlq.js";
 
-const uiDir = new URL("../src/ui/", import.meta.url).pathname;
+const uiDir = new URL("../src/console/", import.meta.url).pathname;
 
 const dir = mkdtempSync(join(tmpdir(), "hearth-sec-"));
 const cfgPath = join(dir, "hearth.yaml");
@@ -36,14 +36,14 @@ await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
 const beUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
 
 writeFileSync(cfgPath, `name: sec
-backend: { url: "${beUrl}", kind: none, serves: [mine] }
-share: [mine]
+backends: { main: { url: "${beUrl}", kind: none, serves: [mine] } }
+lending: { models: [mine] }
 apiKeys: [my-key]
-peerTokens: { friend: peer-token }
 peers:
-  - name: friend
+  friend:
     url: http://127.0.0.1:1
     token: t
+    accept: peer-token
     models: { borrowed: theirs }
 `);
 chmodSync(cfgPath, 0o600);
@@ -154,12 +154,12 @@ await node.close();
   await new Promise<void>((r) => hostile.listen(0, "127.0.0.1", r));
   const p2 = join(dir, "peer.yaml");
   writeFileSync(p2, `name: sec2
-backend: { url: "${beUrl}", kind: none, serves: [mine] }
-peerTokens: { evil: tok }
+backends: { main: { url: "${beUrl}", kind: none, serves: [mine] } }
 peers:
-  - name: evil
+  evil:
     url: http://127.0.0.1:${(hostile.address() as AddressInfo).port}
     token: t
+    accept: tok
     models: { borrowed: theirs }
 `);
   const n2 = createNode(loadConfig(p2), silentLogger);
@@ -221,10 +221,10 @@ peers:
   const cfgFile = join(dir, "hearth.yaml");
   writeFileSync(cfgFile, [
     "name: authz",
-    `backend: { url: ${yq(beUrl)}, serves: [m] }`,
+    `backends: { main: { url: ${yq(beUrl)}, serves: [m] } }`,
     "apiKeys: [local-key]",
-    "share: [m]",
-    "peerTokens: { friend: peer-token }",
+    "lending: { models: [m] }",
+    "peers: { friend: { accept: peer-token } }",
   ].join("\n"));
   const n = createNode(loadConfig(cfgFile), silentLogger);
   n.start();
@@ -315,7 +315,7 @@ peers:
   const cfgFile = join(dir, "hearth.yaml");
   writeFileSync(cfgFile, [
     "name: scoped",
-    `backend: { url: ${yq(beUrl)}, kind: none, serves: [m, other] }`,
+    `backends: { main: { url: ${yq(beUrl)}, kind: none, serves: [m, other] } }`,
     "apiKeys:",
     "  - {key: full-key, label: app}",
     "  - {key: narrow-key, label: voice, models: [quiet]}",
@@ -371,13 +371,13 @@ peers:
   const cfgFile = join(dir, "hearth.yaml");
   writeFileSync(cfgFile, [
     "name: scoped",
-    `backend: { url: ${yq(beUrl)}, serves: [m] }`,
+    `backends: { main: { url: ${yq(beUrl)}, serves: [m] } }`,
     "apiKeys: [{key: k, label: v, models: [m]}]",
   ].join("\n"));
   assert.throws(() => loadConfig(cfgFile), /not a route in models:/, "a backend id alone is not a route");
   writeFileSync(cfgFile, [
     "name: scoped",
-    `backend: { url: ${yq(beUrl)}, serves: [m] }`,
+    `backends: { main: { url: ${yq(beUrl)}, serves: [m] } }`,
     "apiKeys: [{key: k, label: v, models: []}]",
   ].join("\n"));
   assert.throws(() => loadConfig(cfgFile), /at least one model/, "an empty scope is a mistake, not a lock");

@@ -4,8 +4,19 @@
  */
 import { create } from "zustand";
 
-import { forgetKey, rememberKey, storedKey } from "../ui/lib.js";
-import type { UiData } from "../ui/types.js";
+import type { UiData } from "./types.js";
+
+const KEY_STORE = "hearth.apikey";
+const storedKey = (): string | null => {
+  try { return localStorage.getItem(KEY_STORE); } catch { return null; }
+};
+const rememberKey = (key: string): void => {
+  try { localStorage.setItem(KEY_STORE, key.trim()); } catch { /* private mode */ }
+};
+/** Forget a key only on a 401; a 403 is the cross-origin guard, not a bad key. */
+const forgetKey = (): void => {
+  try { localStorage.removeItem(KEY_STORE); } catch { /* private mode */ }
+};
 
 export type Page = "topology" | "models" | "queue" | "config";
 export type Sel = { kind: "self" | "peer" | "backend" | "resource"; id: string } | null;

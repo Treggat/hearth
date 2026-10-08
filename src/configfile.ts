@@ -24,6 +24,9 @@ const LIVE_KEYS = [
   "peerStaleMs", "peerFirstByteMs", "backendFirstByteMs", "backendIdleMs", "coldPenalty", "shutdownGraceMs",
 ] as const satisfies readonly (keyof HearthConfig)[];
 
+/** Restart-only internal keys whose hearth.yaml name differs, for "restart to apply …". */
+const YAML_NAME: Record<string, string> = { peerPollMs: "borrowing.pollMs" };
+
 /** Live keys that stay frozen once applied, as the fixed config is. */
 const FROZEN_LIVE = new Set<string>(["apiKeys", "apiKeyLabels", "apiKeyModels", "peerTokens", "operator"]);
 
@@ -70,8 +73,7 @@ function secretTable(doc: unknown): Map<string, string> {
     if (typeof e === "string") grab(e);
     else if (isObj(e)) grab(e.key);
   }
-  if (isObj(d.peerTokens)) for (const t of Object.values(d.peerTokens)) grab(t);
-  if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) grab(p.token);
+  if (isObj(d.peers)) for (const p of Object.values(d.peers)) if (isObj(p)) { grab(p.token); grab(p.accept); }
   // Only a hash, but one that can be attacked offline, and nothing on the page needs it.
   if (isObj(d.operator)) grab(d.operator.passHash);
   return table;
@@ -92,8 +94,13 @@ function maskSecrets(text: string, doc: unknown): { text: string; doc: unknown }
       if (typeof e === "string") keys[i] = swap(e);
       else if (isObj(e)) e.key = swap(e.key);
     }
-  if (isObj(d.peerTokens)) d.peerTokens = Object.fromEntries(Object.entries(d.peerTokens).map(([k, v]) => [k, swap(v)]));
-  if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) p.token = swap(p.token);
+  if (isObj(d.peers)) {
+    for (const p of Object.values(d.peers)) {
+      if (!isObj(p)) continue;
+      if (p.token !== undefined) p.token = swap(p.token);
+      if (p.accept !== undefined) p.accept = swap(p.accept);
+    }
+  }
   if (isObj(d.operator)) d.operator.passHash = swap(d.operator.passHash);
   let masked = text;
   for (const [m, s] of table) masked = masked.split(s).join(m);
@@ -243,18 +250,18 @@ function writeDiff(doc: Document, before: HearthConfig, after: HearthConfig, whe
   };
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
-  if (!same(before.share, after.share)) setList(["share"], after.share);
+  if (!same(before.share, after.share)) setList(["lending", "models"], after.share);
 
-  for (const [i, p] of after.peers.entries()) {
+  for (const p of after.peers) {
     const was = before.peers.find((x) => x.name === p.name)?.models ?? {};
     if (same(was, p.models)) continue;
     // Refuse rather than skip: an anchored `peers:` would drop the edit and still report saved.
-    if (!(doc.getIn(["peers", i], true))) {
-      throw new ConfigError(`peers[${i}].models`, `cannot find peer "${p.name}" as a plain entry under peers: in ${where}`);
+    if (!(doc.getIn(["peers", p.name], true))) {
+      throw new ConfigError(`peers.${p.name}.models`, `cannot find peer "${p.name}" as a plain entry under peers: in ${where}`);
     }
-    for (const mine of Object.keys(was)) if (!(mine in p.models)) doc.deleteIn(["peers", i, "models", mine]);
+    for (const mine of Object.keys(was)) if (!(mine in p.models)) doc.deleteIn(["peers", p.name, "models", mine]);
     for (const [mine, theirs] of Object.entries(p.models)) {
-      if (was[mine] !== theirs) doc.setIn(["peers", i, "models", mine], theirs);
+      if (was[mine] !== theirs) doc.setIn(["peers", p.name, "models", mine], theirs);
     }
   }
 
@@ -262,7 +269,9 @@ function writeDiff(doc: Document, before: HearthConfig, after: HearthConfig, whe
     const was = before.models[id];
     const now = after.models[id];
     if (!now) {
-      if (was) doc.deleteIn(["models", id]);
+      // A retired route keeps its note: the note describes the model, not where it runs.
+      if (was) for (const k of Object.keys(was)) if (k !== "note") doc.deleteIn(["models", id, k]);
+      dropIfEmpty(id);
       continue;
     }
     if (was && was.policy === now.policy && was.fallbackLocal === now.fallbackLocal && same(was.peers, now.peers)) continue;
@@ -278,10 +287,15 @@ function writeDiff(doc: Document, before: HearthConfig, after: HearthConfig, whe
   const nowNotes = after.notes ?? {};
   for (const m of new Set([...Object.keys(wasNotes), ...Object.keys(nowNotes)])) {
     if (wasNotes[m] === nowNotes[m]) continue;
-    if (nowNotes[m] === undefined) doc.deleteIn(["notes", m]);
-    else doc.setIn(["notes", m], nowNotes[m]);
+    if (nowNotes[m] === undefined) { doc.deleteIn(["models", m, "note"]); dropIfEmpty(m); }
+    else doc.setIn(["models", m, "note"], nowNotes[m]);
   }
-  if (Object.keys(nowNotes).length === 0 && doc.has("notes")) doc.delete("notes");
+
+  /** A model entry left with nothing in it goes, rather than staying as `id: {}`. */
+  function dropIfEmpty(id: string): void {
+    const node = doc.getIn(["models", id], true) as { items?: unknown[] } | undefined;
+    if (node && Array.isArray(node.items) && node.items.length === 0) doc.deleteIn(["models", id]);
+  }
 }
 
 /* --------------------------------------------------------------- the file */
@@ -515,7 +529,8 @@ export class ConfigFile {
   }
 
   private restartPendingFor(next: HearthConfig): string[] {
-    return Object.keys(this.running).filter((k) => JSON.stringify(this.restartView(k, next)) !== this.running[k]).sort();
+    return Object.keys(this.running).filter((k) => JSON.stringify(this.restartView(k, next)) !== this.running[k])
+      .map((k) => YAML_NAME[k] ?? k).sort();
   }
 
   /** Re-read the file; if someone else changed it, load that first so an edit builds on it. */
