@@ -279,6 +279,9 @@ peers:
     url: http://127.0.0.1:1
     token: plain-peer-token
     models: {}
+operator:
+  user: op
+  passHash: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
 `;
   writeFileSync(secretPath, SECRETED);
   const a = await boot(secretPath);
@@ -288,7 +291,7 @@ peers:
   const patch = (body: unknown) => fetch(`${a.url}/config`, { method: "PATCH", headers: auth, body: JSON.stringify(body) });
 
   const f = await get();
-  for (const s of ["plain-key-value", "plain-map-key", "plain-token-value", "plain-peer-token", "env-resolved-value"]) {
+  for (const s of ["plain-key-value", "plain-map-key", "plain-token-value", "plain-peer-token", "env-resolved-value", "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"]) {
     assert.ok(!f.text.includes(s), `no secret in the file's own tab (${s})`);
     assert.ok(!JSON.stringify(f.doc).includes(s), `no secret in the parsed doc`);
   }

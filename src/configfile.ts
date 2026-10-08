@@ -72,6 +72,8 @@ function secretTable(doc: unknown): Map<string, string> {
   }
   if (isObj(d.peerTokens)) for (const t of Object.values(d.peerTokens)) grab(t);
   if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) grab(p.token);
+  // Only a hash, but one that can be attacked offline, and nothing on the page needs it.
+  if (isObj(d.operator)) grab(d.operator.passHash);
   return table;
 }
 
@@ -92,6 +94,7 @@ function maskSecrets(text: string, doc: unknown): { text: string; doc: unknown }
     }
   if (isObj(d.peerTokens)) d.peerTokens = Object.fromEntries(Object.entries(d.peerTokens).map(([k, v]) => [k, swap(v)]));
   if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) p.token = swap(p.token);
+  if (isObj(d.operator)) d.operator.passHash = swap(d.operator.passHash);
   let masked = text;
   for (const [m, s] of table) masked = masked.split(s).join(m);
   return { text: masked, doc: d };
