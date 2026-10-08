@@ -69,6 +69,11 @@ function stamp(obj: Record<string, unknown>, clock: Clock): void {
   }
 }
 
+/** An OpenAI-shaped error as one SSE data frame, for a stream whose 200 was already sent. */
+export function streamErrorFrame(status: number, message: string): string {
+  return `data: ${JSON.stringify({ error: { message: message.slice(0, 500), type: "server_error", code: status } })}\n\n`;
+}
+
 /** Relays an upstream answer reshaped as llama-server's; returns the status. */
 export async function relayEmulated(
   up: UpstreamResponse,
@@ -78,14 +83,16 @@ export async function relayEmulated(
 ): Promise<number> {
   const clock: Clock = { sentAt, firstAt: 0, lastAt: 0 };
   const type = String(up.headers["content-type"] ?? "application/json");
-  res.writeHead(up.status, { ...headers, "Content-Type": type, "X-Accel-Buffering": "no" });
+  // A stream opened early to report queue position already has its headers; failures then go in-band.
+  const early = res.headersSent;
+  if (!early) res.writeHead(up.status, { ...headers, "Content-Type": type, "X-Accel-Buffering": "no" });
 
   if (up.status >= 400 || !type.includes("text/event-stream")) {
     const chunks: Buffer[] = [];
     for await (const c of up.body) chunks.push(c as Buffer);
     const raw = Buffer.concat(chunks).toString();
     if (up.status >= 400) {
-      res.end(raw);
+      res.end(early ? streamErrorFrame(up.status, raw) : raw);
       return up.status;
     }
     try {

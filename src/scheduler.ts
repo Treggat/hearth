@@ -18,6 +18,8 @@ export interface LaneConfig {
   /** Slots this lane may hold at once on one backend; unset is no ceiling. Priority orders
    *  the queue and nothing is preempted, so this is what keeps bulk work off a busy seat. */
   concurrency?: number;
+  /** Fail a queued job once nothing on this backend has started for this long: a wedged-lane guard, not a deadline. */
+  maxWaitMs?: number;
 }
 
 export interface SchedulerOptions {
@@ -46,6 +48,8 @@ export interface SchedulerOptions {
   pool?: (model: string) => number | null;
   /** The id a model occupies the backend under, so aliases of one resident model batch together. */
   wire?: (model: string) => string;
+  /** A turn may join running turns only once each has run this long; 0 never waits. */
+  shareAfter?: (model: string) => number;
   /** Several models run side by side (ollama), so a model's ceiling counts only its own jobs. */
   coresident?: boolean;
   /** Fires whenever the job list changes, for status surfaces. */
@@ -111,6 +115,16 @@ export class QueueFullError extends Error {
   }
 }
 
+export class QueueTimeoutError extends Error {
+  constructor(
+    public readonly lane: string,
+    public readonly waitMs: number,
+  ) {
+    super(`nothing in the ${lane} lane started for ${Math.round(waitMs / 1000)}s`);
+    this.name = "QueueTimeoutError";
+  }
+}
+
 export class AbortedError extends Error {
   constructor() {
     super("aborted");
@@ -135,6 +149,7 @@ interface Job<T = unknown> {
   onPosition?: (position: number) => void;
   lastPosition: number;
   detach?: () => void;
+  waitTimer?: ReturnType<typeof setTimeout>;
 }
 
 const DEFAULTS = {
@@ -156,6 +171,11 @@ export class Scheduler {
   private readonly poolOf: (model: string) => number | null;
   private readonly wireOf: (model: string) => string;
   private readonly coresident: boolean;
+  private readonly shareAfter: (model: string) => number;
+  /** One pending wake-up for a turn waiting on shareAfter. */
+  private shareTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When a job last started here, so the wait guard can tell a slow lane from a stuck one. */
+  private lastStartAt = 0;
   private readonly onChange?: (jobs: JobView[]) => void;
   private readonly resources: readonly string[];
   private readonly arbiter?: ResourceArbiter;
@@ -181,6 +201,7 @@ export class Scheduler {
     this.poolOf = opts.pool ?? (() => null);
     this.wireOf = opts.wire ?? ((m) => m);
     this.coresident = opts.coresident ?? false;
+    this.shareAfter = opts.shareAfter ?? (() => 0);
     this.onChange = opts.onChange;
     // Arbitrate only with both resources and an arbiter; config validation catches half a pair.
     this.resources = opts.arbiter ? (opts.resources ?? []) : [];
@@ -338,9 +359,26 @@ export class Scheduler {
     if (this.laneFull(job)) return false;
     if (this.heldBy(job.model) >= this.limitFor(job.model)) return false;
     if (this.overPool(job)) return false;
+    if (this.tooSoonToShare(job)) return false;
     if (this.running.size < this.concurrency) return true;
     const wire = this.wireOf(job.model);
     for (const j of this.running) if (this.wireOf(j.model) !== wire) return false;
+    return true;
+  }
+
+  /** Would joining now cut into a running turn's head start? Arms a wake-up for when the youngest crosses it. */
+  private tooSoonToShare(job: Job): boolean {
+    if (this.running.size === 0) return false;
+    const share = this.shareAfter(job.model);
+    if (share <= 0) return false;
+    let youngest = 0;
+    for (const j of this.running) youngest = Math.max(youngest, j.startedAt ?? 0);
+    const wait = youngest + share - Date.now();
+    if (wait <= 0) return false;
+    if (!this.shareTimer) {
+      this.shareTimer = setTimeout(() => { this.shareTimer = null; this.pump(); }, wait + 1);
+      this.shareTimer.unref?.();
+    }
     return true;
   }
 
@@ -503,6 +541,8 @@ export class Scheduler {
       this.remove(job);
       job.state = "running";
       job.startedAt = Date.now();
+      this.lastStartAt = job.startedAt;
+      clearTimeout(job.waitTimer);
       // Taking the hardware and clearing the neighbours off it happen once per
       // TURN, not once per job: a backend that already holds its resources had
       // them cleared when it took them.
@@ -580,6 +620,7 @@ export class Scheduler {
           // wired into its upstream call and rejects run() for us.
           if (job.state !== "queued") return;
           this.remove(job as Job);
+          clearTimeout(job.waitTimer);
           job.detach?.();
           reject(new AbortedError());
           // The queue may have just emptied, and a hold is kept only for work
@@ -632,6 +673,29 @@ export class Scheduler {
         return;
       }
 
+      const maxWait = this.lanes[job.lane]?.maxWaitMs;
+      if (maxWait) {
+        // Re-armed while anything here starts: only a backend that has stopped moving fails its queue.
+        let checked = Date.now();
+        const arm = () => {
+          job.waitTimer = setTimeout(() => {
+            if (job.state !== "queued") return;
+            if (this.lastStartAt > checked) {
+              checked = Date.now();
+              arm();
+              return;
+            }
+            this.remove(job as Job);
+            job.detach?.();
+            reject(new QueueTimeoutError(job.lane, maxWait));
+            this.updateClaim();
+            if (this.running.size === 0) this.settleHold();
+            this.sync();
+          }, maxWait);
+          job.waitTimer.unref?.();
+        };
+        arm();
+      }
       this.queued.push(job as Job);
       this.pump();
     });

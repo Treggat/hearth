@@ -95,6 +95,8 @@ export class BackendPool {
           // that fallback, and answering it here would freeze the value.
           slots: (m) => this.slotsOf(m),
           pool: (m) => this.poolOf(m)?.tokens ?? null,
+          // Inherited from the seat an alias fronts, like slots.
+          shareAfter: (m) => this.cfg.models[m]?.shareAfterMs ?? this.cfg.models[this.outboundId(m)]?.shareAfterMs ?? 0,
           // Two ids that resolve to the same resident model ARE the same model
           // to a backend that batches; without this the scheduler sees a
           // foreign job and refuses to run them together.

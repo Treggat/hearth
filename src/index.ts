@@ -10,7 +10,7 @@ export type { HearthNode } from "./server.js";
 export { BackendState } from "./backend.js";
 export { BackendPool } from "./pool.js";
 export type { BackendSlot, ModelCapacity } from "./pool.js";
-export { Scheduler, QueueFullError, AbortedError } from "./scheduler.js";
+export { Scheduler, QueueFullError, QueueTimeoutError, AbortedError } from "./scheduler.js";
 export type { JobSpec, JobView, SchedulerOptions } from "./scheduler.js";
 export { History } from "./history.js";
 export type { Sample, BackendSample } from "./history.js";

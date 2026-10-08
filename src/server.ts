@@ -12,7 +12,7 @@ import {
   type BackendConfig, type HearthConfig, type RoutePolicy,
 } from "./config.js";
 import { Controls } from "./controls.js";
-import { emulatedRequest, relayEmulated } from "./emulate.js";
+import { emulatedRequest, relayEmulated, streamErrorFrame } from "./emulate.js";
 import { ConfigFile, ConfigRefusal, deepFreeze, link, setNote, setShare, unlink } from "./configfile.js";
 import { COOKIE, LoginThrottle, OperatorSessions, SESSION_TTL_MS, cookieToken, verifyDecoy, verifyPassword } from "./login.js";
 import type { Logger } from "./log.js";
@@ -200,6 +200,21 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     if (c.peer !== null && peerOverLimit(c.peer)) throw new Refusal(429, "rate capped", "rate_limit_error");
   }
 
+  /**
+   * Opt-in queue position for a streamed chat (`X-Hearth-Queue: stream`): the stream opens while the
+   * request waits and carries `: hearth-queue {"position":N}` comments, which OpenAI-style parsers skip.
+   */
+  function positionStream(req: IncomingMessage, res: ServerResponse, payload: Record<string, unknown>) {
+    if (req.headers["x-hearth-queue"] !== "stream" || payload.stream !== true) return undefined;
+    return (position: number) => {
+      if (res.writableEnded) return;
+      if (!res.headersSent) {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" });
+      }
+      res.write(`: hearth-queue ${JSON.stringify({ position })}\n\n`);
+    };
+  }
+
   /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
   async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readBody(req, cfg.maxBodyBytes);
@@ -213,7 +228,12 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   /** Answer any failure with its status, or end a response already under way. */
   function fail(res: ServerResponse, e: unknown): void {
     if (res.headersSent) {
-      res.end();
+      // A stream opened early for queue position carries the failure in-band; a 200 cannot be taken back.
+      const early = String(res.getHeader("Content-Type") ?? "").includes("text/event-stream");
+      if (early && !res.writableEnded) {
+        const r = refusalOf(e);
+        res.end(streamErrorFrame(r.status, r.message));
+      } else res.end();
       return;
     }
     const r = refusalOf(e);
@@ -313,6 +333,12 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    * reaches the client but is not a success. `pipeline` settles even if the client disconnects.
    */
   async function pipeThrough(up: UpstreamResponse, res: ServerResponse): Promise<number> {
+    if (res.headersSent) {
+      // Opened early for queue position: the status cannot change now, so a failure is a frame.
+      if (up.status >= 400) res.end(streamErrorFrame(up.status, await up.text()));
+      else await pipeline(up.body, res);
+      return up.status;
+    }
     res.writeHead(up.status, {
       ...forwardable(up.headers),
       "Content-Type": up.headers["content-type"] ?? "application/json",
@@ -343,6 +369,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     caller: string,
     res: ServerResponse,
     signal: AbortSignal,
+    onPosition?: (position: number) => void,
   ): Promise<void> {
     // Refresh peer state only when a decision needs it, and only for models that may leave.
     if (cfg.models[model] && cfg.models[model].policy !== "local") {
@@ -391,7 +418,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       }
       try {
         await local.scheduler.submit(
-          { lane, model, caller, maxPerCaller: callerCap(null, cfg), signal, tokens: pool.poolTokens(model, fitted) },
+          { lane, model, caller, maxPerCaller: callerCap(null, cfg), signal, tokens: pool.poolTokens(model, fitted), onPosition },
           async () => {
             t.startedAt = Date.now();
             await runLocal();
@@ -1221,7 +1248,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     });
 
     if (fromPeer === null) {
-      await dispatch(payload, model, lane, caller, res, ctrl.signal);
+      await dispatch(payload, model, lane, caller, res, ctrl.signal, positionStream(c.req, res, payload));
       return;
     }
 
