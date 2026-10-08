@@ -65,7 +65,11 @@ function secretTable(doc: unknown): Map<string, string> {
   const grab = (v: unknown): void => {
     if (typeof v === "string" && v !== "" && !v.startsWith("env:")) table.set(`${SECRET}${++n}`, v);
   };
-  for (const k of (d.apiKeys ?? []) as unknown[]) grab(k);
+  // An apiKeys entry is a bare key or {key, label, models}; the secret sits in the same place either way.
+  for (const e of (d.apiKeys ?? []) as unknown[]) {
+    if (typeof e === "string") grab(e);
+    else if (isObj(e)) grab(e.key);
+  }
   if (isObj(d.peerTokens)) for (const t of Object.values(d.peerTokens)) grab(t);
   if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) grab(p.token);
   return table;
@@ -79,7 +83,13 @@ function maskSecrets(text: string, doc: unknown): { text: string; doc: unknown }
   // Must skip exactly what secretTable skipped, or the stand-ins misalign.
   const swap = (v: unknown): unknown =>
     typeof v === "string" && v !== "" && !v.startsWith("env:") ? `${SECRET}${++n}` : v;
-  if (Array.isArray(d.apiKeys)) d.apiKeys = d.apiKeys.map(swap);
+  const keys = d.apiKeys as unknown[] | undefined;
+  if (Array.isArray(keys))
+    for (let i = 0; i < keys.length; i++) {
+      const e = keys[i];
+      if (typeof e === "string") keys[i] = swap(e);
+      else if (isObj(e)) e.key = swap(e.key);
+    }
   if (isObj(d.peerTokens)) d.peerTokens = Object.fromEntries(Object.entries(d.peerTokens).map(([k, v]) => [k, swap(v)]));
   if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) p.token = swap(p.token);
   let masked = text;

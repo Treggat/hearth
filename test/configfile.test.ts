@@ -270,6 +270,7 @@ backend:
   serves: [mine]
 apiKeys:
   - plain-key-value
+  - {key: plain-map-key, label: ops}
   - env:HEARTH_TEST_SECRET
 peerTokens:
   friend: plain-token-value
@@ -282,18 +283,21 @@ peers:
   writeFileSync(secretPath, SECRETED);
   const a = await boot(secretPath);
   const auth = { Authorization: "Bearer plain-key-value", "Content-Type": "application/json" };
-  type SecretDoc = { apiKeys: string[]; peerTokens: Record<string, string>; peers: { token: string }[] };
+  type SecretDoc = { apiKeys: (string | { key: string; label: string })[]; peerTokens: Record<string, string>; peers: { token: string }[] };
   const get = async () => (await (await fetch(`${a.url}/config`, { headers: auth })).json()) as { text: string; hash: string; doc: SecretDoc };
   const patch = (body: unknown) => fetch(`${a.url}/config`, { method: "PATCH", headers: auth, body: JSON.stringify(body) });
 
   const f = await get();
-  for (const s of ["plain-key-value", "plain-token-value", "plain-peer-token", "env-resolved-value"]) {
+  for (const s of ["plain-key-value", "plain-map-key", "plain-token-value", "plain-peer-token", "env-resolved-value"]) {
     assert.ok(!f.text.includes(s), `no secret in the file's own tab (${s})`);
     assert.ok(!JSON.stringify(f.doc).includes(s), `no secret in the parsed doc`);
   }
   assert.match(f.text, /hearth-secret\d+/, "the stand-in is where the secret was");
-  assert.match(f.doc.apiKeys[0]!, /^hearth-secret\d+$/);
-  assert.equal(f.doc.apiKeys[1], "env:HEARTH_TEST_SECRET", "an env: reference is not a secret in the file");
+  assert.match(f.doc.apiKeys[0]! as string, /^hearth-secret\d+$/);
+  const mapEntry = f.doc.apiKeys[1]! as { key: string; label: string };
+  assert.match(mapEntry.key, /^hearth-secret\d+$/, "a {key, label} entry masks the key, keeps the label");
+  assert.equal(mapEntry.label, "ops");
+  assert.equal(f.doc.apiKeys[2], "env:HEARTH_TEST_SECRET", "an env: reference is not a secret in the file");
   assert.match(f.doc.peerTokens["friend"]!, /^hearth-secret\d+$/);
   assert.match(f.doc.peers[0]!.token, /^hearth-secret\d+$/);
   assert.ok(readFileSync(secretPath, "utf8").includes("plain-key-value"), "the file itself still holds the real key");
@@ -304,7 +308,7 @@ peers:
   assert.equal(r.status, 200);
   const file = readFileSync(secretPath, "utf8");
   assert.match(file, /# touched from the console/);
-  for (const s of ["plain-key-value", "plain-token-value", "plain-peer-token"]) assert.ok(file.includes(s), `the stand-in came home as ${s}`);
+  for (const s of ["plain-key-value", "plain-map-key", "plain-token-value", "plain-peer-token"]) assert.ok(file.includes(s), `the stand-in came home as ${s}`);
 
   // An op that replaces a secret installs the new value; the answer masks it again.
   const f2 = await get();
