@@ -258,11 +258,23 @@ const WARM_LANE_PRIORITY = 200;
 
 export { WARM_LANE };
 
+/**
+ * A validation finding. `path` is the field it is about (e.g. `backends[0].kind`),
+ * or null for a whole-config one; the sentence keeps the field too, because a
+ * journal line has nothing else to say where it came from.
+ */
 export class ConfigError extends Error {
-  constructor(message: string) {
+  constructor(
+    readonly path: string | null,
+    message: string,
+  ) {
     super(message);
     this.name = "ConfigError";
   }
+}
+
+function bad(path: string | null, text: string): ConfigError {
+  return new ConfigError(path, path !== null && !text.startsWith(path) ? `${path} ${text}` : text);
 }
 
 /** `env:NAME` indirection, so tokens live in the environment and the config
@@ -272,15 +284,13 @@ function resolveSecret(value: string, where: string): string {
   if (!value.startsWith("env:")) return value;
   const name = value.slice(4);
   const got = process.env[name];
-  if (!got) {
-    throw new ConfigError(`${where}: environment variable ${name} is not set`);
-  }
+  if (!got) throw bad(where, `${where}: environment variable ${name} is not set`);
   return got;
 }
 
 function asRecord(v: unknown, where: string): Record<string, unknown> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
-    throw new ConfigError(`${where} must be a mapping`);
+    throw bad(where, "must be a mapping");
   }
   return v as Record<string, unknown>;
 }
@@ -288,16 +298,16 @@ function asRecord(v: unknown, where: string): Record<string, unknown> {
 function str(v: unknown, where: string, fallback?: string): string {
   if (v === undefined) {
     if (fallback !== undefined) return fallback;
-    throw new ConfigError(`${where} is required`);
+    throw bad(where, "is required");
   }
-  if (typeof v !== "string") throw new ConfigError(`${where} must be a string`);
+  if (typeof v !== "string") throw bad(where, "must be a string");
   return v;
 }
 
 function num(v: unknown, where: string, fallback: number): number {
   if (v === undefined) return fallback;
   if (typeof v !== "number" || !Number.isFinite(v)) {
-    throw new ConfigError(`${where} must be a number`);
+    throw bad(where, "must be a number");
   }
   return v;
 }
@@ -306,7 +316,7 @@ function num(v: unknown, where: string, fallback: number): number {
 function count(v: unknown, where: string, fallback: number, min = 1): number {
   const n = num(v, where, fallback);
   if (!Number.isInteger(n) || n < min) {
-    throw new ConfigError(`${where} must be a whole number >= ${min} (got ${n})`);
+    throw bad(where, `must be a whole number >= ${min} (got ${n})`);
   }
   return n;
 }
@@ -323,20 +333,18 @@ function declaredStats(raw: unknown, id: string): ModelStats | null {
   for (const [k, v] of Object.entries(rec)) {
     if (k === "context") {
       if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) {
-        throw new ConfigError(`${where}.context is "${String(v)}" -- expected a positive whole number of tokens`);
+        throw bad(`${where}.context`, `is "${String(v)}" -- expected a positive whole number of tokens`);
       }
       out.context = v;
     } else if (k === "vision" || k === "tools" || k === "thinking" || k === "effort") {
       if (typeof v !== "boolean") {
-        throw new ConfigError(`${where}.${k} is "${String(v)}" -- expected true or false`);
+        throw bad(`${where}.${k}`, `is "${String(v)}" -- expected true or false`);
       }
       out[k] = v;
     } else if (k === "quant") {
       out.quant = str(v, `${where}.quant`);
     } else {
-      throw new ConfigError(
-        `${where}.${k} is not a model stat -- expected context, vision, tools, thinking, effort or quant`,
-      );
+      throw bad(`${where}.${k}`, "is not a model stat -- expected context, vision, tools, thinking, effort or quant");
     }
   }
   return known(out) ? out : null;
@@ -352,8 +360,8 @@ function modelParams(raw: unknown, id: string): Record<string, unknown> | null {
   const rec = asRecord(raw, where);
   for (const k of ["model", "messages", "stream", "lane"]) {
     if (k in rec) {
-      throw new ConfigError(
-        `${where}.${k} cannot be stamped -- ` +
+      throw bad(
+        `${where}.${k}`, "cannot be stamped -- " +
           (k === "model" ? "use `as` to rename the model on the wire" : `${k} belongs to the request, not the route`),
       );
     }
@@ -365,8 +373,8 @@ function modelParams(raw: unknown, id: string): Record<string, unknown> | null {
 function modelConcurrency(entry: Record<string, unknown>, id: string): number | null {
   const has = (k: string) => entry[k] !== undefined && entry[k] !== null;
   if (has("concurrency") && has("batch") && entry.concurrency !== entry.batch) {
-    throw new ConfigError(
-      `models.${id} sets both concurrency and batch, which are the same setting ` +
+    throw bad(
+      `models.${id}`, `sets both concurrency and batch, which are the same setting ` +
         `(${String(entry.concurrency)} vs ${String(entry.batch)}) — keep concurrency`,
     );
   }
@@ -389,7 +397,7 @@ function modelPool(v: unknown, id: string): ModelRoute["pool"] {
 /** Number, at least `min`, fractions fine; for tuning weights where a negative inverts the meaning. */
 function atLeast(v: unknown, where: string, fallback: number, min = 0): number {
   const n = num(v, where, fallback);
-  if (n < min) throw new ConfigError(`${where} must be >= ${min} (got ${n})`);
+  if (n < min) throw bad(where, `must be >= ${min} (got ${n})`);
   return n;
 }
 
@@ -400,16 +408,14 @@ function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
   const kind = str(entry.kind, `${where}.kind`, "");
   const legacy = entry.llamaSwapExtras;
   if (kind !== "" && legacy !== undefined) {
-    throw new ConfigError(
-      `${where}: set kind or llamaSwapExtras, not both — ` +
+    throw bad(
+      where, `set kind or llamaSwapExtras, not both — ` +
         `llamaSwapExtras: ${String(legacy)} is the old spelling of kind: ${legacy === false ? "none" : "llama-swap"}`,
     );
   }
   if (kind !== "") {
     if (!WARM_SOURCES.includes(kind as WarmSource)) {
-      throw new ConfigError(
-        `${where}.kind is "${kind}" — expected ${WARM_SOURCES.join(", ")}`,
-      );
+      throw bad(`${where}.kind`, `is "${kind}" — expected ${WARM_SOURCES.join(", ")}`);
     }
     return kind as WarmSource;
   }
@@ -418,14 +424,14 @@ function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
 
 function bool(v: unknown, where: string, fallback: boolean): boolean {
   if (v === undefined) return fallback;
-  if (typeof v !== "boolean") throw new ConfigError(`${where} must be true or false`);
+  if (typeof v !== "boolean") throw bad(where, "must be true or false");
   return v;
 }
 
 function strList(v: unknown, where: string): string[] {
   if (v === undefined) return [];
   if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
-    throw new ConfigError(`${where} must be a list of strings`);
+    throw bad(where, "must be a list of strings");
   }
   return v as string[];
 }
@@ -435,7 +441,7 @@ function apiKeyList(
   v: unknown, where: string, routeIds: Set<string>,
 ): { keys: string[]; labels: string[]; models: (string[] | null)[] } {
   if (v === undefined) return { keys: [], labels: [], models: [] };
-  if (!Array.isArray(v)) throw new ConfigError(`${where} must be a list`);
+  if (!Array.isArray(v)) throw bad(where, "must be a list");
   const keys: string[] = [];
   const labels: string[] = [];
   const models: (string[] | null)[] = [];
@@ -448,8 +454,8 @@ function apiKeyList(
     // the operator sees in the config and never in a log.
     const dupKey = seenKey.get(key);
     if (dupKey !== undefined) {
-      throw new ConfigError(
-        `${at}.key repeats ${where}[${dupKey}] -- the first match wins, so this entry can never be the one that authenticates`,
+      throw bad(
+        `${at}.key`, `repeats ${where}[${dupKey}] -- the first match wins, so this entry can never be the one that authenticates`,
       );
     }
     seenKey.set(key, keys.length);
@@ -457,8 +463,8 @@ function apiKeyList(
       // Two keys under one label would be one caller sharing one budget, so refuse it.
       const dupLabel = seenLabel.get(label);
       if (dupLabel !== undefined) {
-        throw new ConfigError(
-          `${at}.label "${label}" is already used by ${where}[${dupLabel}] -- two keys under one name share one caller identity, and with it one maxPerCaller budget`,
+        throw bad(
+          `${at}.label`, `"${label}" is already used by ${where}[${dupLabel}] -- two keys under one name share one caller identity, and with it one maxPerCaller budget`,
         );
       }
       seenLabel.set(label, keys.length);
@@ -478,17 +484,17 @@ function apiKeyList(
     // A blank label is a typo, not "no label" — the string form is how you say
     // no label — so it is refused rather than silently falling back to the hash.
     const label = str(entry.label, `${at}.label`).trim();
-    if (label === "") throw new ConfigError(`${at}.label must not be empty`);
+    if (label === "") throw bad(`${at}.label`, "must not be empty");
     // A scope names routes, not backend ids: an unknown id is refused here
     // rather than found as a 403 on the client, and a scoped key can only ever
     // reach ids whose lane and params the operator wrote down.
     let scope: string[] | null = null;
     if (entry.models !== undefined) {
       scope = strList(entry.models, `${at}.models`);
-      if (scope.length === 0) throw new ConfigError(`${at}.models must name at least one model`);
+      if (scope.length === 0) throw bad(`${at}.models`, "must name at least one model");
       for (const id of scope) {
         if (!routeIds.has(id)) {
-          throw new ConfigError(`${at}.models names "${id}", which is not a route in models:`);
+          throw bad(`${at}.models`, `names "${id}", which is not a route in models:`);
         }
       }
     }
@@ -503,10 +509,10 @@ function requirePath(path: string, at: string): void {
   // would otherwise fail silently at 3am rather than at startup. Matching is on
   // pathname alone, so a query string in the config is a mistake as well.
   if (!path.startsWith("/")) {
-    throw new ConfigError(`${at}.path must start with "/" (got ${path})`);
+    throw bad(`${at}.path`, `must start with "/" (got ${path})`);
   }
   if (path.includes("?")) {
-    throw new ConfigError(`${at}.path must not include a query string (got ${path})`);
+    throw bad(`${at}.path`, `must not include a query string (got ${path})`);
   }
 }
 
@@ -537,7 +543,7 @@ function residentDecl(v: unknown, where: string): ResidentDecl | null {
 /** `routes:` entries, as a bare path or an object; lane and model are filled in once lanes exist. */
 function routeList(v: unknown, where: string): RouteRule[] {
   if (v === undefined) return [];
-  if (!Array.isArray(v)) throw new ConfigError(`${where} must be a list`);
+  if (!Array.isArray(v)) throw bad(where, "must be a list");
   return v.map((raw, i) => {
     const at = `${where}[${i}]`;
     const entry = typeof raw === "string" ? { path: raw } : asRecord(raw, at);
@@ -548,20 +554,18 @@ function routeList(v: unknown, where: string): RouteRule[] {
     // which is the objection that kept wildcards out of here in the first place.
     const holes = path.split("{model}").length - 1;
     if (holes > 1) {
-      throw new ConfigError(`${at}.path may contain at most one {model} (got ${path})`);
+      throw bad(`${at}.path`, `may contain at most one {model} (got ${path})`);
     }
     if (holes === 1 && !path.split("/").includes("{model}")) {
-      throw new ConfigError(
-        `${at}.path must use {model} as a whole path segment, not part of one (got ${path})`,
+      throw bad(
+        `${at}.path`, `must use {model} as a whole path segment, not part of one (got ${path})`,
       );
     }
     if (/\{(?!model\})[^}]*\}/.test(path)) {
-      throw new ConfigError(`${at}.path: the only placeholder is {model} (got ${path})`);
+      throw bad(`${at}.path`, `${at}.path: the only placeholder is {model} (got ${path})`);
     }
     if (holes === 1 && typeof entry.model === "string" && entry.model !== "") {
-      throw new ConfigError(
-        `${at} sets both {model} in the path and model: — the path supplies the id`,
-      );
+      throw bad(`${at}`, `sets both {model} in the path and model: — the path supplies the id`);
     }
     return {
       path,
@@ -574,7 +578,7 @@ function routeList(v: unknown, where: string): RouteRule[] {
 
 function trimUrl(u: string, where: string): string {
   if (!/^https?:\/\//.test(u)) {
-    throw new ConfigError(`${where} must start with http:// or https:// (got ${u})`);
+    throw bad(where, `must start with http:// or https:// (got ${u})`);
   }
   return u.replace(/\/+$/, "");
 }
@@ -597,6 +601,7 @@ export function parseConfig(raw: unknown): HearthConfig {
   // you thought you had replaced.
   if (root.backend !== undefined && root.backends !== undefined) {
     throw new ConfigError(
+      null,
       "set either backend: (one) or backends: (a list), not both — " +
         "`backend` is just shorthand for a list of one",
     );
@@ -611,9 +616,7 @@ export function parseConfig(raw: unknown): HearthConfig {
       const entry = asRecord(raw ?? {}, at);
       const kind = str(entry.kind, `${at}.kind`, "gpu");
       if (kind !== "gpu" && kind !== "cpu" && kind !== "other") {
-        throw new ConfigError(
-          `${at}.kind must be gpu, cpu or other (got ${JSON.stringify(kind)})`,
-        );
+        throw bad(`${at}.kind`, `must be gpu, cpu or other (got ${JSON.stringify(kind)})`);
       }
       resourceDecls[name] = { kind, shared: bool(entry.shared, `${at}.shared`, false) };
     }
@@ -621,8 +624,8 @@ export function parseConfig(raw: unknown): HearthConfig {
 
   const backends: BackendConfig[] = [];
   if (root.backends !== undefined) {
-    if (!Array.isArray(root.backends)) throw new ConfigError("backends must be a list");
-    if (root.backends.length === 0) throw new ConfigError("backends must not be empty");
+    if (!Array.isArray(root.backends)) throw bad("backends", "must be a list");
+    if (root.backends.length === 0) throw bad("backends", "must not be empty");
     for (const [i, b] of root.backends.entries()) {
       const entry = asRecord(b, `backends[${i}]`);
       backends.push({
@@ -645,7 +648,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
     const seen = new Set<string>();
     for (const b of backends) {
-      if (seen.has(b.name)) throw new ConfigError(`two backends are both named "${b.name}"`);
+      if (seen.has(b.name)) throw new ConfigError("backends", `two backends are both named "${b.name}"`);
       seen.add(b.name);
     }
     // Two backends claiming the same id outright is a typo. Discovery can
@@ -657,6 +660,7 @@ export function parseConfig(raw: unknown): HearthConfig {
         const owner = claimed.get(m);
         if (owner) {
           throw new ConfigError(
+            "backends",
             `backends "${owner}" and "${b.name}" both declare they serve "${m}" — ` +
               `one id cannot mean two backends`,
           );
@@ -691,7 +695,7 @@ export function parseConfig(raw: unknown): HearthConfig {
   // A resident on shared hardware (or none) would never be asked to yield, which is its only job.
   for (const b of backends) {
     if (b.resident && !b.resources.some((r) => !resourceDecls[r]?.shared)) {
-      throw new ConfigError(`backends "${b.name}" is resident but declares no exclusive resource to yield`);
+      throw new ConfigError("backends", `backends "${b.name}" is resident but declares no exclusive resource to yield`);
     }
   }
   // A kind that reports a resident model but cannot unload it would fail every neighbour's turn.
@@ -703,6 +707,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     if (rival) {
       const card = rival.resources.find((r) => mine.includes(r));
       throw new ConfigError(
+        "backends",
         `backends "${b.name}" (kind: ${b.kind}) cannot unload, so "${rival.name}" could never take ${card} from it — ` +
           `declare "${b.name}" resident, or mark ${card} shared`,
       );
@@ -723,7 +728,7 @@ export function parseConfig(raw: unknown): HearthConfig {
   // config with one lane nobody asked for. An empty lanes block is a mistake and
   // has to keep failing as one.
   if (Object.keys(lanes).length === 0) {
-    throw new ConfigError("scheduler.lanes must define at least one lane");
+    throw new ConfigError("scheduler.lanes", "must define at least one lane");
   }
   // See WARM_LANE_PRIORITY. Added rather than defaulted, so it survives an
   // explicit `lanes:` block that would otherwise replace it.
@@ -734,13 +739,11 @@ export function parseConfig(raw: unknown): HearthConfig {
     .filter(([n]) => n !== WARM_LANE)
     .sort((a, b) => b[1].priority - a[1].priority)[0]![0];
   const claimedPaths = new Map<string, string>();
-  for (const b of backends) {
-    for (const r of b.routes) {
+  for (const [bi, b] of backends.entries()) {
+    for (const [ri, r] of b.routes.entries()) {
       if (r.lane === "") r.lane = fallbackLane;
       else if (!(r.lane in lanes)) {
-        throw new ConfigError(
-          `backends "${b.name}" route ${r.path} names lane "${r.lane}", which is not in scheduler.lanes`,
-        );
+        throw bad(`backends[${bi}].routes[${ri}].lane`, `names lane "${r.lane}", which is not in scheduler.lanes`);
       }
       // Reported under the backend's name, except {model} routes, which take the id from the request.
       if (r.model === "" && !r.path.includes("{model}")) r.model = b.name;
@@ -750,6 +753,7 @@ export function parseConfig(raw: unknown): HearthConfig {
       const owner = claimedPaths.get(r.path);
       if (owner) {
         throw new ConfigError(
+          "backends",
           `backends "${owner}" and "${b.name}" both declare the route ${r.path} — ` +
             `one path cannot mean two backends`,
         );
@@ -760,7 +764,7 @@ export function parseConfig(raw: unknown): HearthConfig {
 
   const peers: PeerConfig[] = [];
   const peersRaw = root.peers === undefined ? [] : root.peers;
-  if (!Array.isArray(peersRaw)) throw new ConfigError("peers must be a list");
+  if (!Array.isArray(peersRaw)) throw bad("peers", "must be a list");
   for (const [i, p] of peersRaw.entries()) {
     const entry = asRecord(p, `peers[${i}]`);
     const name = str(entry.name, `peers[${i}].name`);
@@ -768,7 +772,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     const map: Record<string, string> = {};
     for (const [mine, theirs] of Object.entries(models)) {
       map[mine] = str(theirs, `peers[${i}].models.${mine}`);
-      if (map[mine] === "") throw new ConfigError(`peers[${i}].models.${mine} is empty: name the peer's id for it`);
+      if (map[mine] === "") throw bad(`peers[${i}].models.${mine}`, "is empty: name the peer's id for it");
     }
     // A peer mapping nothing is valid: the state between trusting someone and borrowing from them.
     peers.push({
@@ -781,7 +785,7 @@ export function parseConfig(raw: unknown): HearthConfig {
 
   const names = new Set<string>();
   for (const p of peers) {
-    if (names.has(p.name)) throw new ConfigError(`two peers are both named "${p.name}"`);
+    if (names.has(p.name)) throw new ConfigError("peers", `two peers are both named "${p.name}"`);
     names.add(p.name);
   }
 
@@ -791,50 +795,48 @@ export function parseConfig(raw: unknown): HearthConfig {
     const entry = asRecord(v, `models.${id}`);
     const policy = str(entry.policy, `models.${id}.policy`, "local") as RoutePolicy;
     if (!["local", "peer", "spillover", "fastest"].includes(policy)) {
-      throw new ConfigError(
-        `models.${id}.policy is "${policy}" — expected local, peer, spillover or fastest`,
-      );
+      throw bad(`models.${id}.policy`, `is "${policy}" — expected local, peer, spillover or fastest`);
     }
     const named = strList(entry.peers, `models.${id}.peers`);
     for (const n of named) {
       if (!names.has(n)) {
-        throw new ConfigError(`models.${id}.peers names "${n}", which is not a configured peer`);
+        throw bad(`models.${id}.peers`, `names "${n}", which is not a configured peer`);
       }
     }
     // Catching it here instead of at request time is the reason this validation
     // exists at all. A policy that can never fire is a typo.
     if (policy !== "local") {
       if (peersMapping(id, named, peers).length === 0) {
-        throw new ConfigError(
-          `models.${id}.policy is "${policy}" but no peer maps "${id}" — ` +
+        throw bad(
+          `models.${id}.policy`, `is "${policy}" but no peer maps "${id}" — ` +
             `add it to a peer's models mapping, or set policy: local`,
         );
       }
     }
     const pinned = str(entry.backend, `models.${id}.backend`, "");
     if (pinned !== "" && !backendNames.has(pinned)) {
-      throw new ConfigError(
-        `models.${id}.backend is "${pinned}", which is not a configured backend ` +
+      throw bad(
+        `models.${id}.backend`, `is "${pinned}", which is not a configured backend ` +
           `(${[...backendNames].join(", ")})`,
       );
     }
     const alias = str(entry.as, `models.${id}.as`, "");
     const follow = bool(entry.follow, `models.${id}.follow`, false);
     if (follow && pinned === "") {
-      throw new ConfigError(`models.${id}.follow needs models.${id}.backend: the backend whose resident model it follows`);
+      throw bad(`models.${id}.follow`, `needs models.${id}.backend: the backend whose resident model it follows`);
     }
     if (follow && alias === "") {
-      throw new ConfigError(`models.${id}.follow needs models.${id}.as: the model to load when nothing is resident`);
+      throw bad(`models.${id}.follow`, `needs models.${id}.as: the model to load when nothing is resident`);
     }
     const params = modelParams(entry.params, id);
     const emulate = str(entry.emulate, `models.${id}.emulate`, "");
     if (emulate !== "" && !(EMULATIONS as readonly string[]).includes(emulate)) {
-      throw new ConfigError(`models.${id}.emulate is "${emulate}"; known: ${EMULATIONS.join(", ")}`);
+      throw bad(`models.${id}.emulate`, `is "${emulate}"; known: ${EMULATIONS.join(", ")}`);
     }
     const lane = str(entry.lane, `models.${id}.lane`, "");
     if (lane !== "" && !(lane in lanes)) {
-      throw new ConfigError(
-        `models.${id}.lane is "${lane}", which is not in scheduler.lanes (${Object.keys(lanes).join(", ")})`,
+      throw bad(
+        `models.${id}.lane`, `is "${lane}", which is not in scheduler.lanes (${Object.keys(lanes).join(", ")})`,
       );
     }
     // `as` applies only on the way to a local backend and a peer dispatch uses the peer's map, so both may be set.
@@ -880,9 +882,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     // `false` (default) serves the page only; `key` adds the write routes behind the apiKey gate.
     const rawControl = u.control ?? false;
     if (rawControl !== false && rawControl !== "key") {
-      throw new ConfigError(
-        `uiListen.control must be false or "key" (got ${JSON.stringify(rawControl)})`,
-      );
+      throw bad("uiListen.control", `must be false or "key" (got ${JSON.stringify(rawControl)})`);
     }
     const control: UiControl = rawControl === "key" ? "key" : "off";
     uiListen = {
@@ -892,8 +892,8 @@ export function parseConfig(raw: unknown): HearthConfig {
     };
     // Clickable controls with no apiKeys could only ever 401 off-loopback, so refuse at --check.
     if (control === "key" && apiKeys.length === 0) {
-      throw new ConfigError(
-        `uiListen.control: key requires apiKeys — without one, writes on the status ` +
+      throw bad(
+        "uiListen.control", `key requires apiKeys — without one, writes on the status ` +
           `port fall back to loopback-only and every click from the LAN would be refused`,
       );
     }
@@ -901,6 +901,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     // reads. Say it here instead.
     if (uiListen.port === mainListen.port && uiListen.host === mainListen.host) {
       throw new ConfigError(
+        "uiListen",
         `uiListen is the same address as listen (${uiListen.host}:${uiListen.port}) — ` +
           `give the status page its own port, or drop uiListen and reach it on the main one`,
       );
@@ -936,7 +937,7 @@ export function parseConfig(raw: unknown): HearthConfig {
       for (const [id, v] of Object.entries(raw)) {
         const note = str(v, `notes.${id}`).trim();
         if (note.length > NOTE_MAX) {
-          throw new ConfigError(`notes.${id} is ${note.length} characters -- keep it under ${NOTE_MAX}`);
+          throw bad(`notes.${id}`, `is ${note.length} characters -- keep it under ${NOTE_MAX}`);
         }
         if (note !== "") out[id] = note;
       }
@@ -947,8 +948,8 @@ export function parseConfig(raw: unknown): HearthConfig {
       const named = str(root.peerLane, "peerLane", "");
       if (named !== "") {
         if (!(named in lanes)) {
-          throw new ConfigError(
-            `peerLane is "${named}", which is not one of your lanes (${Object.keys(lanes).join(", ")})`,
+          throw bad(
+            "peerLane", `is "${named}", which is not one of your lanes (${Object.keys(lanes).join(", ")})`,
           );
         }
         return named;
@@ -984,13 +985,13 @@ export function loadConfig(path: string): HearthConfig {
   try {
     text = readFileSync(path, "utf8");
   } catch {
-    throw new ConfigError(`cannot read config at ${path}`);
+    throw new ConfigError(null, `cannot read config at ${path}`);
   }
   let raw: unknown;
   try {
     raw = parseYaml(text);
   } catch (e) {
-    throw new ConfigError(`${path} is not valid YAML: ${String(e)}`);
+    throw new ConfigError(null, `${path} is not valid YAML: ${String(e)}`);
   }
   const cfg = parseConfig(raw);
   cfg.configPath = path;
