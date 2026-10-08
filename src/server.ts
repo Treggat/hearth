@@ -24,6 +24,7 @@ import { History } from "./history.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
 import { CONSOLE_HTML, UI_HTML } from "./ui.js";
 import { createViews } from "./views.js";
+import { multipartField, replaceMultipartField } from "./multipart.js";
 import { send, type UpstreamResponse } from "./upstream.js";
 
 /** Constant-time compare over sha256 digests, so neither length nor content leaks. */
@@ -1438,15 +1439,22 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // statement here the operator actually made.
     const routed = pool.forPath(url.pathname);
 
-    // The model from the /upstream/<model>/ path or the JSON body, else the first backend.
+    // The model from the /upstream/<model>/ path or the body, else the first backend. A form upload
+    // (/v1/audio/transcriptions) names its model in a multipart field rather than in JSON.
     const viaPath = /^\/upstream\/([^/]+)\//.exec(path)?.[1];
+    const contentType = req.headers["content-type"] ?? "";
+    const isForm = /^\s*multipart\/form-data\b/i.test(contentType);
     let viaBody: string | undefined;
     if (body && body.length > 0) {
-      try {
-        const parsed = JSON.parse(body.toString()) as { model?: unknown };
-        if (typeof parsed.model === "string") viaBody = parsed.model;
-      } catch {
-        // Not JSON, or not ours to understand. The fallback covers it.
+      if (isForm) {
+        viaBody = multipartField(body, contentType, "model");
+      } else {
+        try {
+          const parsed = JSON.parse(body.toString()) as { model?: unknown };
+          if (typeof parsed.model === "string") viaBody = parsed.model;
+        } catch {
+          // Not JSON, or not ours to understand. The fallback covers it.
+        }
       }
     }
     // What the caller asked for, kept apart from the backend `named` picks.
@@ -1466,6 +1474,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       if (wire !== asked) {
         if (viaPath) {
           outPath = path.replace(`/upstream/${viaPath}/`, `/upstream/${wire}/`);
+        } else if (body && body.length > 0 && isForm) {
+          // Only the one field changes; the file part is never decoded or re-encoded.
+          outBody = replaceMultipartField(body, contentType, "model", wire) ?? body;
         } else if (body && body.length > 0) {
           try {
             const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
