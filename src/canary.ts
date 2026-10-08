@@ -267,6 +267,13 @@ const RAW_MAX_RUN = 64;
 const TOKEN_MAX = 128;
 /** An SSE line longer than this is abandoned rather than buffered. */
 const SSE_CARRY_MAX = 64 * 1024;
+/**
+ * The most of a non-streamed body the watcher holds. A non-streamed answer
+ * only exists when it is complete, so reading it means holding it; the bound is
+ * what keeps a huge response from becoming the proxy's memory. Past it, only
+ * the raw-run check applies to what was held.
+ */
+const BODY_MAX = 256 * 1024;
 
 /** What one incremental scan calls a repetition. */
 export interface ScanTuning {
@@ -380,31 +387,42 @@ export class DegenerateScan {
 /**
  * Watches one proxied response without touching it.
  *
- * An event stream is parsed far enough to read `delta.content` and
- * `delta.reasoning_content` out of each frame; anything else is scanned raw for
- * a long run of one character, which is what a non-streamed `!` body is. Either
- * way the caller writes the chunk on unchanged and immediately.
+ * A stream is read frame by frame as it goes past, so a degenerate answer is
+ * caught on the chunk that first shows the repetition. A NON-streamed response
+ * is one JSON body that only exists once the model has finished, so it is held
+ * — bounded — and judged in `finish()`; there is nothing to judge before that,
+ * and pretending otherwise would mean buffering the generation itself.
+ *
+ * Either way the caller writes each chunk on unchanged and immediately.
  */
 export class StreamWatch {
   private readonly scan: DegenerateScan;
   private readonly sse: boolean;
   private readonly decoder = new TextDecoder();
   private carry = "";
+  /** The non-streamed body, bounded; see BODY_MAX. */
+  private held = "";
+  private done = false;
+  private hit: Verdict | null = null;
 
   constructor(contentType?: string) {
     this.sse = /text\/event-stream/i.test(contentType ?? "");
-    this.scan = new DegenerateScan(this.sse ? STREAM_TUNING : RAW_TUNING);
+    this.scan = new DegenerateScan(STREAM_TUNING);
   }
 
   /** Observe one chunk. Never throws, never blocks, never modifies it. */
   feed(chunk: Buffer | string): void {
-    if (this.scan.verdict() !== null) return;
+    if (this.done || this.hit !== null) return;
     const text = typeof chunk === "string"
       ? chunk
       : this.decoder.decode(chunk as Uint8Array, { stream: true });
     if (text === "") return;
     if (!this.sse) {
-      this.scan.feed(text);
+      // Truncated to the bound, not merely stopped at it: one chunk can be the
+      // whole body, and a cap that only refuses the next append is no cap.
+      if (this.held.length < BODY_MAX) {
+        this.held += text.slice(0, BODY_MAX - this.held.length);
+      }
       return;
     }
     this.carry += text.replace(/\r\n/g, "\n");
@@ -422,34 +440,123 @@ export class StreamWatch {
       } catch {
         continue;
       }
-      this.scan.feed(deltaText(body));
+      this.scan.feed(answerText(body));
     }
+  }
+
+  /**
+   * The response is complete: judge what was held. For a stream this only
+   * repeats the running verdict; for a non-streamed body it is the only moment
+   * the answer exists at all.
+   */
+  finish(): Verdict | null {
+    this.done = true;
+    if (this.hit !== null) return this.hit;
+    this.hit = this.scan.verdict();
+    if (this.hit !== null || this.sse || this.held === "") return this.hit;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(this.held);
+    } catch {
+      parsed = undefined;
+    }
+    const said = parsed === undefined ? "" : answerText(parsed);
+    if (said !== "") {
+      // The same content rules a streamed answer gets, applied to the whole body.
+      const s = new DegenerateScan(STREAM_TUNING);
+      s.feed(said);
+      this.hit = s.verdict();
+      return this.hit;
+    }
+    if (parsed !== undefined) {
+      // It IS JSON and we read it: no answer text in it means there is nothing
+      // here to judge. A base64 image or a rerank score is not a broken seat.
+      return null;
+    }
+    // Not JSON at all — a plain-text completion from a server that answers that
+    // way, or a body too large to hold whole. The raw run check is the last
+    // net, and only here: reading arbitrary JSON fields as the model's words is
+    // how an image becomes a "degraded" seat.
+    if (/^\s*[{[]/.test(this.held)) return null;
+    const s = new DegenerateScan(RAW_TUNING);
+    s.feed(this.held);
+    this.hit = s.verdict();
+    return this.hit;
   }
 
   /** The degenerate verdict, once one has been seen. */
   verdict(): Verdict | null {
-    return this.scan.verdict();
+    return this.hit ?? this.scan.verdict();
   }
 
   /** How much the watcher is holding, for the no-buffering guarantee. */
   retained(): number {
-    return this.scan.retained() + this.carry.length;
+    return this.sse
+      ? this.scan.retained() + this.carry.length
+      : this.scan.retained() + this.held.length;
   }
 }
 
-/** The model's own words in one stream frame: the answer, or the reasoning trace. */
-function deltaText(body: unknown): string {
-  if (typeof body !== "object" || body === null) return "";
-  const choices = (body as Record<string, unknown>).choices;
-  if (!Array.isArray(choices) || choices.length === 0) return "";
-  const first = choices[0];
-  if (typeof first !== "object" || first === null) return "";
-  const c = first as Record<string, unknown>;
-  const carrier = typeof c.delta === "object" && c.delta !== null
-    ? c.delta as Record<string, unknown>
-    : (typeof c.message === "object" && c.message !== null ? c.message as Record<string, unknown> : null);
-  if (carrier === null) return "";
-  return textOf(carrier.content) || strAt(carrier, "reasoning_content") || strAt(carrier, "reasoning");
+/** The same object, or null. */
+function obj(v: unknown): Record<string, unknown> | null {
+  return typeof v === "object" && v !== null ? v as Record<string, unknown> : null;
+}
+
+/**
+ * The model's own words in one chunk or one whole body, whichever shape the
+ * server uses. Everything that is not the model's words — the JSON around it,
+ * a base64 image, a rerank score — is deliberately not read: calling a field
+ * hearth does not understand "degenerate" would refuse a working seat.
+ *
+ * Shapes covered, because a degenerate answer can arrive in any of them:
+ *   - chat, streamed (`choices[].delta.content`) and not (`message.content`);
+ *   - the reasoning channel under either spelling (`reasoning_content`,
+ *     `reasoning`), which is where a reasoning model's junk shows up first;
+ *   - legacy completions (`choices[].text`), streamed and whole — a separate
+ *     endpoint, and reading only the chat shape leaves it unwatched;
+ *   - the Responses API: named events carrying `delta`, and a whole body's
+ *     `output[].content[].text`.
+ */
+function answerText(body: unknown): string {
+  const o = obj(body);
+  if (o === null) return "";
+  // Responses-API deltas: {type: "response.output_text.delta", delta: "..."}.
+  if (typeof o.delta === "string" && typeof o.type === "string"
+      && /^response\.(output_text|reasoning_text|reasoning_summary_text)\.delta$/.test(o.type)) {
+    return o.delta;
+  }
+  const choices = o.choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const c = obj(choices[0]);
+    if (c !== null) {
+      const carrier = obj(c.delta) ?? obj(c.message);
+      if (carrier !== null) {
+        const said = textOf(carrier.content)
+          || strAt(carrier, "reasoning_content")
+          || strAt(carrier, "reasoning");
+        if (said !== "") return said;
+      }
+      // The legacy completions shape, streamed and whole.
+      if (typeof c.text === "string") return c.text;
+    }
+  }
+  // llama.cpp's own `/completion` answers with a bare `content` field.
+  if (typeof o.content === "string") return o.content;
+  // A whole Responses body: output[].content[].text.
+  if (Array.isArray(o.output)) {
+    const parts: string[] = [];
+    for (const item of o.output) {
+      const it = obj(item);
+      const content = it?.content;
+      if (it === null || !Array.isArray(content)) continue;
+      for (const p of content) {
+        const part = obj(p);
+        if (part !== null && typeof part.text === "string") parts.push(part.text);
+      }
+    }
+    if (parts.length > 0) return parts.join("");
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------

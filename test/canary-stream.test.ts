@@ -86,14 +86,16 @@ const reasoning = (text: string): string =>
 }
 
 // --- a non-streamed body ----------------------------------------------------
-// The same request with `stream: false` arrives as one JSON document. The
-// content is still a run of 200 identical characters and must be caught.
+// The same request with `stream: false` arrives as one JSON document, and the
+// document only exists once the model has finished. So the proxy judges it at
+// the end — `finish()` — rather than pretending there was something to watch
+// on the way. The content is a run of 200 identical characters either way.
 {
   const w = new StreamWatch("application/json");
   w.feed(JSON.stringify({
     choices: [{ message: { content: "!".repeat(200) }, finish_reason: "length" }],
   }));
-  assert.ok(w.verdict(), "a non-streamed 200-! body must be caught too");
+  assert.ok(w.finish(), "a non-streamed 200-! body must be caught when it completes");
 }
 
 // --- and a non-streamed good body ------------------------------------------
@@ -102,7 +104,7 @@ const reasoning = (text: string): string =>
   w.feed(JSON.stringify({
     choices: [{ message: { content: "Paris is the capital of France." }, finish_reason: "stop" }],
   }));
-  assert.equal(w.verdict(), null);
+  assert.equal(w.finish(), null);
 }
 
 // --- a markdown rule is not degeneration -----------------------------------
