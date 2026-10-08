@@ -35,9 +35,10 @@ const INPUT = "h-8 w-full rounded-md border bg-bg px-2 text-[12px] focus:border-
 /** What a secret reads back as from the server; the hint is what steers a plaintext one to `env:`. */
 const STANDIN = /^hearth-secret\d+$/;
 function secretHint(name: string, v: unknown): string | null {
-  const vals = Array.isArray(v) ? v : isObj(v) ? Object.values(v) : [v];
+  // An apiKeys entry is a bare key or {key, label, models}; the secret sits in the same place either way.
+  const vals = Array.isArray(v) ? v.flatMap((x) => (isObj(x) ? [x.key] : [x])) : isObj(v) ? Object.values(v) : [v];
   if (vals.some((x) => typeof x === "string" && STANDIN.test(x))
-      && (name === "apiKeys" || name === "peerTokens" || name === "token")) {
+      && (name === "apiKeys" || name === "peerTokens" || name === "token" || name === "key")) {
     return "stored in the file in plain text — `env:NAME` keeps it out of hearth.yaml";
   }
   return null;
