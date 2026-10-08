@@ -30,21 +30,48 @@ const ENUMS: Record<string, string[]> = {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const fmt = (path: (string | number)[]) => path.map((p, i) => (typeof p === "number" ? `[${p}]` : i ? `.${p}` : p)).join("");
+const INPUT = "h-8 w-full rounded-md border bg-bg px-2 text-[12px] focus:border-accent focus:outline-none";
 
-/* ---------------------------------------------------------------- editor */
+/** What a secret reads back as from the server; the hint is what steers a plaintext one to `env:`. */
+const STANDIN = /^hearth-secret\d+$/;
+function secretHint(name: string, v: unknown): string | null {
+  const vals = Array.isArray(v) ? v : isObj(v) ? Object.values(v) : [v];
+  if (vals.some((x) => typeof x === "string" && STANDIN.test(x))
+      && (name === "apiKeys" || name === "peerTokens" || name === "token")) {
+    return "stored in the file in plain text — `env:NAME` keeps it out of hearth.yaml";
+  }
+  return null;
+}
+
+/** A list of scalars as one line: edit freely, commit on Enter or blur — so `a, b` is typeable at all. */
+function ListInput({ v, onChange, bad }: { v: string[]; onChange: (v: string[]) => void; bad: boolean }) {
+  const [raw, setRaw] = useState(() => v.join(", "));
+  useEffect(() => { setRaw(v.join(", ")); }, [v]);
+  const commit = () => {
+    const next = raw.split(",").map((x) => x.trim()).filter(Boolean);
+    if (next.length === v.length && next.every((x, i) => x === v[i])) { setRaw(v.join(", ")); return; }
+    onChange(next);
+  };
+  return (
+    <input className={cx(INPUT, mono, bad ? "border-bad" : "border-line")} value={raw} placeholder="a, b, c"
+           onChange={(e) => setRaw(e.target.value)}
+           onKeyDown={(e) => e.key === "Enter" && commit()}
+           onBlur={commit} />
+  );
+}
 
 function Scalar({ name, v, onChange, bad }: { name: string; v: unknown; onChange: (v: unknown) => void; bad: boolean }) {
-  const base = cx("h-8 w-full rounded-md border bg-bg px-2 text-[12px] focus:border-accent focus:outline-none", bad ? "border-bad" : "border-line");
+  const base = cx(INPUT, bad ? "border-bad" : "border-line");
   if (typeof v === "boolean") return <Switch label={name} on={v} onChange={onChange} />;
-  if (typeof v === "number") return <input type="number" className={cx(base, "tabular w-40")} value={v} onChange={(e) => onChange(e.target.value === "" ? 0 : Number(e.target.value))} />;
+  if (typeof v === "number" || v === null)
+    return <input type="number" className={cx(base, "tabular w-40")} value={v ?? ""} onChange={(e) => onChange(e.target.value === "" ? null : Number(e.target.value))} />;
   const kinds = ENUMS[name];
   if (kinds && typeof v === "string") {
     const opts = name === "kind" && ["gpu", "cpu", "other"].includes(v) ? ["gpu", "cpu", "other"] : name === "kind" ? kinds.slice(0, 4) : kinds;
     return <select className={cx(base, "w-40")} value={v} onChange={(e) => onChange(e.target.value)}>{opts.map((o) => <option key={o}>{o}</option>)}</select>;
   }
   if (Array.isArray(v)) {
-    return <input className={cx(base, mono)} value={v.join(", ")} placeholder="a, b, c"
-                  onChange={(e) => onChange(e.target.value.split(",").map((x) => x.trim()).filter(Boolean))} />;
+    return <ListInput v={v as string[]} onChange={onChange} bad={bad} />;
   }
   return <input className={cx(base, mono)} value={v === null || v === undefined ? "" : String(v)} onChange={(e) => onChange(e.target.value)} />;
 }
@@ -76,6 +103,7 @@ function Value({ name, v, path, onChange, err, entry }: {
     <div>
       <Scalar name={name} v={v} onChange={onChange} bad={bad} />
       {bad && <div className="mt-1 text-[11px] text-bad">{err!.message}</div>}
+      {!bad && secretHint(name, v) && <div className="mt-1 text-[11px] text-warn">{secretHint(name, v)}</div>}
     </div>
   );
 }
@@ -96,6 +124,7 @@ function Obj({ v, path, onChange, err, entry }: {
         <div key={k} className="group flex items-start gap-3 border-b border-line/50 py-1.5 last:border-0">
           <div className={cx("w-40 shrink-0 pt-1.5 text-dim", mono)}>{k}</div>
           <div className="min-w-0 flex-1">
+            {/* A cleared field becomes null in the draft, which opsBetween turns into a key deletion. */}
             <Value name={k} v={x} path={[...path, k]} err={err} onChange={(n) => onChange({ ...v, [k]: n })} />
           </div>
           <button className="pt-2 text-dim opacity-0 hover:text-bad group-hover:opacity-100" aria-label={`remove ${k}`}
@@ -244,7 +273,7 @@ export function Config() {
                 )}
               </div>
             </div>
-            {err && <div className="border-b border-line bg-bad/10 px-4 py-2 text-bad">{err.path ? <b className={mono}>{err.path}: </b> : null}{err.message}</div>}
+            {err && <div className="border-b border-line bg-bad/10 px-4 py-2 text-bad">{err.message}</div>}
             {sec ? (
               <div className="min-h-0 flex-1 overflow-auto p-4">
                 {current(tab) === undefined ? (
