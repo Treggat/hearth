@@ -258,6 +258,72 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   await a.node.close();
 }
 
+/* --------------------------------------------- secrets never reach the console */
+
+{
+  process.env.HEARTH_TEST_SECRET = "env-resolved-value";
+  const secretPath = join(dir, "secret-hearth.yaml");
+  const SECRETED = `name: node-under-test
+backend:
+  url: ${beUrl}
+  kind: none
+  serves: [mine]
+apiKeys:
+  - plain-key-value
+  - env:HEARTH_TEST_SECRET
+peerTokens:
+  friend: plain-token-value
+peers:
+  - name: friend
+    url: http://127.0.0.1:1
+    token: plain-peer-token
+    models: {}
+`;
+  writeFileSync(secretPath, SECRETED);
+  const a = await boot(secretPath);
+  const auth = { Authorization: "Bearer plain-key-value", "Content-Type": "application/json" };
+  const get = async () => (await (await fetch(`${a.url}/config`, { headers: auth })).json()) as { text: string; hash: string; doc: Record<string, unknown> };
+  const patch = (body: unknown) => fetch(`${a.url}/config`, { method: "PATCH", headers: auth, body: JSON.stringify(body) });
+
+  const f = await get();
+  for (const s of ["plain-key-value", "plain-token-value", "plain-peer-token", "env-resolved-value"]) {
+    assert.ok(!f.text.includes(s), `no secret in the file's own tab (${s})`);
+    assert.ok(!JSON.stringify(f.doc).includes(s), `no secret in the parsed doc`);
+  }
+  assert.match(f.text, /hearth-secret\d+/, "the stand-in is where the secret was");
+  assert.match(String(f.doc.apiKeys[0]!), /^hearth-secret\d+$/);
+  assert.equal(f.doc.apiKeys[1], "env:HEARTH_TEST_SECRET", "an env: reference is not a secret in the file");
+  assert.match(String(f.doc.peerTokens!["friend"]), /^hearth-secret\d+$/);
+  assert.match(String(f.doc.peers[0]!["token"]), /^hearth-secret\d+$/);
+  assert.ok(readFileSync(secretPath, "utf8").includes("plain-key-value"), "the file itself still holds the real key");
+
+  // A whole-text save sends the stand-ins back; the originals come home.
+  const edited = f.text + "# touched from the console\n";
+  let r = await patch({ baseHash: f.hash, text: edited });
+  assert.equal(r.status, 200);
+  const file = readFileSync(secretPath, "utf8");
+  assert.match(file, /# touched from the console/);
+  for (const s of ["plain-key-value", "plain-token-value", "plain-peer-token"]) assert.ok(file.includes(s), `the stand-in came home as ${s}`);
+
+  // An op that replaces a secret installs the new value; the answer masks it again.
+  const f2 = await get();
+  r = await patch({ baseHash: f2.hash, ops: [{ path: ["apiKeys", 0], value: "rotated-key" }] });
+  assert.equal(r.status, 200);
+  const body = (await r.json()) as { text: string };
+  assert.ok(!body.text.includes("rotated-key"), "a new secret is masked in the answer too");
+  assert.match(readFileSync(secretPath, "utf8"), /^  - rotated-key$/m, "and the file has the new one");
+
+  // A dry run leaks nothing and writes nothing. (The key just rotated, so does the auth.)
+  const auth2 = { Authorization: "Bearer rotated-key", "Content-Type": "application/json" };
+  const get2 = async () => (await (await fetch(`${a.url}/config`, { headers: auth2 })).json()) as { text: string; hash: string; doc: Record<string, unknown> };
+  const f3 = await get2();
+  r = await fetch(`${a.url}/config`, { method: "PATCH", headers: auth2, body: JSON.stringify({ baseHash: f3.hash, ops: [{ path: ["peerTokens", "friend"], value: "another" }], dryRun: true }) });
+  assert.ok(!((await r.json()) as { text: string }).text.includes("another"));
+  assert.ok(!readFileSync(secretPath, "utf8").includes("another"), "a dry run writes nothing");
+  await a.node.close();
+  delete process.env.HEARTH_TEST_SECRET;
+}
+
 /* ---------------------------------------- a node built in code edits memory */
 
 {

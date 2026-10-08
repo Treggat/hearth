@@ -48,6 +48,52 @@ export interface ConfigOp {
   delete?: true;
 }
 
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * A secret (an apiKeys entry, a peer token) never reaches a console — not in a form, not in the
+ * YAML tab. Each one is read back as a stand-in; the stand-in then travels with an edit: left
+ * standing, it is written back as the original, replaced, and the new value takes its place.
+ */
+const SECRET = "hearth-secret";
+
+/** One stand-in per secret in the file, in file order; `env:NAME` entries are already out of the file. */
+function secretTable(doc: unknown): Map<string, string> {
+  const d = (doc ?? {}) as Record<string, unknown>;
+  const table = new Map<string, string>();
+  let n = 0;
+  const grab = (v: unknown): void => {
+    if (typeof v === "string" && v !== "" && !v.startsWith("env:")) table.set(`${SECRET}${++n}`, v);
+  };
+  for (const k of (d.apiKeys ?? []) as unknown[]) grab(k);
+  if (isObj(d.peerTokens)) for (const t of Object.values(d.peerTokens)) grab(t);
+  if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) grab(p.token);
+  return table;
+}
+
+function maskSecrets(text: string, doc: unknown): { text: string; doc: unknown } {
+  const table = secretTable(doc);
+  if (table.size === 0) return { text, doc };
+  const d = JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
+  let n = 0;
+  // Must skip exactly what secretTable skipped, or the stand-ins misalign.
+  const swap = (v: unknown): unknown =>
+    typeof v === "string" && v !== "" && !v.startsWith("env:") ? `${SECRET}${++n}` : v;
+  if (Array.isArray(d.apiKeys)) d.apiKeys = d.apiKeys.map(swap);
+  if (isObj(d.peerTokens)) d.peerTokens = Object.fromEntries(Object.entries(d.peerTokens).map(([k, v]) => [k, swap(v)]));
+  if (Array.isArray(d.peers)) for (const p of d.peers) if (isObj(p)) p.token = swap(p.token);
+  let masked = text;
+  for (const [m, s] of table) masked = masked.split(s).join(m);
+  return { text: masked, doc: d };
+}
+
+/** A file the console sent back: every stand-in it left standing comes home as the original. */
+function unmaskSecrets(text: string, table: Map<string, string>): string {
+  let out = text;
+  for (const [m, s] of table) out = out.split(m).join(s);
+  return out;
+}
+
 export interface ConfigStatus {
   /** The file every edit lands in, or null for a node built in code (edits are then in memory only). */
   path: string | null;
@@ -68,14 +114,9 @@ export interface CommitResult {
 
 const hashOf = (text: string) => createHash("sha256").update(text).digest("hex").slice(0, 16);
 
-/** Leading dotted path of a ConfigError message, for a form to put the error beside its field. */
-export function errorPath(message: string): string | null {
-  return /^([A-Za-z_][\w.[\]-]*)(?::| must| is| needs| has)/.exec(message)?.[1] ?? null;
-}
-
-/** A refusal that carries the field it is about. */
+/** A refusal that carries the field it is about, straight from the ConfigError it came from. */
 export class ConfigRefusal extends Refusal {
-  constructor(status: number, message: string, readonly path: string | null = errorPath(message)) {
+  constructor(status: number, message: string, readonly path: string | null = null) {
     super(status, message);
   }
 }
@@ -122,10 +163,11 @@ export function link(cfg: HearthConfig, peer: string, mine: string, theirs: stri
   const p = cfg.peers.find((x) => x.name === peer);
   if (!p) {
     throw new ConfigError(
+      null,
       `"${peer}" is not a configured peer (${cfg.peers.map((x) => x.name).join(", ") || "none"})`,
     );
   }
-  if (mine === "" || theirs === "") throw new ConfigError("both model ids are required");
+  if (mine === "" || theirs === "") throw new ConfigError(null, "both model ids are required");
   const prev = cfg.models[mine];
   p.models[mine] = theirs;
   const peers = prev && prev.peers.length > 0 && !prev.peers.includes(peer) ? [...prev.peers, peer] : (prev?.peers ?? []);
@@ -135,7 +177,7 @@ export function link(cfg: HearthConfig, peer: string, mine: string, theirs: stri
 /** Remove a mapping, and retire any route nothing it names still maps; an emptied peer list is dead, not open. */
 export function unlink(cfg: HearthConfig, peer: string, mine: string): void {
   const p = cfg.peers.find((x) => x.name === peer);
-  if (!p) throw new ConfigError(`"${peer}" is not a configured peer`);
+  if (!p) throw new ConfigError(null, `"${peer}" is not a configured peer`);
   delete p.models[mine];
   const route = cfg.models[mine];
   if (route && route.peers.includes(peer)) {
@@ -195,7 +237,7 @@ function writeDiff(doc: Document, before: HearthConfig, after: HearthConfig, whe
     if (same(was, p.models)) continue;
     // Refuse rather than skip: an anchored `peers:` would drop the edit and still report saved.
     if (!(doc.getIn(["peers", i], true))) {
-      throw new ConfigError(`cannot find peer "${p.name}" as a plain entry under peers: in ${where}`);
+      throw new ConfigError(`peers[${i}].models`, `cannot find peer "${p.name}" as a plain entry under peers: in ${where}`);
     }
     for (const mine of Object.keys(was)) if (!(mine in p.models)) doc.deleteIn(["peers", i, "models", mine]);
     for (const [mine, theirs] of Object.entries(p.models)) {
@@ -277,8 +319,8 @@ export class ConfigFile {
   }
 
   /**
-   * The file's text, hash and parsed document (as written: `env:` references unresolved), for editors;
-   * a file that does not load is returned too, to be fixed.
+   * The file's text, hash and parsed document, for editors; a file that does not load is returned
+   * too, to be fixed. `env:` references are left unresolved, and secrets are stand-ins.
    */
   text(): { text: string; hash: string; doc: unknown } {
     try {
@@ -292,7 +334,8 @@ export class ConfigFile {
     } catch {
       // Not YAML at all: the raw text is still there to fix.
     }
-    return { text: this.lastText, hash: this.hash, doc };
+    const masked = isObj(doc) ? maskSecrets(this.lastText, doc) : { text: this.lastText, doc };
+    return { text: masked.text, hash: this.hash, doc: masked.doc };
   }
 
   /**
@@ -305,14 +348,14 @@ export class ConfigFile {
     try {
       mutate(draft);
     } catch (e) {
-      throw e instanceof ConfigError ? new ConfigRefusal(400, e.message) : e;
+      throw e instanceof ConfigError ? new ConfigRefusal(400, e.message, e.path) : e;
     }
     if (!this.path) return this.applyInMemory(draft);
     const doc = parseDocument(this.lastText);
     try {
       writeDiff(doc, this.live, draft, this.path);
     } catch (e) {
-      throw e instanceof ConfigError ? new ConfigRefusal(409, e.message) : e;
+      throw e instanceof ConfigError ? new ConfigRefusal(409, e.message, e.path) : e;
     }
     return this.commit(this.render(doc), false);
   }
@@ -327,11 +370,14 @@ export class ConfigFile {
     const baseHash = this.hash;
     this.syncFromDisk();
     const moved = req.baseHash !== undefined && req.baseHash !== this.hash;
+    // The stand-ins the caller's file was showing; what it sends back with them still standing is
+    // the originals, and the console never writes one of its own into the file.
+    const table = this.tableOf(base);
 
     let out: string;
     if (req.text !== undefined) {
       if (moved) throw this.conflict();
-      out = req.text;
+      out = unmaskSecrets(req.text, table);
     } else {
       const ops = req.ops ?? [];
       if (moved) {
@@ -356,15 +402,26 @@ export class ConfigFile {
         if (old && typeof old.flow === "boolean" && node && typeof node === "object") node.flow = old.flow;
         doc.setIn(op.path, node);
       }
-      out = this.render(doc);
+      out = unmaskSecrets(this.render(doc), table);
     }
     return this.commit(out, req.dryRun === true);
+  }
+
+  /** What the file the caller last held was masking, so its stand-ins come home on the way in. */
+  private tableOf(text: string): Map<string, string> {
+    try {
+      const doc = parseDocument(text).toJS();
+      return isObj(doc) ? secretTable(doc) : new Map();
+    } catch {
+      return new Map();
+    }
   }
 
   /** Validate, write, apply. Nothing is written unless the result loads, and nothing applies unless it was written. */
   private commit(text: string, dryRun: boolean): CommitResult {
     const next = this.parse(text, 422);
-    if (dryRun) return { hash: hashOf(text), text, restartPending: this.restartPendingFor(next) };
+    const masked = this.masked(text);
+    if (dryRun) return { hash: hashOf(text), text: masked, restartPending: this.restartPendingFor(next) };
     if (text !== this.lastText) {
       try {
         writeFileAtomic(this.path!, text);
@@ -377,7 +434,18 @@ export class ConfigFile {
       this.log.info("config.saved", { path: this.path, hash: this.hash });
     }
     this.apply(next);
-    return { hash: this.hash, text, restartPending: [...this.pending] };
+    return { hash: this.hash, text: masked, restartPending: [...this.pending] };
+  }
+
+  /** The text a console sees back: the file's secrets out, stand-ins in. */
+  private masked(text: string): string {
+    let doc: unknown;
+    try {
+      doc = parseDocument(text).toJS();
+    } catch {
+      return text;
+    }
+    return isObj(doc) ? maskSecrets(text, doc).text : text;
   }
 
   private applyInMemory(draft: HearthConfig): CommitResult {
@@ -389,7 +457,7 @@ export class ConfigFile {
     let raw: unknown;
     try {
       const doc = parseDocument(text);
-      if (doc.errors.length > 0) throw new ConfigError(`not valid YAML: ${doc.errors[0]!.message}`);
+      if (doc.errors.length > 0) throw new ConfigError(null, `not valid YAML: ${doc.errors[0]!.message}`);
       raw = doc.toJS();
     } catch (e) {
       throw new ConfigRefusal(status, e instanceof Error ? e.message : String(e), null);
@@ -399,7 +467,8 @@ export class ConfigFile {
       cfg.configPath = this.path;
       return cfg;
     } catch (e) {
-      throw new ConfigRefusal(status, e instanceof Error ? e.message : String(e));
+      if (e instanceof ConfigError) throw new ConfigRefusal(status, e.message, e.path);
+      throw new ConfigRefusal(status, e instanceof Error ? e.message : String(e), null);
     }
   }
 
