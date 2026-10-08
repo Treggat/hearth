@@ -21,6 +21,8 @@ import { lineDiff, opsBetween } from "../src/console/diff.js";
     { path: ["backends", 2], delete: true },
   ], "and trimmed from the end on the way back");
   assert.deepEqual(opsBetween({ a: 1, b: 2 }, { a: 1 }), [{ path: ["b"], delete: true }], "a removed key is a delete");
+  assert.deepEqual(opsBetween({ a: 1, b: 2 }, { a: null, b: 2 }), [{ path: ["a"], delete: true }], "a cleared field is a delete, not a null written");
+  assert.deepEqual(opsBetween({ a: null, b: 2 }, { a: null, b: 2 }), [], "an already-null key stays put");
   assert.deepEqual(opsBetween({ a: 1 }, { a: 1 }), [], "no change, no ops");
 }
 

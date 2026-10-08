@@ -40,6 +40,8 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
  * Lists of scalars are replaced whole; lists of maps are diffed per item, appended, or trimmed from the end.
  */
 export function opsBetween(from: unknown, to: unknown, path: (string | number)[] = []): Op[] {
+  if (to === null) return from === undefined || from === null ? [] : [{ path, delete: true }];
+  if (from === null) return to === undefined ? [] : [{ path, value: to }];
   if (same(from, to)) return [];
   if (isObj(from) && isObj(to)) {
     const ops: Op[] = [];

@@ -65,6 +65,31 @@ const minimal = { backend: { url: "http://127.0.0.1:9292" } };
   assert.throws(() => parseConfig({ ...minimal, models: { c: { pool: 0 } } }), /models\.c\.pool/);
 }
 
+// --- findings carry their field explicitly ----------------------------------
+{
+  const thrown = (raw: unknown): ConfigError => {
+    try {
+      parseConfig(raw);
+    } catch (e) {
+      if (e instanceof ConfigError) return e;
+      throw e;
+    }
+    throw new Error("expected a ConfigError");
+  };
+  const path = (raw: unknown): string | null => thrown(raw).path;
+  assert.equal(path({ ...minimal, backend: { url: "127.0.0.1:9292" } }), "backend.url");
+  assert.equal(path({ ...minimal, listen: { port: -1 } }), "listen.port");
+  assert.equal(path({ ...minimal, share: 5 }), "share");
+  assert.equal(path({ ...minimal, notes: { n: 5 } }), "notes.n");
+  assert.equal(path({ ...minimal, scheduler: { lanes: {} } }), "scheduler.lanes");
+  assert.equal(path({ ...minimal, models: { m: { lane: "nope" } } }), "models.m.lane");
+  assert.equal(path({ ...minimal, peerLane: "nope" }), "peerLane");
+  assert.equal(path({ ...minimal, models: ["m"] }), "models", "a whole-section finding names the section");
+  assert.equal(path({ ...minimal, models: { m: { params: { model: "x" } } } }), "models.m.params.model");
+  assert.equal(path({ backend: { url: "http://x" }, backends: [{ name: "a", url: "http://y" }] }), null, "a whole-config one carries none");
+  assert.equal(thrown({ ...minimal, models: { c: { pool: 0 } } }).message, "models.c.pool must be a whole number >= 1 (got 0)", "and the sentence keeps the field for a journal line");
+}
+
 // --- a policy that can never fire is a typo, not a preference --------------
 {
   assert.throws(
