@@ -282,7 +282,8 @@ peers:
   writeFileSync(secretPath, SECRETED);
   const a = await boot(secretPath);
   const auth = { Authorization: "Bearer plain-key-value", "Content-Type": "application/json" };
-  const get = async () => (await (await fetch(`${a.url}/config`, { headers: auth })).json()) as { text: string; hash: string; doc: Record<string, unknown> };
+  type SecretDoc = { apiKeys: string[]; peerTokens: Record<string, string>; peers: { token: string }[] };
+  const get = async () => (await (await fetch(`${a.url}/config`, { headers: auth })).json()) as { text: string; hash: string; doc: SecretDoc };
   const patch = (body: unknown) => fetch(`${a.url}/config`, { method: "PATCH", headers: auth, body: JSON.stringify(body) });
 
   const f = await get();
@@ -291,10 +292,10 @@ peers:
     assert.ok(!JSON.stringify(f.doc).includes(s), `no secret in the parsed doc`);
   }
   assert.match(f.text, /hearth-secret\d+/, "the stand-in is where the secret was");
-  assert.match(String(f.doc.apiKeys[0]!), /^hearth-secret\d+$/);
+  assert.match(f.doc.apiKeys[0]!, /^hearth-secret\d+$/);
   assert.equal(f.doc.apiKeys[1], "env:HEARTH_TEST_SECRET", "an env: reference is not a secret in the file");
-  assert.match(String(f.doc.peerTokens!["friend"]), /^hearth-secret\d+$/);
-  assert.match(String(f.doc.peers[0]!["token"]), /^hearth-secret\d+$/);
+  assert.match(f.doc.peerTokens["friend"]!, /^hearth-secret\d+$/);
+  assert.match(f.doc.peers[0]!.token, /^hearth-secret\d+$/);
   assert.ok(readFileSync(secretPath, "utf8").includes("plain-key-value"), "the file itself still holds the real key");
 
   // A whole-text save sends the stand-ins back; the originals come home.
@@ -315,7 +316,7 @@ peers:
 
   // A dry run leaks nothing and writes nothing. (The key just rotated, so does the auth.)
   const auth2 = { Authorization: "Bearer rotated-key", "Content-Type": "application/json" };
-  const get2 = async () => (await (await fetch(`${a.url}/config`, { headers: auth2 })).json()) as { text: string; hash: string; doc: Record<string, unknown> };
+  const get2 = async () => (await (await fetch(`${a.url}/config`, { headers: auth2 })).json()) as { text: string; hash: string; doc: SecretDoc };
   const f3 = await get2();
   r = await fetch(`${a.url}/config`, { method: "PATCH", headers: auth2, body: JSON.stringify({ baseHash: f3.hash, ops: [{ path: ["peerTokens", "friend"], value: "another" }], dryRun: true }) });
   assert.ok(!((await r.json()) as { text: string }).text.includes("another"));
