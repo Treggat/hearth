@@ -10,7 +10,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import {
   analyseAnswer, Canary, readCompletion, StreamWatch,
-  type CanaryEvent, type ProbeTarget, type Verdict,
+  type CanaryEvent, type DegradedInfo, type ProbeTarget, type Verdict,
 } from "./canary.js";
 import {
   peersMapping, WARM_LANE,
@@ -454,13 +454,15 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
    * back and since when costs them one clear one. The body carries the facts
    * rather than only a sentence, because whoever sees this at 3am is the one who
    * has to decide whether to restart the seat.
+   *
+   * Returned rather than thrown so every door can answer it: the chat route
+   * throws it, the passthrough hands it to `fail`, which already knows the
+   * envelope.
    */
-  function refuseDegraded(model: string): void {
-    const sick = canary?.refuse(model);
-    if (sick === undefined || sick === null) return;
+  function degradedRefusal(model: string, sick: DegradedInfo): Refusal {
     const backend = pool.for(model).name;
     const since = new Date(sick.since).toISOString();
-    throw new Refusal(
+    return new Refusal(
       503,
       `model "${model}" is degraded on ${backend}: ${sick.detail} (since ${since}). ` +
         `hearth refuses new requests rather than serving broken output; it returns to ` +
@@ -477,6 +479,13 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         failures: sick.failures,
       },
     );
+  }
+
+  /** Refuse a degraded model on the chat route. */
+  function refuseDegraded(model: string): void {
+    const sick = canary?.refuse(model);
+    if (sick === undefined || sick === null) return;
+    throw degradedRefusal(model, sick);
   }
 
   /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
@@ -595,7 +604,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // Observed as it is relayed, never held back — see StreamWatch.
     const slot = pool.for(model);
     const watch = canary !== null && cfg.canary?.passive === true && canary.watches(model, slot.name)
-      ? { model, backend: slot.name, watcher: new StreamWatch(headerText(up.headers["content-type"])) }
+      ? {
+        model, backend: slot.name, reported: false,
+        watcher: new StreamWatch(headerText(up.headers["content-type"])),
+      }
       : null;
     return pipeThrough(up, res, watch ?? undefined);
   }
@@ -603,6 +615,14 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   /** One header value as a string, whatever the header object says. */
   function headerText(v: string | string[] | undefined): string | undefined {
     return Array.isArray(v) ? v[0] : v;
+  }
+
+  /** The text-completion paths a relayed answer is worth watching on, with or without an `/upstream/<model>` prefix. */
+  const COMPLETION_PATH = /^\/(?:v1\/(?:completions|chat\/completions|responses)|completion)$/;
+
+  /** A passthrough path with llama-swap's `/upstream/<model>` prefix removed. */
+  function stripUpstream(path: string): string {
+    return path.replace(/^\/upstream\/[^/]+/, "");
   }
 
   /**
@@ -615,7 +635,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   async function pipeThrough(
     up: UpstreamResponse,
     res: ServerResponse,
-    watch?: { model: string; backend: string; watcher: StreamWatch },
+    watch?: RelayWatch,
   ): Promise<number> {
     if (res.headersSent) {
       // Opened early for queue position: the status cannot change now, so a failure is a frame.
@@ -629,6 +649,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         return up.status;
       }
       await pipeline(up.body, watcher(watch), res);
+      reportDegenerate(watch);
       return up.status;
     }
     res.writeHead(up.status, {
@@ -643,22 +664,46 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       return up.status;
     }
     await pipeline(up.body, watcher(watch), res);
+    // The response is complete, which is the only moment a non-streamed body
+    // can be judged at all. A stream has already reported mid-flight if it was
+    // going to, and this is a no-op for it.
+    reportDegenerate(watch);
     return up.status;
   }
 
+  /** A relayed answer being watched, and whether its reading has been counted. */
+  interface RelayWatch {
+    model: string;
+    backend: string;
+    watcher: StreamWatch;
+    reported: boolean;
+  }
+
+  /** Count the first degenerate reading of one relayed answer, once. */
+  function reportDegenerate(watch: RelayWatch): void {
+    if (watch.reported) return;
+    try {
+      const hit = watch.watcher.finish();
+      if (hit === null) return;
+      watch.reported = true;
+      canary?.observePassive(watch.model, watch.backend, hit);
+    } catch {
+      // Observing must never be able to break the relay.
+    }
+  }
+
   /** The observing transform: writes each chunk straight on, never holds or alters one. */
-  function watcher(watch: { model: string; backend: string; watcher: StreamWatch }): Transform {
-    let reported = false;
+  function watcher(watch: RelayWatch): Transform {
     return new Transform({
       transform(chunk: Buffer, _encoding, done) {
-        if (!reported) {
+        if (!watch.reported) {
           try {
             watch.watcher.feed(chunk);
             const hit = watch.watcher.verdict();
             if (hit !== null) {
               // Counted the moment it is seen, mid-stream, rather than at the
               // end: the next request should already be refused.
-              reported = true;
+              watch.reported = true;
               canary?.observePassive(watch.model, watch.backend, hit);
             }
           } catch {
@@ -1787,6 +1832,18 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     }
     // What the caller asked for, kept apart from the backend `named` picks.
     const asked = viaPath ?? viaBody;
+    // A degraded model is out of rotation on EVERY door, not only the chat one.
+    // `/v1/completions`, the declared routed paths and llama-swap's
+    // `/upstream/<model>/...` all reach the same seat, and an answer of `!!!!`
+    // costs the caller just as much there. `asked` is already resolved above —
+    // from the path or the body — so this reads nothing new.
+    if (asked !== undefined) {
+      const sick = canary?.refuse(asked);
+      if (sick !== undefined && sick !== null) {
+        fail(res, degradedRefusal(asked, sick));
+        return;
+      }
+    }
     const named = routed ? undefined : asked;
     const target = routed ? routed.slot : named ? pool.for(named) : pool.first();
     if (named && !pool.single) {
@@ -1817,6 +1874,15 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       }
     }
 
+    // A completion relayed down here is watched exactly as one on the chat
+    // route is, so a legacy `/v1/completions` — or `/upstream/<model>/v1/…` —
+    // answer of `!!!!` is counted rather than passed by. Only text-completion
+    // paths: judging a rerank score or an image as "the model's words" would be
+    // inventing a verdict about something that is not an answer.
+    const watching = (backend: string): boolean => canary !== null && cfg.canary?.passive === true
+      && asked !== undefined && canary.watches(asked, backend)
+      && COMPLETION_PATH.test(stripUpstream(path));
+
     const ctrl = new AbortController();
     res.on("close", () => {
       if (!res.writableEnded) ctrl.abort();
@@ -1836,7 +1902,14 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         up.body.resume();
         throw new Error(`${to.name} answered ${up.status}`);
       }
-      await pipeThrough(up, res);
+      // Watched on the backend actually used: a declared route may fall back to
+      // a spare, and the label has to be the one that answered.
+      await pipeThrough(up, res, watching(to.name)
+        ? {
+          model: asked!, backend: to.name, reported: false,
+          watcher: new StreamWatch(headerText(up.headers["content-type"])),
+        }
+        : undefined);
     };
 
     try {
