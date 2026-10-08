@@ -208,6 +208,8 @@ export interface UiData {
   canWarm: boolean;
   /** The operator logged in on this socket, or null for loopback, key and status-page callers. */
   operator: string | null;
+  /** Whether the socket that served this page also serves an operator login. */
+  login: boolean;
   /** How to authenticate a write here, decided per socket rather than guessed. */
   control: "open" | "key" | "off";
   controls: Controls;

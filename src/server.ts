@@ -1679,6 +1679,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       ...snapshot,
       canWarm,
       operator,
+      login: canWarm && cfg.operator !== null,
       control: canWarm ? writeMode() : "off",
     });
     lastFlushAt = Date.now();
@@ -1730,15 +1731,21 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   });
 
   const uiWritable = cfg.uiListen?.control === "key";
+  /** Who is signed in on the status port, which serves the login only where it serves writes. */
+  const uiOperator = (req: IncomingMessage): string | null => (uiWritable ? sessionOperator(req) : null);
   /** The only paths the standalone listener serves. */
   const UI_PATHS = new Set(["/ui", "/ui/", "/ui/next", "/ui/classic", "/ui/data", "/ui/events", "/"]);
   /** The writes the standalone listener passes through when `uiListen.control` allows; new controls must be added here. */
-  const UI_WRITE_PATHS = new Set(["/control", "/v1/warm"]);
-  // The status listener: only UI_PATHS (plus UI_WRITE_PATHS behind localCaller), 404 for the rest.
+  const UI_WRITE_PATHS = new Set(["/control", "/v1/warm", "/login", "/logout"]);
+  /** The config editor, on the same terms: its reads carry the file, so they pass through to the main gate too. */
+  const UI_CONFIG_METHODS = new Set(["GET", "PATCH", "POST"]);
+  // The status listener: only UI_PATHS (plus the passed-through paths behind their own gates), 404 for the rest.
   const uiServer = cfg.uiListen
     ? createServer((req, res) => {
         const path = new URL(req.url ?? "/", "http://localhost").pathname;
-        const isWrite = uiWritable && req.method === "POST" && UI_WRITE_PATHS.has(path);
+        const isWrite = uiWritable && (
+          (req.method === "POST" && UI_WRITE_PATHS.has(path))
+          || (path === "/config" && UI_CONFIG_METHODS.has(req.method ?? "GET")));
         if (!UI_PATHS.has(path) && !isWrite) {
           json(res, 404, { error: "only the status page is served on this port" });
           return;
@@ -1755,13 +1762,13 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           return;
         }
         if (path === "/ui/events") {
-          void serveUiEvents(req, res, uiWritable).catch((e) => {
+          void serveUiEvents(req, res, uiWritable, uiOperator(req)).catch((e) => {
             log.error("ui.stream_failed", { error: e instanceof Error ? e.message : String(e) });
             res.end();
           });
           return;
         }
-        void serveUi(path === "/ui/data" || path === "/ui/classic" ? path : "/ui", res, uiWritable).catch((e) => {
+        void serveUi(path === "/ui/data" || path === "/ui/classic" ? path : "/ui", res, uiWritable, uiOperator(req)).catch((e) => {
           log.error("ui.failed", { error: e instanceof Error ? e.message : String(e) });
           if (!res.headersSent) json(res, 500, { error: "internal error" });
           else res.end();
