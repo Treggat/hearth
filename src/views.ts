@@ -39,6 +39,8 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
       // Who this socket signed in as, so the page can show it and offer a sign-out;
       // loopback and key callers are nobody in particular.
       operator,
+      // Whether this socket serves a login the page can offer.
+      login: canWarm && cfg.operator !== null,
       // How this page must authenticate its writes, decided per socket rather
       // than assumed. "off" when the socket serves no write routes at all.
       control: canWarm ? writeMode() : "off",

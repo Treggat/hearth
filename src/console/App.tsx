@@ -149,6 +149,8 @@ function Activity() {
 }
 
 function LoginCard() {
+  // Reached from a write on a page that is already open, as on the status port, or from a refused data stream.
+  const overOpenPage = useStore((s) => s.signIn && !s.loginRequired);
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -169,13 +171,21 @@ function LoginCard() {
             <Flame size={16} className="text-accent" />
             log in to hearth
           </div>
-          <p className="mt-1 text-dim">This page is loopback-only. A login opens the whole console — dashboard, config, controls — from anywhere on your network.</p>
+          <p className="mt-1 text-dim">{overOpenPage
+            ? "Reading is open here. A login opens the rest — config and controls."
+            : "This page is loopback-only. A login opens the whole console — dashboard, config, controls — from anywhere on your network."}</p>
           <input autoFocus value={user} onChange={(e) => setUser(e.target.value)} placeholder="username"
                  className="mt-3 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
           <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="password"
                  className="mt-2 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
           {err !== null && <div className="mt-2 text-sm text-bad">{err}</div>}
-          <div className="mt-4 flex justify-end">
+          <div className="mt-4 flex justify-end gap-2">
+            {overOpenPage && (
+              <>
+                <Button onClick={() => useStore.setState({ signIn: false })}>cancel</Button>
+                <Button onClick={() => useStore.setState({ signIn: false, preferKey: true })}>use a key</Button>
+              </>
+            )}
             <Button tone="primary" type="submit" disabled={busy || user === "" || pass === ""}>
               {busy ? "signing in…" : "log in"}
             </Button>
@@ -224,7 +234,7 @@ export default function App() {
   const data = useStore((s) => s.data);
   const live = useStore((s) => s.live);
   const dead = useStore((s) => s.dead);
-  const loginRequired = useStore((s) => s.loginRequired);
+  const loginRequired = useStore((s) => s.loginRequired || s.signIn);
   const page = useStore((s) => s.page);
   const [dark, toggleTheme] = useTheme();
 

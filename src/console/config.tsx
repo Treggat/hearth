@@ -304,6 +304,9 @@ export function Config() {
           {err ? (
             <div>
               <div className="text-bad">{err.message}</div>
+              {err.message === "log in to continue" && (
+                <div className="mt-3"><Button tone="primary" onClick={() => useStore.setState({ signIn: true })}>log in</Button></div>
+              )}
               {err.message.includes("status page is served on this port") && (
                 <div className="mt-1 text-[12px] text-dim">
                   this status port only shows the dashboard — the config editor lives on the node's main port.
