@@ -215,6 +215,12 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     };
   }
 
+  /** The caller's own id for this request (`X-Hearth-Job`), so its updates on /queue/events can be matched; ignored if malformed. */
+  function jobId(req: IncomingMessage): string | undefined {
+    const v = req.headers["x-hearth-job"];
+    return typeof v === "string" && /^[\w.:-]{1,128}$/.test(v) ? v : undefined;
+  }
+
   /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
   async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readBody(req, cfg.maxBodyBytes);
@@ -370,6 +376,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     res: ServerResponse,
     signal: AbortSignal,
     onPosition?: (position: number) => void,
+    id?: string,
   ): Promise<void> {
     // Refresh peer state only when a decision needs it, and only for models that may leave.
     if (cfg.models[model] && cfg.models[model].policy !== "local") {
@@ -418,7 +425,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       }
       try {
         await local.scheduler.submit(
-          { lane, model, caller, maxPerCaller: callerCap(null, cfg), signal, tokens: pool.poolTokens(model, fitted), onPosition },
+          { lane, model, caller, maxPerCaller: callerCap(null, cfg), signal, tokens: pool.poolTokens(model, fitted), onPosition, ...(id ? { id } : {}) },
           async () => {
             t.startedAt = Date.now();
             await runLocal();
@@ -452,6 +459,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         maxPerCaller: callerCap(null, cfg),
         // No local slot: this runs on their hardware, not ours.
         offbox: true,
+        ...(id ? { id } : {}),
         peer: decision.peer,
         signal,
       },
@@ -669,6 +677,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     { path: "/control", auth: "local", handler: routeControl },
     { path: "/config", methods: ["GET", "PATCH", "POST"], auth: "local", handler: routeConfig },
     { path: "/queue", auth: "local", handler: routeQueue },
+    { path: "/queue/events", methods: ["GET"], auth: "local", handler: routeQueueEvents },
 
     // The OpenAI surface: a peer may send us work here, and so may we.
     { path: "/v1/warm", methods: ["POST"], auth: "either", envelope: "openai", handler: routeWarm },
@@ -987,6 +996,48 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     }
   }
 
+  /**
+   * The caller's own jobs, pushed: a snapshot on connect, then the list again whenever it changes
+   * (queued, started, finished, moved in line). One connection serves every job a client has.
+   */
+  const queueStreams = new Map<ServerResponse, { caller: string; last: string }>();
+  const callerJobs = (caller: string) =>
+    pool.jobs().filter((j) => j.caller === caller).map((j) => ({
+      id: j.id, state: j.state, position: j.position, lane: j.lane, model: j.model,
+      backend: j.backend, ...(j.peer ? { peer: j.peer } : {}), since: j.since,
+    }));
+  function pushJobs(res: ServerResponse, s: { caller: string; last: string }, event: "snapshot" | "jobs"): void {
+    const body = JSON.stringify({ jobs: callerJobs(s.caller) });
+    if (event === "jobs" && body === s.last) return;
+    s.last = body;
+    res.write(`event: ${event}\ndata: ${body}\n\n`);
+  }
+  let jobsPending = false;
+  pool.onJobs(() => {
+    if (jobsPending || queueStreams.size === 0) return;
+    // A burst of changes in one tick goes out as one update.
+    jobsPending = true;
+    queueMicrotask(() => {
+      jobsPending = false;
+      for (const [res, s] of queueStreams) pushJobs(res, s, "jobs");
+    });
+  });
+
+  async function routeQueueEvents(c: Call): Promise<void> {
+    const { res } = c;
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" });
+    notWork(res);
+    const s = { caller: c.caller, last: "" };
+    queueStreams.set(res, s);
+    pushJobs(res, s, "snapshot");
+    const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
+    ping.unref();
+    res.on("close", () => {
+      clearInterval(ping);
+      queueStreams.delete(res);
+    });
+  }
+
   async function routeQueue(c: Call): Promise<void> {
     const { res } = c;
     json(res, 200, {
@@ -1248,7 +1299,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     });
 
     if (fromPeer === null) {
-      await dispatch(payload, model, lane, caller, res, ctrl.signal, positionStream(c.req, res, payload));
+      await dispatch(payload, model, lane, caller, res, ctrl.signal, positionStream(c.req, res, payload), jobId(c.req));
       return;
     }
 
@@ -1431,7 +1482,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
         try {
           await target.scheduler.submit(
-            { lane, model, caller: who, maxPerCaller: callerCap(null, cfg), signal: ctrl.signal },
+            { lane, model, caller: who, maxPerCaller: callerCap(null, cfg), signal: ctrl.signal, ...(jobId(req) ? { id: jobId(req)! } : {}) },
             async () => {
               t.startedAt = Date.now();
               await proxy();
@@ -1698,6 +1749,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       uiServer?.closeAllConnections?.();
       // End event streams first, so pages start reconnecting at once.
       for (const res of streams) res.end();
+      for (const res of queueStreams.keys()) res.end();
       streams.clear();
 
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));

@@ -82,6 +82,47 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   assert.match(text, /data: \[DONE\]/, "then the answer streams through on the same response");
   assert.ok(!(await (await first).text()).includes("hearth-queue"), "a client that did not ask sees nothing new");
 
+  // --- /queue/events: one stream, the caller's own jobs, pushed as they change ----------
+  const base = `http://127.0.0.1:${(node.server.address() as AddressInfo).port}`;
+  const ctrl = new AbortController();
+  const events = await fetch(`${base}/queue/events`, { signal: ctrl.signal });
+  assert.match(events.headers.get("content-type") ?? "", /text\/event-stream/);
+  const reader = events.body!.getReader();
+  const seen: { event: string; jobs: { id: string; state: string; position: number }[] }[] = [];
+  let buf = "";
+  const pump = (async () => {
+    for (;;) {
+      const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }));
+      if (done) return;
+      buf += new TextDecoder().decode(value);
+      for (let i = buf.indexOf("\n\n"); i >= 0; i = buf.indexOf("\n\n")) {
+        const frame = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const ev = /^event: (\w+)$/m.exec(frame)?.[1];
+        const data = /^data: (.*)$/m.exec(frame)?.[1];
+        if (ev && data) seen.push({ event: ev, ...(JSON.parse(data) as { jobs: [] }) });
+      }
+    }
+  })();
+  await sleep(50);
+  const tagged = (id: string) => fetch(url, {
+    method: "POST", headers: { "content-type": "application/json", "x-hearth-job": id },
+    body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "x" }] }),
+  }).then((r) => r.text());
+  await Promise.all([tagged("app-1"), (async () => { await sleep(30); await tagged("app-2"); })()]);
+  await sleep(50);
+  ctrl.abort();
+  await pump;
+
+  assert.equal(seen[0]?.event, "snapshot", "a snapshot first");
+  assert.deepEqual(seen[0]?.jobs, [], "with nothing in flight");
+  const flat = seen.flatMap((e) => e.jobs.map((j) => `${j.id}:${j.state}:${j.position}`));
+  assert.ok(flat.includes("app-1:running:0"), "the caller's own id comes back on its job");
+  assert.ok(flat.some((x) => x.startsWith("app-2:queued:")), "a waiting job is pushed with its place in line");
+  assert.ok(flat.includes("app-2:running:0"), "and pushed again when it starts");
+  assert.deepEqual(seen.at(-1)?.jobs, [], "and the list empties when both finish");
+  assert.ok(seen.length <= 8, `pushed on change only, not on a timer (${seen.length} updates)`);
+
   await node.close();
   backend.closeAllConnections();
   backend.close();
