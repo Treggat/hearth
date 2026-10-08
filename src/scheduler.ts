@@ -81,6 +81,12 @@ export interface JobSpec {
   /** Client went away. Drops a queued job. Once it's running, we assume the
    *  caller wired the same signal into its upstream call. */
   signal?: AbortSignal;
+  /**
+   * false for a job that takes a lane but not the hardware: it queues, yields and is
+   * counted, but never acquires a resource and never clears one for a neighbour. The
+   * canary's probes use this — a health check may not evict a working model.
+   */
+  claimHardware?: boolean;
   /** Live position while waiting. 0 means next. */
   onPosition?: (position: number) => void;
 }
@@ -139,6 +145,8 @@ interface Job<T = unknown> {
   caller: string;
   offbox: boolean;
   peer?: string;
+  /** false: runs in a lane without taking or clearing the declared hardware. */
+  claimHardware: boolean;
   tokens: number;
   enqueuedAt: number;
   startedAt: number | null;
@@ -354,8 +362,9 @@ export class Scheduler {
    * `concurrency` only alongside jobs of the same model.
    */
   private canAdmit(job: Job): boolean {
-    // Hardware first; our own hold never blocks us.
-    if (!this.hardwareFree()) return false;
+    // Hardware first; our own hold never blocks us. A job that claims nothing
+    // (a canary probe) is not gated on it either — it is not going to use it.
+    if (job.claimHardware && !this.hardwareFree()) return false;
     if (this.laneFull(job)) return false;
     if (this.heldBy(job.model) >= this.limitFor(job.model)) return false;
     if (this.overPool(job)) return false;
@@ -545,8 +554,9 @@ export class Scheduler {
       clearTimeout(job.waitTimer);
       // Taking the hardware and clearing the neighbours off it happen once per
       // TURN, not once per job: a backend that already holds its resources had
-      // them cleared when it took them.
-      if (this.arbiter !== undefined && !this.holding) {
+      // them cleared when it took them. A job that claims nothing skips both,
+      // so a probe can neither hold the card nor evict anyone off it.
+      if (this.arbiter !== undefined && !this.holding && job.claimHardware) {
         // canAdmit proved this free; if acquire still fails, leave the job queued.
         if (!this.arbiter.acquire(this.resources, this)) {
           // Put it back exactly as it was. It has not been added to `running`
@@ -598,6 +608,7 @@ export class Scheduler {
         model: spec.model,
         caller: spec.caller,
         offbox: spec.offbox === true,
+        claimHardware: spec.claimHardware !== false,
         ...(spec.peer ? { peer: spec.peer } : {}),
         tokens: spec.tokens ?? 0,
         enqueuedAt: Date.now(),

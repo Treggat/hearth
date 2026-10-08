@@ -77,6 +77,12 @@ export interface Kind {
    * Absent: this kind cannot, so it must not share an exclusive resource.
    */
   unload?(url: string, log: Logger): Promise<boolean>;
+  /**
+   * Drop ONE model, leaving everything else resident: true once dropped, false where the
+   * backend would not. What the canary's gentle recovery leans on — clearing the whole card
+   * to fix one model would evict a neighbour that was working. Absent: no per-model drop.
+   */
+  unloadModel?(url: string, wire: string, log: Logger): Promise<boolean>;
   /** Placement for a resident set, read when the set changes; absent where the kind cannot say. */
   placement?(url: string): Promise<Map<string, Placement>>;
 }
@@ -131,6 +137,25 @@ const llamaSwap: Kind = {
     if (!res.ok) {
       log.warn("backend.unload_refused", { url: at, status: res.status });
       throw new Error(`${at} answered ${res.status}: the card was not cleared`);
+    }
+    return true;
+  },
+  async unloadModel(url, wire, log) {
+    // llama-swap's own API: `POST /api/models/unload/:model_id`. Encoded, so an id
+    // with a slash in it stays one path segment instead of becoming a deeper route.
+    const at = `${url}/api/models/unload/${encodeURIComponent(wire)}`;
+    let res;
+    try {
+      res = await send(at, { method: "POST", headersTimeoutMs: 30_000 });
+    } catch (e) {
+      log.warn("backend.unload_model_failed", { url: at, wire, detail: e instanceof Error ? e.message : String(e) });
+      return false;
+    }
+    res.body.resume();
+    if (!res.ok) {
+      // A refusal is not a drop, and the caller must not think the seat was cleared.
+      log.warn("backend.unload_model_refused", { url: at, wire, status: res.status });
+      return false;
     }
     return true;
   },
