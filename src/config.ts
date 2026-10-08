@@ -602,7 +602,7 @@ function routeFallback(v: unknown, where: string): RouteFallback | null {
   const o = asRecord(v, where);
   const out = { backend: str(o.backend, `${where}.backend`), model: str(o.model, `${where}.model`) };
   if (out.backend === "" || out.model === "") {
-    throw new ConfigError(`${where} needs both backend: and model: — the backend to try, and the id it serves`);
+    throw new ConfigError(where, `${where} needs both backend: and model: — the backend to try, and the id it serves`);
   }
   return out;
 }
@@ -792,10 +792,11 @@ export function parseConfig(raw: unknown): HearthConfig {
       claimedPaths.set(r.path, b.name);
       if (r.fallback) {
         if (!r.queue) {
-          throw new ConfigError(`backends "${b.name}" route ${r.path} has a fallback but queue: false — only queued work falls back`);
+          throw new ConfigError("backends", `backends "${b.name}" route ${r.path} has a fallback but queue: false — only queued work falls back`);
         }
         if (r.fallback.backend === b.name || !backendNames.has(r.fallback.backend)) {
           throw new ConfigError(
+            "backends",
             `backends "${b.name}" route ${r.path} falls back to "${r.fallback.backend}", which is not another backend`,
           );
         }
