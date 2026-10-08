@@ -17,6 +17,10 @@ interface State {
   dead: boolean;
   /** The data stream refused this address and this browser holds no session: the login card shows. */
   loginRequired: boolean;
+  /** A write wanted a credential on a socket that serves a login: the card shows over an open page. */
+  signIn: boolean;
+  /** The operator chose a key over the login for this visit. */
+  preferKey: boolean;
   page: Page;
   sel: Sel;
   toast: Toast;
@@ -29,6 +33,8 @@ export const useStore = create<State>(() => ({
   live: false,
   dead: false,
   loginRequired: false,
+  signIn: false,
+  preferKey: false,
   page: (location.hash.slice(1) as Page) || "topology",
   sel: null,
   toast: null,
@@ -122,7 +128,7 @@ export async function login(user: string, pass: string): Promise<string | null> 
   }
   const d = (await r.json().catch(() => ({}))) as { error?: string };
   if (!r.ok) return d.error ?? `login failed (${r.status})`;
-  useStore.setState({ loginRequired: false, dead: false });
+  useStore.setState({ loginRequired: false, signIn: false, dead: false });
   connect();
   return null;
 }
@@ -153,7 +159,13 @@ export async function request<T = Record<string, unknown>>(method: string, path:
   let key = storedKey() ?? "";
   let r = await doFetch(key);
   if (r.status === 401 && key === "") {
-    const mode = useStore.getState().data?.control;
+    const { data, preferKey } = useStore.getState();
+    // Where the socket serves a login and nobody is signed in, that is the door to offer first.
+    if (data?.login && !data.operator && !preferKey) {
+      useStore.setState({ signIn: true });
+      throw new RequestError("log in to continue", null);
+    }
+    const mode = data?.control;
     if (mode === "key") {
       const entered = await askForKey();
       useStore.setState({ askKey: null });
