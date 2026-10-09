@@ -411,8 +411,13 @@ through a model swapper would load it on every read.
 When the app is itself a seat in a model swapper, it answers nothing until its
 seat is up, a whole load after someone asked for it, and in that window a held
 lane would take the card back and swap the half-loaded app out. Name the seat's
-id with `seat:` (the id another backend declares in `serves`) and the hold
-starts the moment that seat begins loading.
+id with `seat:` (an id some backend declares in `serves`) and the hold starts
+the moment that seat begins loading, and ends the moment the swapper drops it.
+
+The app and its swapper entry can be one backend: give it the swapper's `url`,
+`serves: [the seat]`, and an `activity` path through the swapper to the app
+(`/upstream/<seat>/queue` on llama-swap). hearth reads that path only while the
+seat is loaded, so reading it never starts the app.
 
 ### What `/healthz` actually checks
 

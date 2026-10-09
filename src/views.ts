@@ -61,7 +61,7 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
   async function uiPayload(operator: string | null = null): Promise<Record<string, unknown>> {
     await peers.ensureFresh();
     // Declared activity paths are read only while a page is building data, never on a timer.
-    for (const b of pool.all()) if (b.cfg.activity) void b.state.sampleActivity(b.cfg.activity);
+    for (const b of pool.all()) void pool.sampleActivity(b);
     return {
       // Who this request signed in as, so the page can show it and offer a sign-out;
       // loopback and key callers are nobody in particular.
