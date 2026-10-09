@@ -111,6 +111,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `backends.<name>.firstByteMs` / `.idleMs` | `backendDefaults` | per-backend deadlines. A sidecar that renders a clip before it answers at all needs a longer one than a chat server |
 | `backends.<name>.activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
 | `backends.<name>.resources` | none | hardware this backend uses. Backends on one exclusive card take turns. See [Backends that share a card](#backends-that-share-a-card) |
+| `backends.<name>.hold` | none | `{ lanes, idleMs }`: while this backend's app is in use (read off `activity`), keep these lanes off its hardware until it has been idle this long. See [Keeping background work off the card](#keeping-background-work-off-the-card-while-the-app-is-in-use) |
 | `backends.<name>.resident` | `false` | stays loaded beside the card's swapping model and is asked to yield when it needs the memory. See [Something small that lives on a card](#something-small-that-lives-on-a-card) |
 | `backends.<name>.routes` | none | paths this backend answers besides chat, each with its lane and model. See [Backends that don't speak the OpenAI API](#backends-that-dont-speak-the-openai-api) |
 | `resources.<name>.kind` | `gpu` | `gpu`, `cpu` or `other`. Picks the icon; `gpu` and `other` are exclusive unless shared |
@@ -132,6 +133,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `models.<id>.spilloverAt` | `1` | `spillover` only: go to a peer once this many jobs are queued here |
 | `models.<id>.fallbackLocal` | `true` | run here when no peer can take it |
 | `models.<id>.lane` | the client's | lane this model's requests queue in, over the one the client asked for |
+| `models.<id>.whenHeld` | unset | the id a request runs as while a neighbour's `hold` keeps its lane off this model's hardware; unset waits |
 | `models.<id>.as` | unset | the id this one goes out as: an alias for another model. See [Advertising a nicer id](#advertising-a-nicer-id-than-the-backend-uses) |
 | `models.<id>.params` | unset | request fields stamped on every call (`temperature`, `reasoning_effort`, …). See [One resident model, several ids](#one-resident-model-several-ids-different-defaults) |
 | `models.<id>.emulate` | unset | `llama-server`: reshape the backend's answers into llama-server's format (`reasoning_content`, `timings`) for clients that expect it |
@@ -364,7 +366,46 @@ would be the same lie forwarded work exists to correct. And a reading it could
 not get — an unreachable backend, a field that was not there — draws as
 **unknown**, never as idle: a failed poll is not evidence the thing is quiet.
 The path is read only while a page is open, on the same page-driven cadence as
-the rest of the console; hearth adds no background poll for it.
+the rest of the console; hearth adds no background poll for it, unless the
+backend also declares a `hold`.
+
+#### Keeping background work off the card while the app is in use
+
+Without more, the first request for a model on that card swaps the app's weights
+out from under whoever is using it. `hold:` lets the app keep the card against
+the lanes you name, and only those:
+
+```yaml
+backends:
+  comfy:
+    url: http://127.0.0.1:8188
+    kind: none
+    resources: [gpu0]
+    activity: { path: /queue, running: queue_running, queued: queue_pending }
+    hold:
+      lanes: [batch]        # these lanes wait; every other lane takes the card as before
+      idleMs: 3600000       # until the app has had nothing running or queued for an hour
+models:
+  summaries:
+    backend: main
+    lane: batch
+    whenHeld: summaries-small   # optional: run as this id meanwhile, instead of waiting
+```
+
+The hold starts when the app first answers its `activity` path, since someone
+started it and its first job is still to come, and is renewed by every reading
+that shows work. It ends once the app has been idle for `idleMs`, or has stopped
+answering for half a minute. A backend with a `hold` has its path read every
+two seconds, page or no page.
+
+While it lasts, a job in a held lane on any backend sharing that hardware stays
+queued and is passed over, so it never blocks the lanes behind it. A model with
+`whenHeld` does not wait: its request runs as the id named there, on that id's
+backend and in that id's lane, which is how background work moves to another
+card with a ceiling of its own. `/network` lists every hold under `holds`, with
+`active` and how long the app has been quiet, for a client that wants to plan
+around it. Keep the `activity` path one that does not start the app: a path
+through a model swapper would load it on every read.
 
 ### What `/healthz` actually checks
 
