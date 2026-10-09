@@ -198,7 +198,7 @@ try {
   const side = config(card.url()).backends.find((b) => b.name === "side")!;
   assert.deepEqual(side.resident, { yield: null, resume: null }, "a resident that is never asked to move");
   const [r] = side.routes;
-  assert.deepEqual(r!.fallback, { backend: "cpu", model: "rerank-cpu" });
+  assert.deepEqual(r!.fallback, { backend: "cpu", model: "rerank-cpu", models: {} });
   const one = (route: Record<string, unknown>) => () => parseV1({
     name: "t",
     backends: [
@@ -211,6 +211,58 @@ try {
   assert.throws(one({ fallback: { backend: "a", model: "m" } }), ConfigError, "and not the one that just failed");
   assert.throws(one({ fallback: { backend: "b" } }), ConfigError, "and the id it serves there");
   assert.throws(one({ queue: false, fallback: { backend: "b", model: "m" } }), ConfigError, "only queued work falls back");
+  assert.deepEqual(one({ fallback: { backend: "b", model: "m", models: { big: "big-b" } } })().backends[0]!.routes[0]!.fallback!.models,
+    { big: "big-b" }, "a shared path may name a counterpart per model");
+  assert.throws(one({ fallback: { backend: "b", model: "m", models: { big: "" } } }), ConfigError, "and each one names an id");
+}
+
+// --- several models on one path: each falls back to its own counterpart ------------------
+{
+  const gpu = fakeSwap(["small", "large"]);
+  const spare = fakeSwap(["small-cpu", "large-cpu"]);
+  await gpu.listen();
+  await spare.listen();
+  const shared = createNode(parseV1({
+    name: "shared",
+    resources: { gpu: { kind: "gpu" }, cpu: { kind: "cpu", shared: true } },
+    backends: [
+      {
+        name: "gpu", url: gpu.url(), kind: "llama-swap", resources: ["gpu"],
+        routes: [{ path: "/v1/embeddings", lane: "chat", model: "small",
+          fallback: { backend: "spare", model: "small-cpu", models: { large: "large-cpu" } } }],
+      },
+      { name: "spare", url: spare.url(), kind: "none", serves: ["small-cpu", "large-cpu"], resources: ["cpu"] },
+    ],
+    models: { small: { backend: "gpu" }, large: { backend: "gpu" } },
+  }), silentLogger);
+  shared.start();
+  const at = await new Promise<string>((ready) =>
+    shared.server.listen(0, "127.0.0.1", () =>
+      ready(`http://127.0.0.1:${(shared.server.address() as AddressInfo).port}`)),
+  );
+  const embed = async (model: string) => {
+    const r = await fetch(`${at}/v1/embeddings`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model, input: "x" }),
+    });
+    await r.text();
+    return r.status;
+  };
+  try {
+    gpu.answer(503);
+    assert.equal(await embed("large"), 200);
+    assert.equal(spare.seen.at(-1)!.model, "large-cpu", "the listed model runs as its own counterpart");
+    assert.equal(await embed("small"), 200);
+    assert.equal(spare.seen.at(-1)!.model, "small-cpu", "one not listed uses the route's fallback model");
+    gpu.answer(200);
+    spare.seen.length = 0;
+    assert.equal(await embed("large"), 200);
+    assert.equal(gpu.seen.at(-1)!.model, "large");
+    assert.equal(spare.seen.length, 0, "and nothing falls back while the first backend answers");
+  } finally {
+    await shared.close();
+    gpu.close();
+    spare.close();
+  }
 }
 
 card.close();

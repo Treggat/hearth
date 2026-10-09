@@ -2080,14 +2080,16 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           } catch (e) {
             // A full lane is back-pressure, a closed socket has nobody to answer, and a started reply cannot be restarted.
             if (e instanceof QueueFullError || ctrl.signal.aborted || res.headersSent) throw e;
+            // Models that share the path each keep their own counterpart: a spare for one is no answer for another.
+            const spareModel = fb.models[model] ?? fb.model;
             log.warn("route.fallback", {
-              path, from: target.name, to: spare.name, model: fb.model,
+              path, from: target.name, to: spare.name, model: spareModel,
               detail: e instanceof Error ? e.message : String(e),
             });
             // A form names its model in a field, which is rewritten as a JSON body's is.
-            const wire = pool.outboundId(fb.model);
+            const wire = pool.outboundId(spareModel);
             const spareBody = isForm && body ? replaceMultipartField(body, contentType, "model", wire) ?? body : withModel(body, wire);
-            await run(spare, fb.model, spareBody, false);
+            await run(spare, spareModel, spareBody, false);
           }
         }
       } else if (routed) {
