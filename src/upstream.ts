@@ -67,7 +67,12 @@ export function send(url: string, opts: RequestOptions = {}): Promise<UpstreamRe
 
     const headers: Record<string, string> = { ...opts.headers };
     if (body) {
-      headers["Content-Type"] ??= "application/json";
+      // Header names are case-insensitive, and a proxied request carries the client's own
+      // lowercase `content-type`. Defaulting a differently-cased key would send the JSON default
+      // in its place, and a multipart upload would reach the backend labelled as JSON.
+      const names = Object.keys(headers);
+      if (!names.some((k) => k.toLowerCase() === "content-type")) headers["Content-Type"] = "application/json";
+      for (const k of names) if (k.toLowerCase() === "content-length") delete headers[k];
       headers["Content-Length"] = String(body.length);
     }
 
