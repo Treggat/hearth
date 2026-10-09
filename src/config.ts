@@ -622,7 +622,7 @@ function routeList(v: unknown, where: string): RouteRule[] {
   return v.map((raw, i) => {
     const at = `${where}[${i}]`;
     const entry = typeof raw === "string" ? { path: raw } : asRecord(raw, at);
-    only(entry, ["path", "lane", "model", "queue"], at);
+    only(entry, ["path", "lane", "model", "queue", "fallback"], at);
     const path = str(entry.path, `${at}.path`);
     requirePath(path, at);
     // One placeholder, standing for one whole segment. More than one, or one
