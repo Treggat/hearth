@@ -57,7 +57,7 @@ const config = (appUrl: string, idleMs: number, extra: Record<string, unknown> =
 // --- config ----------------------------------------------------------------
 {
   const cfg = config("http://127.0.0.1:1", 60_000);
-  assert.deepEqual(cfg.backends[1]!.hold, { lanes: ["memory"], idleMs: 60_000 }, "the block parses whole");
+  assert.deepEqual(cfg.backends[1]!.hold, { lanes: ["memory"], idleMs: 60_000, seat: null }, "the block parses whole");
   assert.equal(cfg.backends[0]!.hold, null, "absent means null");
   assert.equal(cfg.models["background"]!.whenHeld, "elsewhere");
   assert.equal(cfg.models["waits"]!.whenHeld, null, "a model without one waits");
@@ -206,6 +206,67 @@ const config = (appUrl: string, idleMs: number, extra: Record<string, unknown> =
 
   await node.close();
   for (const f of [app, card, spare]) f.close();
+}
+
+// --- a seat in a model swapper: held from the moment it starts loading -------
+// The app answers nothing until its seat is up, a load later. Without `seat` the held lanes
+// would get their card back in that window and swap the half-loaded app straight out.
+{
+  let running: { model: string; state: string }[] = [];
+  const swap = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(req.url === "/running" ? { running } : { data: [{ id: "main" }, { id: "image-seat" }] }));
+  });
+  const swapUrl = await new Promise<string>((ready) =>
+    swap.listen(0, "127.0.0.1", () => ready(`http://127.0.0.1:${(swap.address() as AddressInfo).port}`)));
+  const cfg = parseV1({
+    name: "seat",
+    resources: { gpu: { kind: "gpu" } },
+    scheduler: { lanes: { chat: { priority: 0 }, memory: { priority: 90 } } },
+    backends: [
+      { name: "card", url: swapUrl, kind: "llama-swap", resources: ["gpu"] },
+      { name: "loader", url: swapUrl, kind: "llama-swap", serves: ["image-seat"], resources: ["gpu"], resident: { yield: false } },
+      {
+        name: "app", url: "http://127.0.0.1:1", kind: "none", resources: ["gpu"],
+        activity: { path: "/queue", running: "running" },
+        hold: { lanes: ["memory"], idleMs: 60_000, seat: "image-seat" },
+      },
+    ],
+  });
+  assert.equal(cfg.backends[2]!.hold!.seat, "image-seat");
+  const pool = new BackendPool(cfg, silentLogger);
+  const [card, loader] = [pool.get("card")!, pool.get("loader")!];
+
+  await loader.state.refresh();
+  assert.equal(pool.heldOff(card.cfg, "memory"), false, "nothing loading, nothing answering: no hold");
+
+  running = [{ model: "image-seat", state: "starting" }];
+  await loader.state.refresh();
+  assert.equal(pool.heldOff(card.cfg, "memory"), true, "the seat is loading: the lanes are held before the app can answer");
+  assert.equal(pool.heldOff(card.cfg, "chat"), false, "still only the lanes it names");
+  assert.equal(pool.holds()[0]!.active, true, "and /network says so");
+
+  running = [{ model: "image-seat", state: "ready" }];
+  await loader.state.refresh();
+  assert.equal(pool.heldOff(card.cfg, "memory"), true, "just loaded: the hold bridges the moment before the app's first answer");
+
+  // Another model loading on that swapper is not this app's business.
+  const other = new BackendPool(cfg, silentLogger);
+  running = [{ model: "main", state: "starting" }];
+  await other.get("loader")!.state.refresh();
+  await other.get("card")!.state.refresh();
+  assert.equal(other.heldOff(other.get("card")!.cfg, "memory"), false, "a different model loading holds nothing");
+
+  assert.throws(() => parseV1({
+    name: "t", resources: { gpu: { kind: "gpu" } },
+    backends: [{ name: "app", url: "http://127.0.0.1:1", kind: "none", resources: ["gpu"],
+      activity: { path: "/queue", running: "running" }, hold: { lanes: ["chat"], idleMs: 1000, seat: "nobody" } }],
+  }), /which no other backend declares in serves/, "a seat nobody loads");
+
+  swap.closeAllConnections();
+  swap.close();
+  pool.stop();
+  other.stop();
 }
 
 console.log("hold: ok");

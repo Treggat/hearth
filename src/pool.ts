@@ -23,6 +23,9 @@ const EVICT_BUDGET_MS = 45_000;
 /** How often a backend with a `hold` has its activity path read. */
 const HOLD_POLL_MS = 2_000;
 
+/** How long a hold outlasts its seat's load: time for the app to answer its activity path for the first time. */
+const SEAT_READY_GRACE_MS = 15_000;
+
 /** One backend, with the queue that fronts it. */
 export interface BackendSlot {
   name: string;
@@ -72,6 +75,8 @@ export class BackendPool {
   /** Reads the activity path of every backend with a `hold`, and what each read last decided. */
   private holdTimer: ReturnType<typeof setInterval> | null = null;
   private readonly holdWas = new Map<BackendSlot, boolean>();
+  /** When a holder's seat was last seen loading, so the hold bridges the moment between "ready" and the app's first answer. */
+  private readonly seatLoadingAt = new Map<BackendSlot, number>();
 
   /** The last twenty handoffs, so a card changing hands shows on the status page. */
   private readonly evicted: { t: number; backend: string; for: string; resources: string[] }[] = [];
@@ -254,9 +259,24 @@ export class BackendPool {
       const h = s.cfg.hold;
       if (h === null || s.name === b.name || !h.lanes.includes(lane)) continue;
       if (!s.cfg.resources.some((r) => mine.includes(r))) continue;
-      if (s.state.holding(h.idleMs)) return true;
+      if (this.holdActive(s)) return true;
     }
     return false;
+  }
+
+  /** Is this backend's hold in force: its app in use, or its seat loading (or only just loaded)? */
+  private holdActive(s: BackendSlot): boolean {
+    const h = s.cfg.hold!;
+    if (s.state.holding(h.idleMs)) return true;
+    if (h.seat === null) return false;
+    const loader = this.slots.find((o) => o !== s && o.cfg.serves.includes(h.seat!));
+    if (loader === undefined) return false;
+    const now = Date.now();
+    if (loader.state.loading().includes(h.seat)) {
+      this.seatLoadingAt.set(s, now);
+      return true;
+    }
+    return now - (this.seatLoadingAt.get(s) ?? -Infinity) < SEAT_READY_GRACE_MS;
   }
 
   /** The id a request for `model` in `lane` runs as while its lane is held off its hardware, or null to queue as itself. */
@@ -273,7 +293,7 @@ export class BackendPool {
       resources: this.arbitrated(s.cfg.resources),
       lanes: [...s.cfg.hold!.lanes],
       idleMs: s.cfg.hold!.idleMs,
-      active: s.state.holding(s.cfg.hold!.idleMs),
+      active: this.holdActive(s),
       quietMs: s.state.quietMs(),
     }));
   }
@@ -284,7 +304,7 @@ export class BackendPool {
     await Promise.all(holders.map((s) => s.state.sampleActivity(s.cfg.activity!)));
     let changed = false;
     for (const s of holders) {
-      const now = s.state.holding(s.cfg.hold!.idleMs);
+      const now = this.holdActive(s);
       if (now === (this.holdWas.get(s) ?? false)) continue;
       this.holdWas.set(s, now);
       changed = true;

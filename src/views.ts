@@ -184,7 +184,7 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
             // Sent whenever declared, including unread (ok:false), which the page shows as unknown.
             ...(b.cfg.activity ? { activity: b.state.activity() } : {}),
             // Which lanes this backend keeps off its hardware while its app is in use, and whether it does so now.
-            ...(b.cfg.hold ? { hold: { lanes: [...b.cfg.hold.lanes], idleMs: b.cfg.hold.idleMs, active: b.state.holding(b.cfg.hold.idleMs), quietMs: b.state.quietMs() } } : {}),
+            ...(b.cfg.hold ? { hold: { lanes: [...b.cfg.hold.lanes], idleMs: b.cfg.hold.idleMs, active: pool.holds().some((h) => h.backend === b.name && h.active), quietMs: b.state.quietMs() } } : {}),
             // Only a kind that unloads evicts; one that keeps its set resident has no thrash to warn about.
             evicts: b.state.canUnload(),
             slots: c.slots,

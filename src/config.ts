@@ -122,6 +122,12 @@ export interface HoldDecl {
   lanes: string[];
   /** How long the app must stay idle before the lanes may start again. */
   idleMs: number;
+  /**
+   * The id the app loads under when it is a seat in a model swapper: one that another backend
+   * declares in `serves`. The hold then starts when that seat starts loading, not a load later
+   * when the app first answers. null for an app that is simply up or down.
+   */
+  seat: string | null;
 }
 
 /**
@@ -641,11 +647,12 @@ function residentDecl(v: unknown, where: string): ResidentDecl | null {
 function holdDecl(v: unknown, where: string): HoldDecl | null {
   if (v === undefined || v === null) return null;
   const o = asRecord(v, where);
-  only(o, ["lanes", "idleMs"], where);
+  only(o, ["lanes", "idleMs", "seat"], where);
   const lanes = strList(o.lanes, `${where}.lanes`);
   if (lanes.length === 0) throw bad(`${where}.lanes`, "must name at least one lane to hold");
   if (o.idleMs === undefined) throw bad(`${where}.idleMs`, "is required: how long the app must stay idle before the lanes start again");
-  return { lanes, idleMs: atLeast(o.idleMs, `${where}.idleMs`, 0) };
+  const seat = str(o.seat, `${where}.seat`, "");
+  return { lanes, idleMs: atLeast(o.idleMs, `${where}.idleMs`, 0), seat: seat === "" ? null : seat };
 }
 
 /** `routes:` entries, as a bare path or an object; lane and model are filled in once lanes exist. */
@@ -965,6 +972,10 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
     for (const l of b.hold.lanes) {
       if (!(l in lanes)) throw bad(`${at}.lanes`, `names "${l}", which is not in scheduler.lanes (${Object.keys(lanes).join(", ")})`);
+    }
+    // Only a declared id says which backend loads the seat; a discovered one could be anybody's.
+    if (b.hold.seat !== null && !backends.some((o) => o !== b && o.serves.includes(b.hold!.seat!))) {
+      throw bad(`${at}.seat`, `is "${b.hold.seat}", which no other backend declares in serves: name the swapper's id for this app`);
     }
   }
 

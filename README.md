@@ -111,7 +111,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `backends.<name>.firstByteMs` / `.idleMs` | `backendDefaults` | per-backend deadlines. A sidecar that renders a clip before it answers at all needs a longer one than a chat server |
 | `backends.<name>.activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
 | `backends.<name>.resources` | none | hardware this backend uses. Backends on one exclusive card take turns. See [Backends that share a card](#backends-that-share-a-card) |
-| `backends.<name>.hold` | none | `{ lanes, idleMs }`: while this backend's app is in use (read off `activity`), keep these lanes off its hardware until it has been idle this long. See [Keeping background work off the card](#keeping-background-work-off-the-card-while-the-app-is-in-use) |
+| `backends.<name>.hold` | none | `{ lanes, idleMs, seat? }`: while this backend's app is in use (read off `activity`), keep these lanes off its hardware until it has been idle this long. See [Keeping background work off the card](#keeping-background-work-off-the-card-while-the-app-is-in-use) |
 | `backends.<name>.resident` | `false` | stays loaded beside the card's swapping model and is asked to yield when it needs the memory. See [Something small that lives on a card](#something-small-that-lives-on-a-card) |
 | `backends.<name>.routes` | none | paths this backend answers besides chat, each with its lane and model. See [Backends that don't speak the OpenAI API](#backends-that-dont-speak-the-openai-api) |
 | `resources.<name>.kind` | `gpu` | `gpu`, `cpu` or `other`. Picks the icon; `gpu` and `other` are exclusive unless shared |
@@ -385,6 +385,7 @@ backends:
     hold:
       lanes: [batch]        # these lanes wait; every other lane takes the card as before
       idleMs: 3600000       # until the app has had nothing running or queued for an hour
+      # seat: image-app     # optional: the id a model swapper loads the app under (see below)
 models:
   summaries:
     backend: main
@@ -406,6 +407,12 @@ card with a ceiling of its own. `/network` lists every hold under `holds`, with
 `active` and how long the app has been quiet, for a client that wants to plan
 around it. Keep the `activity` path one that does not start the app: a path
 through a model swapper would load it on every read.
+
+When the app is itself a seat in a model swapper, it answers nothing until its
+seat is up, a whole load after someone asked for it, and in that window a held
+lane would take the card back and swap the half-loaded app out. Name the seat's
+id with `seat:` (the id another backend declares in `serves`) and the hold
+starts the moment that seat begins loading.
 
 ### What `/healthz` actually checks
 
