@@ -261,12 +261,62 @@ const config = (appUrl: string, idleMs: number, extra: Record<string, unknown> =
     name: "t", resources: { gpu: { kind: "gpu" } },
     backends: [{ name: "app", url: "http://127.0.0.1:1", kind: "none", resources: ["gpu"],
       activity: { path: "/queue", running: "running" }, hold: { lanes: ["chat"], idleMs: 1000, seat: "nobody" } }],
-  }), /which no other backend declares in serves/, "a seat nobody loads");
+  }), /which no backend declares in serves/, "a seat nobody loads");
 
   swap.closeAllConnections();
   swap.close();
   pool.stop();
   other.stop();
+}
+
+// --- one backend that is both the swapper's entry and the app ----------------
+// Its activity path goes through the swapper, which loads whatever it is asked for: the path
+// is read only while the seat is up, and the hold ends the moment the swapper drops the seat.
+{
+  let running: { model: string; state: string }[] = [];
+  let reads = 0;
+  const swap = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    if (req.url === "/running") return void res.end(JSON.stringify({ running }));
+    if (req.url === "/upstream/image-seat/queue") { reads++; return void res.end(JSON.stringify({ running: 1 })); }
+    res.end(JSON.stringify({ data: [{ id: "main" }, { id: "image-seat" }] }));
+  });
+  const swapUrl = await new Promise<string>((ready) =>
+    swap.listen(0, "127.0.0.1", () => ready(`http://127.0.0.1:${(swap.address() as AddressInfo).port}`)));
+  const cfg = parseV1({
+    name: "one",
+    resources: { gpu: { kind: "gpu" } },
+    scheduler: { lanes: { chat: { priority: 0 }, memory: { priority: 90 } } },
+    backends: [
+      { name: "card", url: swapUrl, kind: "llama-swap", resources: ["gpu"] },
+      {
+        name: "app", url: swapUrl, kind: "llama-swap", serves: ["image-seat"], resources: ["gpu"], resident: { yield: false },
+        activity: { path: "/upstream/image-seat/queue", running: "running" },
+        hold: { lanes: ["memory"], idleMs: 60_000, seat: "image-seat" },
+      },
+    ],
+  });
+  const pool = new BackendPool(cfg, silentLogger);
+  const [card, app] = [pool.get("card")!, pool.get("app")!];
+
+  await app.state.refresh();
+  await pool.sampleActivity(app);
+  assert.equal(reads, 0, "seat down: the path is not read, so reading it cannot start the app");
+  assert.equal(pool.heldOff(card.cfg, "memory"), false);
+
+  running = [{ model: "image-seat", state: "ready" }];
+  await app.state.refresh();
+  await pool.sampleActivity(app);
+  assert.equal(reads, 1, "seat up: the path is read through the swapper");
+  assert.equal(pool.heldOff(card.cfg, "memory"), true, "and the app's work holds the card");
+
+  running = [{ model: "main", state: "ready" }];
+  await app.state.refresh();
+  assert.equal(pool.heldOff(card.cfg, "memory"), false, "the swapper dropped the seat: the hold ends at once, not when the app's last reading ages out");
+
+  swap.closeAllConnections();
+  swap.close();
+  pool.stop();
 }
 
 console.log("hold: ok");

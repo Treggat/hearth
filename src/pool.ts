@@ -274,16 +274,29 @@ export class BackendPool {
   /** Is this backend's hold in force: its app in use, or its seat loading (or only just loaded)? */
   private holdActive(s: BackendSlot): boolean {
     const h = s.cfg.hold!;
-    if (s.state.holding(h.idleMs)) return true;
-    if (h.seat === null) return false;
-    const loader = this.slots.find((o) => o !== s && o.cfg.serves.includes(h.seat!));
-    if (loader === undefined) return false;
-    const now = Date.now();
-    if (loader.state.loading().includes(h.seat)) {
-      this.seatLoadingAt.set(s, now);
-      return true;
+    const loader = h.seat === null ? undefined : this.slots.find((o) => o.cfg.serves.includes(h.seat!));
+    if (loader !== undefined) {
+      const now = Date.now();
+      if (loader.state.loading().includes(h.seat!)) {
+        this.seatLoadingAt.set(s, now);
+        return true;
+      }
+      if (now - (this.seatLoadingAt.get(s) ?? -Infinity) < SEAT_READY_GRACE_MS) return true;
+      // A seat its swapper says is gone holds nothing, whatever the app last reported.
+      if (loader.state.knowsWarm() && !loader.state.isWarm(h.seat!)) return false;
     }
-    return now - (this.seatLoadingAt.get(s) ?? -Infinity) < SEAT_READY_GRACE_MS;
+    return s.state.holding(h.idleMs);
+  }
+
+  /**
+   * Read a backend's activity path, unless that would start its app: a seat's own path goes
+   * through its swapper, which loads whatever it is asked for.
+   */
+  sampleActivity(s: BackendSlot): Promise<void> {
+    if (s.cfg.activity === null) return Promise.resolve();
+    const seat = s.cfg.hold?.seat ?? null;
+    if (seat !== null && s.cfg.serves.includes(seat) && !s.state.isWarm(seat)) return Promise.resolve();
+    return s.state.sampleActivity(s.cfg.activity);
   }
 
   /** The id a request for `model` in `lane` runs as while its lane is held off its hardware, or null to queue as itself. */
@@ -308,7 +321,7 @@ export class BackendPool {
   /** Read each holding backend's activity path, and wake the queues when a hold starts or ends. */
   private async sampleHolds(): Promise<void> {
     const holders = this.slots.filter((s) => s.cfg.hold !== null);
-    await Promise.all(holders.map((s) => s.state.sampleActivity(s.cfg.activity!)));
+    await Promise.all(holders.map((s) => this.sampleActivity(s)));
     let changed = false;
     for (const s of holders) {
       const now = this.holdActive(s);

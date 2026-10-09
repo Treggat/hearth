@@ -123,9 +123,10 @@ export interface HoldDecl {
   /** How long the app must stay idle before the lanes may start again. */
   idleMs: number;
   /**
-   * The id the app loads under when it is a seat in a model swapper: one that another backend
-   * declares in `serves`. The hold then starts when that seat starts loading, not a load later
-   * when the app first answers. null for an app that is simply up or down.
+   * The id the app loads under when it is a seat in a model swapper: one a backend declares in
+   * `serves`, this one included. The hold then starts when that seat starts loading, not a load
+   * later when the app first answers, and ends when the swapper drops it. null for an app that
+   * is simply up or down.
    */
   seat: string | null;
 }
@@ -985,8 +986,8 @@ export function parseConfig(raw: unknown): HearthConfig {
       if (!(l in lanes)) throw bad(`${at}.lanes`, `names "${l}", which is not in scheduler.lanes (${Object.keys(lanes).join(", ")})`);
     }
     // Only a declared id says which backend loads the seat; a discovered one could be anybody's.
-    if (b.hold.seat !== null && !backends.some((o) => o !== b && o.serves.includes(b.hold!.seat!))) {
-      throw bad(`${at}.seat`, `is "${b.hold.seat}", which no other backend declares in serves: name the swapper's id for this app`);
+    if (b.hold.seat !== null && !backends.some((o) => o.serves.includes(b.hold!.seat!))) {
+      throw bad(`${at}.seat`, `is "${b.hold.seat}", which no backend declares in serves: name the swapper's id for this app`);
     }
   }
 
