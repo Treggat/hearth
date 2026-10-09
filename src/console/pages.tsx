@@ -26,8 +26,8 @@ function Row({ k, children }: { k: string; children: React.ReactNode }) {
  * The one failure the topology cannot draw.
  *
  * A seat returning 200 and `!!!!` is up, loaded, holding its card, and every
- * number on every page is green — which is how the incident ran for hours. So
- * when the canary has a model out of rotation this says so on every page,
+ * number on every page is green. So when the canary has a model out of
+ * rotation this says so on every page,
  * rather than sitting somewhere an operator has to think to look.
  */
 export function CanaryAlert() {

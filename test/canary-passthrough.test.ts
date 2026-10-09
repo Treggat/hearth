@@ -23,7 +23,7 @@ import { parseV1 } from "./v1.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 
-/** bad: every answer is junk (the incident). split: only the canary's own question is answered. good: all fine. */
+/** bad: every answer is junk. split: only the canary's own question is answered. good: all fine. */
 type Mode = "bad" | "split" | "good";
 
 function fakeSwap() {

@@ -220,7 +220,7 @@ export interface CanaryConfig {
   models: Record<string, Partial<CanaryProbe>>;
   /** Backends whose whole served set is asked, with overrides. */
   backends: Record<string, Partial<CanaryProbe>>;
-  /** Also watch relayed completions and treat a degenerate one as a failed probe. */
+  /** Also watch relayed completions; a degenerate one brings the next probe forward. */
   passive: boolean;
   notify: CanaryNotify | null;
   recovery: CanaryRecovery | null;

@@ -1,9 +1,8 @@
 /**
  * What a bad answer looks like, in one pure function.
  *
- * The incident this exists for: card B's vLLM answered HTTP 200 with 200 `!`
- * characters for hours. Nothing upstream called that a failure, because every
- * layer above it only ever asked "did bytes arrive" and the bytes arrived.
+ * A backend can answer HTTP 200 with 200 `!` characters, and nothing upstream
+ * calls that a failure when every layer only asks "did bytes arrive".
  * A canary has to say what a GOOD answer is and then judge against that, so
  * this is the judgement, separated from the HTTP that fetched it.
  *
@@ -21,7 +20,7 @@ import { analyseAnswer, isFailure, readCompletion } from "../src/canary.js";
 
 const PARIS = /paris/i;
 
-// --- the incident, verbatim -------------------------------------------------
+// --- 200 of one character -------------------------------------------------
 // 200 `!`, finish_reason `length`, HTTP 200. This is the answer that must be
 // called what it is before any threshold is consulted.
 {
@@ -72,7 +71,7 @@ const PARIS = /paris/i;
 }
 
 // --- a reasoning model that ran out of room --------------------------------
-// gpt-oss reasons before it answers. With max_tokens small enough, the whole
+// A reasoning model thinks before it answers. With max_tokens small enough, the whole
 // budget goes to the reasoning channel and `content` is empty with
 // finish_reason `length`. That is a mis-sized probe, NOT a broken seat: calling
 // it a failure would degrade a perfectly healthy reasoning model on the first

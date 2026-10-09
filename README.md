@@ -122,7 +122,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `scheduler.maxPerCaller` | `0`, or `2` with apiKeys | queued-or-running jobs per caller per lane. Off without apiKeys, where every local caller is one identity |
 | `models.<id>` | — | routing policy per model. Anything unlisted stays local |
 | `models.<id>.note` | unset | what the model is for. Shown to borrowers and as `description` on `/v1/models`. A note alone routes nothing |
-| `canary` | unset | ask named models a question with one right answer, on a schedule, so a seat that answers `200` with nothing worth reading is taken out of rotation instead of called healthy. Off unless configured; restart-only. See [A seat that answers 200 with nothing](#a-seat-that-answers-200-with-nothing) |
+| `canary` | unset | ask named models a question with one right answer, on a schedule, and take one that stops answering it out of rotation. Off unless configured; restart-only. See [Canary](#canary) |
 | `models.<id>.backend` | auto | pin a model to a named backend instead of resolving it from the catalogs |
 | `models.<id>.follow` | `false` | go out as whatever the pinned backend has loaded, and as `as` when nothing is (or when `as` is among several loaded). Needs `backend` and `as`. It follows any model, a non-chat one included, so pin it to a backend that serves one kind |
 | `models.<id>.concurrency` | backend's | jobs this model may run at once, above OR below its backend's `concurrency`. See below |
@@ -355,8 +355,7 @@ gone:
 ```json
 {"ok":true,"name":"web",
  "backends":{"total":9,"watched":2,"connected":2},
- "peers":{"total":1,"up":1},
- "canary":{"enabled":true,"degraded":0}}
+ "peers":{"total":1,"up":1}}
 ```
 
 `watched` is the backends whose event stream hearth holds open — llama-swap,
@@ -364,9 +363,10 @@ today. That connection is the signal: when the backend dies the stream drops,
 and hearth knows within a reconnect without having asked it anything. `503`
 means every one of them is gone.
 
-`canary`, when a canary is configured, is how many models are **degraded** —
-answering, but not with an answer. See below; this endpoint is unauthenticated,
-so it is a count here and the name is on the page.
+With a [canary](#canary) configured the body also carries
+`"canary":{"degraded":0}`: how many models are answering, but not with an
+answer. It is a count for the same reason as the rest, and the field is absent
+when no canary is configured.
 
 What this is deliberately NOT built on is "have we heard from it lately". On an
 idle box nothing is heard from anything, so that reads silent across the board
@@ -387,64 +387,61 @@ It is unauthenticated and the main port may be bound wide, so it reports counts
 and never names. Model ids, backend names and peer names stay behind the page's
 gate.
 
-## A seat that answers 200 with nothing
+## Canary
 
-Every check above asks whether the backend is reachable. None of them asks
-whether it still knows anything, and on 2026-10-07 that gap cost hours: a vLLM
-seat on a B70 returned `200 OK` with nothing but `!` characters for every
-request, `finish_reason: length`, while llama-swap said `ready`, vLLM's metrics
-counted the requests as successes, and `/healthz` said `ok`. The seat was up. It
-was just not answering. Everything downstream of hearth — agents, memory steps,
-anything with a retry budget — spent that morning reading exclamation marks.
+Every check above asks whether a backend is reachable. None asks whether the
+model on it still answers. A backend can hold its model, return `200 OK` to
+every request and fill each answer with one repeated character: it reads as
+healthy everywhere, and everything downstream gets nothing it can use.
 
-A canary closes it. Off unless you configure it, because a heartbeat that talks
-to a model on its own schedule is not something to switch on for someone:
+A canary asks each model you name a question with one right answer, on a
+schedule, and takes a model that stops answering it out of rotation. It is off
+unless you configure it, because a heartbeat that talks to a model on its own
+schedule is not something to switch on for someone:
 
 ```yaml
 canary:
-  # The question, and what a correct answer must match. These defaults are the
-  # ones card B was measured with; the capital of France needs one word.
   prompt: "What is the capital of France? Reply with the city name only."
   expect: "Paris"            # a regex, case-insensitive
   maxTokens: 512             # a reasoning model's trace shares this budget
   timeoutMs: 30000
   intervalMs: 30000          # between probes of one model
-  failureThreshold: 2        # consecutive failures before `degraded`
+  failureThreshold: 2        # consecutive failed probes before `degraded`
   recoverAfter: 1            # consecutive clean probes before back in rotation
-  passive: true              # a degenerate real answer brings the next probe forward
+  passive: false             # true: a degenerate real answer brings the next probe forward
 
-  # Which models to ask. Opting in is naming one.
+  # Which models to ask. Naming one is the opt-in; an entry may override any
+  # of the fields above for that model.
   models:
-    gpu2: {}                 # gpt-oss reasons before it answers: give it room
-    gpt-oss:
+    chat: {}
+    reasoner:
       maxTokens: 1024
 
-  # Or an entire backend at once: every model it serves.
+  # Or every model a backend serves.
   # backends:
-  #   cardb: {}
+  #   main: {}
 
-  notify:
-    url: "http://192.168.1.3:9876/api/notifications"
-    headers:
-      x-api-key: "env:UNRAID_API_KEY"   # env:NAME keeps the key out of the file
-    timeoutMs: 5000
+  # notify:
+  #   url: "https://example.com/hooks/hearth"
+  #   headers:
+  #     Authorization: "env:HOOK_TOKEN"   # env:NAME keeps a secret out of the file
+  #   timeoutMs: 5000
 
-  recovery:
-    unload: true             # drop just that model; the next request reloads it
-    cooldownMs: 600000
+  # recovery:
+  #   unload: true
+  #   cooldownMs: 600000
 ```
 
-A probe is a real chat completion through the model's own lane, at the warm
-lane's lowest priority, so it yields to everything real. It is skipped — never
-queued, never retried in a loop — when the seat is busy or the model is not
-resident. **A canary never loads a model and never evicts one**: probing a cold
-model through llama-swap would load it, so a cold model is simply not asked, and
-the probe job is submitted without a hardware claim so it cannot clear a
-neighbour off the card.
+Everything but `models` (or `backends`) has the default shown. The question and
+the pattern are yours to change: anything with one short, checkable answer works.
+
+A probe is a real chat completion, queued on the model's backend at the lowest
+priority, so it yields to everything real. It is skipped, never queued behind
+work and never retried in a loop, when the backend is busy or the model is not
+loaded. **A probe never loads a model and never evicts one**: a cold model is
+not asked, and the probe takes no hardware claim.
 
 ### What a verdict means
-
-Each answer is one of:
 
 | reason | what it means | counts? |
 |---|---|---|
@@ -453,97 +450,87 @@ Each answer is one of:
 | `degenerate` | one character or one token repeated, near-zero distinct characters, or the token cap reached without answering | yes |
 | `missing` | a real answer that does not answer the question | yes |
 | `transport` / `timeout` | the request failed or ran past `timeoutMs` | yes |
-| `thinking` | the budget went to the reasoning channel and `content` is empty — the probe asked for too little | **no** |
+| `thinking` | the budget went to the reasoning channel and `content` is empty: the probe asked for too little | **no** |
 | `skipped` | the probe could not take a lane | **no** |
 
-The last two are the ones that keep this from being a false-alarm generator. A
-reasoning model given 16 tokens to answer in will produce an empty `content`
-with `finish_reason: length` while being perfectly healthy; that is our mistake
-and it is reported as inconclusive. So is a full queue. Neither degrades a seat.
+The last two are inconclusive rather than failures. A reasoning model given too
+few tokens returns an empty `content` with `finish_reason: length` while being
+healthy, and a full queue says nothing about the model. Neither degrades one;
+raise `maxTokens` for a model that keeps reading `thinking`.
 
-`passive: true` watches completions **as they are relayed**. A degenerate one
-is a suspicion, not a count: it brings the next probe forward to the next tick
-(about a second) instead of the next interval, and the canary's own question is
-what decides. Real traffic alone never takes a model out of rotation — a
-client's prompt can legitimately draw a wall of one character, and two of
-those must not refuse the model to everyone else. It observes, it does not
-filter: the bytes reach the client unchanged and undelayed, and a mangled
-answer is still the client's to see.
+`passive: true` also reads completions **as they are relayed** to clients. A
+degenerate one is a suspicion, not a count: it brings the next probe forward to
+the next tick (about a second) instead of the next interval, and the probe
+decides. Real traffic alone never takes a model out of rotation, because a
+client's own prompt can legitimately draw a wall of one character. Nothing is
+filtered, buffered or delayed: the bytes reach the client as they were.
 
 ### When a model is degraded
 
-New requests get a fast `503` instead of junk, with the facts attached:
+After `failureThreshold` consecutive failed probes, new requests for that model
+get a `503` with the facts attached, on `/v1/chat/completions` and on any
+passthrough path that names the model:
 
 ```json
 {"error":{
-  "message":"model \"gpu2\" is degraded on cardb: the answer repeats itself (200 of the same character in a row) (since 2026-10-07T23:10:04.221Z). hearth refuses new requests rather than serving broken output; it returns to rotation after a clean canary probe.",
+  "message":"model \"chat\" is degraded on main: the answer repeats itself (200 of the same character in a row) (since 2026-01-01T12:00:00.000Z). hearth refuses new requests rather than serving broken output; it returns to rotation after a clean canary probe.",
   "type":"server_error",
   "code":"model_degraded",
-  "model":"gpu2","backend":"cardb",
+  "model":"chat","backend":"main",
   "reason":"degenerate",
   "detail":"the answer repeats itself (200 of the same character in a row)",
   "sample":"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
-  "since":"2026-10-07T23:10:04.221Z",
+  "since":"2026-01-01T12:00:00.000Z",
   "failures":2}}
 ```
 
-`/v1/models` reports it as `status: {value: "degraded"}` rather than `loaded` —
-it is loaded, it is just not answering anything true — with the reason in
-`description`. `/healthz` counts it. The console's **Canary** panel names it,
-shows the sample, and says how long it has been out. Probes continue while
-degraded, and `recoverAfter` consecutive clean ones put it back.
+`/v1/models` reports it as `status: {value: "degraded"}` rather than `loaded`,
+with the reason in `description`. `/healthz` counts it. The console names it in
+a strip under the header on every page. Peers are refused too. Probes continue
+while a model is degraded, and `recoverAfter` consecutive clean ones put it back.
 
-Peers are refused too: a degraded model is out of rotation for everyone.
+### notify
 
-### Telling a human
+`notify` POSTs a JSON body to `url` on each state change, with `headers` sent
+as written. The body is the event and nothing else:
 
-`notify` POSTs a JSON body on every state change. The four fields UnraidClaw's
-notification endpoint reads are always present, so this works as written —
-swap in your own key via `env:` and it belongs in the config file:
-
-```bash
-curl -X POST http://192.168.1.3:9876/api/notifications \
-  -H 'x-api-key: YOUR_KEY' -H 'Content-Type: application/json' \
-  -d '{"title":"hearth: gpu2 is degraded","subject":"gpu2 on cardb is answering, but not with an answer",
-       "description":"... 200 of the same character in a row. It returned: \"!!!!...\"",
-       "importance":"warning"}'
+```json
+{"event":"degraded","node":"box","model":"chat","backend":"main",
+ "reason":"degenerate","detail":"the answer repeats itself (200 of the same character in a row)",
+ "sample":"!!!!!!!!!!!!!!!!","since":"2026-01-01T12:00:00.000Z","failures":2}
 ```
 
-`title`, `subject`, `description` and `importance` carry the prose;
-`event`, `node`, `model`, `backend`, `reason`, `detail`, `sample`, `since`,
-`failures` (and `downMs` on recovery) carry the same thing structured, for
-whatever else you point it at. The hook is fire-and-forget: a webhook that is
+```json
+{"event":"recovered","node":"box","model":"chat","backend":"main",
+ "since":"2026-01-01T12:00:00.000Z","downMs":184000,"probes":7}
+```
+
+hearth does not phrase a title or a message, so a receiver that wants one (a
+chat webhook, a notification API with its own field names) builds it from these
+fields, in whatever sits at `url`. The hook is fire-and-forget: one that is
 slow, wrong or down gets a line in the log and changes nothing else.
 
-### Gentle recovery, and what it actually does
+### recovery
 
-`recovery:` is its own opt-in, off unless declared, and it does exactly one
-thing: for a backend that can drop a single model, ask it to. This is
-llama-swap's own `POST /api/models/unload/<model_id>` (verified against its
-documentation, and held to a contract in `test/kinds.test.ts`) — **not**
-`/api/models/unload`, which clears the whole card and would evict a model that
-was working. The next request for the dropped model reloads it, which is the
-point: reloading is the gentlest thing that might fix a wedged seat.
+`recovery:` is its own opt-in and does one thing: for a backend that can drop a
+single model, ask it to, so the next request reloads it. On llama-swap this is
+`POST /api/models/unload/<model_id>`, never `/api/models/unload`, which clears
+every model the backend holds.
 
-It is attempted at most once per `cooldownMs`, only while the model is resident,
-and **never on a busy seat** — no running job, nothing queued. The probe that
-follows is allowed to load the model back, but only while the card is otherwise
-empty, so the reload cannot evict a neighbour that real traffic loaded in the
-meantime. If the card is not free the reload waits and is logged; the model stays
-degraded and the human has already been told.
+It is attempted at most once per `cooldownMs`, only while the model is loaded,
+and never on a busy backend: no running job, nothing queued. The probe that
+follows is the one probe allowed to load the model back. It claims the hardware
+the way a request does, and waits while anything else is loaded there, so the
+reload cannot evict a neighbour.
 
-If the backend cannot drop one model — `kind: vllm`, `ollama`, `single`, `none`
-— recovery is inert and the log says so. Recovery then means "notify only". For a
-seat where the whole process is wedged, restarting it is the operator's call, not
-hearth's.
+A backend that cannot drop one model (`kind: ollama`, `single`, `none`) makes
+recovery inert, and the log says so. Restarting a backend that is wedged as a
+whole is the operator's call.
 
 ### What it costs
 
-One small completion per watched model per `intervalMs`, only while that model is
-resident and the seat is idle — a handful of tokens, through the lowest-priority
-lane. With the defaults above that is one probe every 30s per model, and none at
-all while the seat is busy. Nothing is sent when no canary is configured, and
-nothing about the passthrough paths changes.
+One small completion per watched model per `intervalMs`, only while that model
+is loaded and its backend is idle. Nothing is sent when no canary is configured.
 
 ## The status page
 

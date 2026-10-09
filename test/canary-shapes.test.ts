@@ -11,7 +11,7 @@
  *     deltas, so nothing was extracted from it and only a crude raw-byte run
  *     check applied — `! ! ! !` spaced out slipped straight through;
  *   - the reasoning spellings a reasoning model actually uses
- *     (`reasoning_content`, `reasoning`), which are the channel gpt-oss fills.
+ *     (`reasoning_content`, `reasoning`), which are the channels a reasoning model fills.
  *
  * One case per shape, and a good answer in each shape that must not be flagged.
  *
@@ -23,7 +23,7 @@ import { StreamWatch } from "../src/canary.js";
 
 /** A degenerate answer that has NO long run of one character: 120 `!` spaced out. */
 const SPACED = "! ".repeat(60);
-/** The incident: one character, repeated past every threshold. */
+/** One character, repeated past every threshold. */
 const SOLID = "!".repeat(200);
 
 const frame = (body: unknown): string => `data: ${JSON.stringify(body)}\n\n`;

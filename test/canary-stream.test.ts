@@ -26,7 +26,7 @@ const delta = (content: string): string =>
 const reasoning = (text: string): string =>
   `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: text } }] })}\n\n`;
 
-// --- the incident, streamed -------------------------------------------------
+// --- 200 of one character, streamed -----------------------------------------
 // 200 `!` arrive as ten deltas of twenty. The first delta already carries a run
 // past the threshold, so the flag lands mid-stream rather than at the end.
 {
