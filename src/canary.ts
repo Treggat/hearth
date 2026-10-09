@@ -1,26 +1,34 @@
 /**
- * Noticing a seat that answers 200 with nothing worth reading.
+ * Noticing a model that answers 200 with nothing worth reading.
  *
- * Card B's vLLM returned HTTP 200 and 200 `!` characters for every request for
- * hours while hearth, llama-swap and the vLLM metrics all looked healthy. Every
- * check in the stack asked "did bytes arrive", and the bytes arrived. The answer
- * that would have caught it is not "is it up" but "does it still know anything":
- * ask a question with one right answer, in a handful of tokens, and look at what
- * comes back.
+ * A backend can be reachable, hold its model and return HTTP 200 while every
+ * answer is empty or the same character repeated. Checks that ask "did bytes
+ * arrive" pass, because the bytes arrive. The check that catches it asks "does
+ * it still know anything": a question with one right answer, in a handful of
+ * tokens, and a look at what comes back.
  *
- * This module is the policy half, and it holds no sockets:
- *   - `analyseAnswer` judges one final answer against an expected pattern.
- *   - `DegenerateScan` watches a stream as it is proxied, without buffering it.
- *   - `Canary` schedules the probes, keeps the per-model state, and runs the
- *     state change hooks. Everything about the backend (is it warm, is it busy,
- *     how do I call it) is supplied by the host, so the state machine can be
+ * Two halves, in this order:
+ *   - The policy, which holds no sockets. `analyseAnswer` judges one final
+ *     answer against an expected pattern, `DegenerateScan` reads a stream as it
+ *     is proxied without buffering it, and `Canary` schedules the probes and
+ *     keeps the per-model state. Everything about a backend (is it warm, is it
+ *     busy, how is it asked) is supplied to it, so the state machine can be
  *     driven in a test with no HTTP at all.
+ *   - The host half, at the bottom: `createCanary` supplies those things from a
+ *     running node's pool, `askModel` sends the probe, `webhook` posts a state
+ *     change, and `degradedError` words the refusal.
  *
  * Off unless `canary:` is configured, because a heartbeat that talks to a model
  * on its own schedule is not something to switch on for someone.
  */
-import type { CanaryConfig, CanaryProbe } from "./config.js";
+import { Transform } from "node:stream";
+
+import { WARM_LANE, type CanaryConfig, type CanaryNotify, type CanaryProbe, type HearthConfig } from "./config.js";
+import { KINDS } from "./kinds.js";
 import type { Logger } from "./log.js";
+import type { BackendPool, BackendSlot } from "./pool.js";
+import { send } from "./upstream.js";
+import type { CanaryView } from "./views.js";
 
 /**
  * Why an answer failed to pass, or that it did. `ok` is the only good one;
@@ -737,6 +745,38 @@ export class Canary {
     return n;
   }
 
+  /** What the status page draws. */
+  page(): CanaryView {
+    return {
+      enabled: true,
+      passive: this.cfg.passive,
+      recovery: this.cfg.recovery?.unload ?? false,
+      models: Object.fromEntries(this.snapshot().map((m) => [m.model, {
+        backend: m.backend,
+        health: m.health,
+        failures: m.failures,
+        lastProbeAt: m.lastProbeAt,
+        lastProbeMs: m.lastProbeMs,
+        reason: m.degraded?.reason ?? null,
+        detail: m.degraded?.detail ?? null,
+        sample: m.degraded?.sample ?? null,
+        since: m.degraded?.since ?? null,
+        reloadPending: m.reloadPending,
+        recoveryCount: m.recoveryCount,
+      }])),
+    };
+  }
+
+  /**
+   * A watcher for one answer being relayed to a client, or undefined when
+   * `passive` is off or nobody asked about this model. See RelayWatch.
+   */
+  watchRelay(model: string | undefined, backend: string, contentType?: string | string[]): RelayWatch | undefined {
+    if (!this.cfg.passive || model === undefined || !this.watches(model, backend)) return undefined;
+    const type = Array.isArray(contentType) ? contentType[0] : contentType;
+    return new RelayWatch(new StreamWatch(type), (hit) => this.observePassive(model, backend, hit));
+  }
+
   /**
    * A degenerate completion seen in real traffic. It is a suspicion, never a count: a
    * client's own prompt can legitimately draw a wall of one character, and two of those
@@ -1019,4 +1059,296 @@ export class Canary {
       recoveryCount: st.recoveryCount,
     };
   }
+}
+
+/**
+ * One relayed answer, observed on its way to the client. `through()` goes in
+ * the pipe and writes every chunk straight on, never holding or altering one;
+ * `end()` is called once the answer is complete, the only moment a non-streamed
+ * body can be read at all. A degenerate answer is reported once, and nothing
+ * here can break the relay.
+ */
+export class RelayWatch {
+  private reported = false;
+
+  constructor(
+    private readonly watch: StreamWatch,
+    private readonly report: (hit: Verdict) => void,
+  ) {}
+
+  through(): Transform {
+    return new Transform({
+      transform: (chunk: Buffer, _encoding, done) => {
+        // Mid-stream rather than at the end: a long answer is known bad early.
+        this.look(() => {
+          this.watch.feed(chunk);
+          return this.watch.verdict();
+        });
+        done(null, chunk);
+      },
+    });
+  }
+
+  end(): void {
+    this.look(() => this.watch.finish());
+  }
+
+  private look(read: () => Verdict | null): void {
+    if (this.reported) return;
+    try {
+      const hit = read();
+      if (hit === null) return;
+      this.reported = true;
+      this.report(hit);
+    } catch {
+      // Observing must never be able to break the relay.
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The host half: what a running node supplies.
+// ---------------------------------------------------------------------------
+
+/**
+ * The canary for a node, or null when `canary:` is not configured. The state
+ * machine cannot know how to ask a backend something, whether a seat is free,
+ * or how to drop one model; this reads all three from the pool.
+ */
+export function createCanary(cfg: HearthConfig, pool: BackendPool, log: Logger): Canary | null {
+  const conf = cfg.canary;
+  if (conf === null) return null;
+
+  const target = (slot: BackendSlot, id: string): ProbeTarget => {
+    const wire = pool.outboundId(id);
+    const mine = slot.scheduler.capacityFor(id);
+    const back = slot.scheduler.capacity();
+    const waiting = Object.values(back.queued).reduce((a, b) => a + b, 0);
+    return {
+      model: id,
+      backend: slot.name,
+      wire,
+      canUnload: slot.state.canUnload(),
+      warm: slot.state.isWarm(wire),
+      // Nothing running and nothing waiting: the seat is free to be nudged.
+      idle: back.running === 0 && waiting === 0,
+      ready: mine.free > 0 && waiting === 0,
+      loadedCount: slot.state.loaded().length,
+      probe: (spec, signal, load) => queued(slot, id, spec, signal, load),
+      unload: () => unloadOne(slot, wire),
+    };
+  };
+
+  /** One probe, through the model's own backend queue at the lowest priority. */
+  const queued = async (
+    slot: BackendSlot, id: string, spec: CanaryProbe, signal: AbortSignal, load: boolean,
+  ): Promise<Verdict> => {
+    let out: Verdict | null = null;
+    try {
+      await slot.scheduler.submit(
+        // No hardware claim for an ordinary probe: it queues and yields like any
+        // job, but it can neither take the card nor clear a neighbour off one.
+        // A recovery reload is the one probe that LOADS, so it claims the card
+        // like a real request would, through the arbiter, which clears or
+        // waits for whatever else holds it, rather than loading around it.
+        { lane: WARM_LANE, model: id, caller: "canary", signal, claimHardware: load },
+        async () => {
+          const body = pool.outboundBody(id, probeBody(pool.outboundId(id), spec));
+          out = await askModel(slot.cfg.url, body, spec, signal);
+        },
+      );
+    } catch (e) {
+      // Could not take a lane. That is our scheduling, not the seat's health.
+      return {
+        reason: "skipped", ok: false, failure: false, sample: "",
+        detail: `the probe did not get a lane: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+    return out ?? { reason: "skipped", ok: false, failure: false, sample: "", detail: "the probe did not run" };
+  };
+
+  /** Drop just this model, then re-read the backend so the reload is seen as a real load. */
+  const unloadOne = async (slot: BackendSlot, wire: string): Promise<boolean> => {
+    const fn = KINDS[slot.cfg.kind].unloadModel;
+    if (fn === undefined) return false;
+    const dropped = await fn(slot.cfg.url, wire, log);
+    if (dropped) void slot.state.refresh().catch(() => {});
+    return dropped;
+  };
+
+  const canary: Canary = new Canary({
+    cfg: conf,
+    log,
+    ...(conf.notify ? { notify: webhook(conf.notify, cfg.name, log) } : {}),
+    /** Every model opted in, on the backend that would serve it. Recomputed each tick. */
+    targets: () => {
+      const out: ProbeTarget[] = [];
+      const seen = new Set<string>();
+      const add = (slot: BackendSlot, id: string): void => {
+        if (seen.has(id) || !canary.watches(id, slot.name)) return;
+        seen.add(id);
+        out.push(target(slot, id));
+      };
+      // Every model a backend offers, whether it declared the list or the backend
+      // advertises it, plus any id config routes here. `watches` is what actually
+      // opts a model in; this only has to not miss one.
+      for (const slot of pool.all()) {
+        const offered = slot.cfg.serves.length > 0
+          ? slot.cfg.serves
+          : slot.state.catalog().map((wire) => pool.advertised(wire));
+        for (const id of offered) add(slot, id);
+        for (const [id, route] of Object.entries(cfg.models)) {
+          if (route.backend === slot.name) add(slot, id);
+        }
+      }
+      // A model named outright, on whichever backend would serve it.
+      for (const id of Object.keys(conf.models)) {
+        if (seen.has(id) || !pool.catalog().includes(id)) continue;
+        add(pool.for(id), id);
+      }
+      return out;
+    },
+  });
+  return canary;
+}
+
+/** The chat completion a probe sends. */
+function probeBody(wire: string, spec: CanaryProbe): Record<string, unknown> {
+  return {
+    model: wire,
+    messages: [{ role: "user", content: spec.prompt }],
+    max_tokens: spec.maxTokens,
+    // A canary must be as reproducible as the backend allows.
+    temperature: 0,
+    stream: false,
+  };
+}
+
+/** The expectation, compiled once per pattern: probes run on a timer and the regex never changes. */
+const patterns = new Map<string, RegExp>();
+function pattern(expect: string): RegExp {
+  let re = patterns.get(expect);
+  if (re === undefined) {
+    re = new RegExp(expect, "i");
+    patterns.set(expect, re);
+  }
+  return re;
+}
+
+/** Ask the question and judge the answer. Never throws: a fault is a verdict. */
+export async function askModel(
+  url: string, body: Record<string, unknown>, spec: CanaryProbe, signal: AbortSignal,
+): Promise<Verdict> {
+  let up;
+  try {
+    up = await send(`${url}/v1/chat/completions`, { json: body, signal, headersTimeoutMs: spec.timeoutMs });
+  } catch (e) {
+    return signal.aborted
+      ? { reason: "timeout", ok: false, failure: true, sample: "", detail: `no answer within ${spec.timeoutMs}ms` }
+      : { reason: "transport", ok: false, failure: true, sample: "", detail: e instanceof Error ? e.message : String(e) };
+  }
+  const text = await up.text().catch(() => "");
+  if (!up.ok) {
+    return {
+      reason: "transport", ok: false, failure: true, sample: text.slice(0, 80),
+      detail: `the backend answered ${up.status}`,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {
+      reason: "transport", ok: false, failure: true, sample: text.slice(0, 80),
+      detail: "the backend did not answer with JSON",
+    };
+  }
+  const reading = readCompletion(parsed);
+  if (reading === null) {
+    return {
+      reason: "empty", ok: false, failure: true, sample: text.slice(0, 80),
+      detail: "the answer had no choices to read",
+    };
+  }
+  return analyseAnswer(reading, pattern(spec.expect));
+}
+
+/**
+ * What `notify` POSTs: the state change as data, and nothing phrased for one
+ * receiver. Times are ISO strings. A receiver that wants a title or a sentence
+ * builds it from these.
+ */
+export function eventBody(node: string, event: CanaryEvent): Record<string, unknown> {
+  const since = new Date(event.since).toISOString();
+  return event.event === "degraded"
+    ? {
+      event: "degraded", node, model: event.model, backend: event.backend,
+      reason: event.reason, detail: event.detail, sample: event.sample,
+      since, failures: event.failures,
+    }
+    : {
+      event: "recovered", node, model: event.model, backend: event.backend,
+      since, downMs: event.downMs, probes: event.probes,
+    };
+}
+
+/**
+ * Posts each state change to the configured webhook. Fire and forget: a hook
+ * that is slow, wrong or down gets a line in the log and touches nothing else.
+ */
+export function webhook(hook: CanaryNotify, node: string, log: Logger): (event: CanaryEvent) => void {
+  const post = async (payload: Record<string, unknown>): Promise<void> => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), hook.timeoutMs);
+    timer.unref?.();
+    try {
+      const res = await fetch(hook.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...hook.headers },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+      // Drained so the socket can be reused, and a 4xx is worth a line.
+      await res.text().catch(() => "");
+      if (!res.ok) log.warn("canary.notify_rejected", { url: hook.url, status: res.status });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  return (event) => {
+    void post(eventBody(node, event)).catch((e) => {
+      log.warn("canary.notify_failed", {
+        url: hook.url, event: event.event,
+        detail: e instanceof Error ? e.message : String(e),
+      });
+    });
+  };
+}
+
+/**
+ * The 503 a degraded model answers with. A model returning 200 with nothing
+ * worth reading costs every caller a confusing failure of their own; one
+ * refusal that names the model, the fault, a sample of what came back and since
+ * when costs them one clear one.
+ */
+export function degradedError(
+  model: string, backend: string, sick: DegradedInfo,
+): { message: string; fields: Record<string, unknown> } {
+  const since = new Date(sick.since).toISOString();
+  return {
+    message:
+      `model "${model}" is degraded on ${backend}: ${sick.detail} (since ${since}). ` +
+      `hearth refuses new requests rather than serving broken output; it returns to ` +
+      `rotation after a clean canary probe.`,
+    fields: {
+      code: "model_degraded",
+      model,
+      backend,
+      reason: sick.reason,
+      detail: sick.detail,
+      sample: sick.sample,
+      since,
+      failures: sick.failures,
+    },
+  };
 }

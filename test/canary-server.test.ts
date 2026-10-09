@@ -1,11 +1,12 @@
 /**
- * The incident, end to end, through a real hearth on a loopback socket.
+ * A model that answers 200 with nothing, end to end, through a real hearth on a
+ * loopback socket.
  *
- * A fake llama-swap answers every completion with HTTP 200 and 200 `!`, which is
- * exactly what card B did for hours. Everything around the model was healthy:
- * the backend was up, the model was resident, the stream connected. The only
- * thing that can tell the difference between that and a working seat is asking
- * it something with a right answer — which is what this asserts:
+ * A fake llama-swap answers every completion with HTTP 200 and 200 `!`.
+ * Everything around the model is healthy: the backend is up, the model is
+ * resident, the stream connected. The only thing that can tell that from a
+ * working seat is asking it something with a right answer, which is what this
+ * asserts:
  *
  *   detect -> degraded -> a fast, explicit 503 to the next client -> notify ->
  *   one gentle unload -> the model answered again -> back in rotation.
@@ -162,7 +163,7 @@ async function chat(base: string, stream = false) {
 }
 
 // ===========================================================================
-// The incident: 200 `!` must stop being called healthy
+// 200 `!` must stop being called healthy
 // ===========================================================================
 {
   const swap = fakeSwap();
@@ -188,14 +189,17 @@ async function chat(base: string, stream = false) {
   assert.equal(told.event, "degraded");
   assert.equal(told.model, "m");
   assert.equal(told.reason, "degenerate");
-  assert.ok(String(told.title).includes("m"), `the title names the model, got ${JSON.stringify(told.title)}`);
-  assert.ok(String(told.description).includes("!"), "the description carries a sample of the bad output");
-  // The four fields UnraidClaw's notification endpoint reads, so the documented
-  // example works without a second format.
-  assert.ok(String(told.title).length > 0);
-  assert.ok(String(told.subject).length > 0);
-  assert.ok(String(told.description).length > 0);
-  assert.equal(typeof told.importance, "string");
+  // The event as data, and nothing phrased for one receiver: whoever takes the
+  // hook builds their own title or sentence from these.
+  assert.deepEqual(
+    Object.keys(told).sort(),
+    ["backend", "detail", "event", "failures", "model", "node", "reason", "sample", "since"],
+  );
+  assert.equal(told.node, "canary-e2e");
+  assert.equal(told.backend, "cardb");
+  assert.ok(String(told.sample).startsWith("!"), "the sample is the bad output");
+  assert.ok(!Number.isNaN(Date.parse(String(told.since))), "since is an ISO timestamp");
+  assert.equal(told.failures, 2);
   assert.equal(hook.headers[0]!.key, "test-key", "the configured header is sent");
 
   // --- the client gets an explicit error, not junk --------------------------
@@ -226,13 +230,16 @@ async function chat(base: string, stream = false) {
     (hook.got.find((e) => e.event === "recovered") ?? null));
   assert.equal(recovered.model, "m");
   assert.ok(Number(recovered.downMs) >= 0, "and can say how long it was out");
+  assert.deepEqual(
+    Object.keys(recovered).sort(),
+    ["backend", "downMs", "event", "model", "node", "probes", "since"],
+  );
 
   // --- the unauthenticated health endpoint counts, and does not name --------
   const hz = (await (await fetch(`${base}/healthz`)).json()) as {
     ok: boolean; canary?: { degraded: number };
   };
-  assert.ok(hz.canary, "healthz carries a canary block");
-  assert.equal(typeof hz.canary!.degraded, "number", "as a count");
+  assert.deepEqual(hz.canary, { degraded: 0 }, "with a canary configured, healthz carries its count and nothing else");
   const rawHz = await (await fetch(`${base}/healthz`)).text();
   assert.ok(!rawHz.includes("\"m\""), "and never as a model name");
 

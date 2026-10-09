@@ -3,21 +3,13 @@
  * protocol. Bodies stream through untouched; only the model id and stream flag are read.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
-import {
-  analyseAnswer, Canary, readCompletion, StreamWatch,
-  type CanaryEvent, type DegradedInfo, type ProbeTarget, type Verdict,
-} from "./canary.js";
-import {
-  peersMapping, WARM_LANE,
-  type BackendConfig, type CanaryProbe, type HearthConfig, type RoutePolicy,
-} from "./config.js";
+import { createCanary, degradedError, type RelayWatch } from "./canary.js";
+import { peersMapping, WARM_LANE, type BackendConfig, type HearthConfig, type RoutePolicy } from "./config.js";
 import { Controls } from "./controls.js";
-import { KINDS } from "./kinds.js";
 import { emulatedRequest, relayEmulated, streamErrorFrame } from "./emulate.js";
 import { ConfigFile, ConfigRefusal, deepFreeze, link, setNote, setShare, unlink } from "./configfile.js";
 import { COOKIE, LoginThrottle, OperatorSessions, SESSION_TTL_MS, cookieToken, hashPassword, verifyDecoy, verifyPassword } from "./login.js";
@@ -152,221 +144,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   if (cfg.stateFile) config.migrateSidecar(cfg.stateFile);
   const peers = new PeerRegistry(cfg, log, controls);
 
-  /**
-   * The opt-in canary, or null when `canary:` is not configured. It owns the
-   * schedule and the per-model verdict; this file supplies the two things it
-   * cannot know — how to ask a backend something, and how to drop one model.
-   */
-  const canary = cfg.canary === null ? null : new Canary({
-    cfg: cfg.canary,
-    log,
-    targets: canaryTargets,
-    notify: notifyHuman,
-  });
-
-  /** The models the canary watches, with everything the state machine needs to judge a probe. */
-  function canaryTargets(): ProbeTarget[] {
-    if (canary === null || cfg.canary === null) return [];
-    const out: ProbeTarget[] = [];
-    const seen = new Set<string>();
-    const add = (slot: BackendSlot, id: string): void => {
-      if (seen.has(id) || !canary.watches(id, slot.name)) return;
-      seen.add(id);
-      const wire = pool.outboundId(id);
-      const mine = slot.scheduler.capacityFor(id);
-      const back = slot.scheduler.capacity();
-      const waiting = Object.values(back.queued).reduce((a, b) => a + b, 0);
-      out.push({
-        model: id,
-        backend: slot.name,
-        wire,
-        canUnload: slot.state.canUnload(),
-        warm: slot.state.isWarm(wire),
-        // Nothing running and nothing waiting: the seat is free to be nudged.
-        idle: back.running === 0 && waiting === 0,
-        ready: mine.free > 0 && waiting === 0,
-        loadedCount: slot.state.loaded().length,
-        probe: (spec, signal, load) => runCanaryProbe(slot, id, spec, signal, load),
-        unload: () => unloadOneModel(slot, wire),
-      });
-    };
-    // Every model a backend offers, whether it declared the list or the backend
-    // advertises it, plus any id config routes here. `watches` is what actually
-    // opts a model in; this only has to not miss one.
-    for (const slot of pool.all()) {
-      const offered = slot.cfg.serves.length > 0
-        ? slot.cfg.serves
-        : slot.state.catalog().map((wire) => pool.advertised(wire));
-      for (const id of offered) add(slot, id);
-      for (const [id, route] of Object.entries(cfg.models)) {
-        if (route.backend === slot.name) add(slot, id);
-      }
-    }
-    // A model named outright, on whichever backend would serve it.
-    for (const id of Object.keys(cfg.canary.models)) {
-      if (seen.has(id)) continue;
-      if (!pool.catalog().includes(id)) continue;
-      add(pool.for(id), id);
-    }
-    return out;
-  }
-
-  /** One probe, through the model's own lane at the lowest priority. */
-  async function runCanaryProbe(
-    slot: BackendSlot, id: string, spec: CanaryProbe, signal: AbortSignal, load: boolean,
-  ): Promise<Verdict> {
-    let out: Verdict | null = null;
-    try {
-      await slot.scheduler.submit(
-        // No hardware claim for an ordinary probe: it queues and yields like any
-        // job, but it can neither take the card nor clear a neighbour off one.
-        // A recovery reload is the one probe that LOADS, so it claims the card
-        // like a real request would — through the arbiter, which clears or
-        // waits for whatever else holds it — rather than loading around it.
-        { lane: WARM_LANE, model: id, caller: "canary", signal, claimHardware: load },
-        async () => { out = await probeBackend(slot, id, spec, signal); },
-      );
-    } catch (e) {
-      // Could not take a lane. That is our scheduling, not the seat's health.
-      return {
-        reason: "skipped", ok: false, failure: false, sample: "",
-        detail: `the probe did not get a lane: ${e instanceof Error ? e.message : String(e)}`,
-      };
-    }
-    return out ?? { reason: "skipped", ok: false, failure: false, sample: "", detail: "the probe did not run" };
-  }
-
-  /** Ask the question and judge the answer. Never throws: a fault is a verdict. */
-  async function probeBackend(
-    slot: BackendSlot, id: string, spec: CanaryProbe, signal: AbortSignal,
-  ): Promise<Verdict> {
-    const payload: Record<string, unknown> = {
-      model: pool.outboundId(id),
-      messages: [{ role: "user", content: spec.prompt }],
-      max_tokens: spec.maxTokens,
-      // A canary must be as reproducible as the seat allows.
-      temperature: 0,
-      stream: false,
-    };
-    const body = pool.outboundBody(id, payload);
-    let up;
-    try {
-      up = await send(`${slot.cfg.url}/v1/chat/completions`, {
-        json: body,
-        signal,
-        headersTimeoutMs: spec.timeoutMs,
-      });
-    } catch (e) {
-      return signal.aborted
-        ? { reason: "timeout", ok: false, failure: true, sample: "", detail: `no answer within ${spec.timeoutMs}ms` }
-        : { reason: "transport", ok: false, failure: true, sample: "", detail: e instanceof Error ? e.message : String(e) };
-    }
-    const text = await up.text().catch(() => "");
-    if (!up.ok) {
-      return {
-        reason: "transport", ok: false, failure: true, sample: text.slice(0, 80),
-        detail: `the backend answered ${up.status}`,
-      };
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      return {
-        reason: "transport", ok: false, failure: true, sample: text.slice(0, 80),
-        detail: "the backend did not answer with JSON",
-      };
-    }
-    const reading = readCompletion(parsed);
-    if (reading === null) {
-      return {
-        reason: "empty", ok: false, failure: true, sample: text.slice(0, 80),
-        detail: "the answer had no choices to read",
-      };
-    }
-    return analyseAnswer(reading, canaryPattern(spec.expect));
-  }
-
-  /** The expectation, compiled once per pattern: probes run on a timer and the regex never changes. */
-  const patterns = new Map<string, RegExp>();
-  function canaryPattern(expect: string): RegExp {
-    let re = patterns.get(expect);
-    if (re === undefined) {
-      re = new RegExp(expect, "i");
-      patterns.set(expect, re);
-    }
-    return re;
-  }
-
-  /** Drop just this model, then re-read the backend so the reload is seen as a real load. */
-  async function unloadOneModel(slot: BackendSlot, wire: string): Promise<boolean> {
-    const fn = KINDS[slot.cfg.kind].unloadModel;
-    if (fn === undefined) return false;
-    const dropped = await fn(slot.cfg.url, wire, log);
-    if (dropped) void slot.state.refresh().catch(() => {});
-    return dropped;
-  }
-
-  /**
-   * Post a state change to the configured webhook. Fire and forget: a hook that
-   * is slow, wrong or down is not allowed to touch the proxy.
-   */
-  function notifyHuman(event: CanaryEvent): void {
-    const hook = cfg.canary?.notify;
-    if (hook === undefined || hook === null) return;
-    const since = new Date(event.event === "degraded" ? event.since : event.since).toISOString();
-    const where = `${event.model} on ${event.backend}`;
-    // `title`/`subject`/`description`/`importance` are UnraidClaw's notification
-    // body, so the documented example works as written; the rest is for anything else.
-    const payload: Record<string, unknown> = event.event === "degraded"
-      ? {
-        title: `hearth: ${event.model} is degraded`,
-        subject: `${where} is answering, but not with an answer`,
-        description:
-          `hearth (${cfg.name}) took ${event.model} out of rotation after ${event.failures} failed ` +
-          `canary checks: ${event.detail}. Since ${since}. It returned: ${JSON.stringify(event.sample)}. ` +
-          `New requests get 503 until a clean probe; recovery is ${cfg.canary?.recovery ? "on" : "not configured"}.`,
-        importance: "warning",
-        event: "degraded", node: cfg.name, model: event.model, backend: event.backend,
-        reason: event.reason, detail: event.detail, sample: event.sample,
-        since, failures: event.failures,
-      }
-      : {
-        title: `hearth: ${event.model} recovered`,
-        subject: `${where} is answering correctly again`,
-        description:
-          `hearth (${cfg.name}) put ${event.model} back in rotation after a clean canary probe. ` +
-          `It was out for ${Math.round(event.downMs / 1000)}s, from ${since}.`,
-        importance: "normal",
-        event: "recovered", node: cfg.name, model: event.model, backend: event.backend,
-        since, downMs: event.downMs, probes: event.probes,
-      };
-    void post(hook, payload).catch((e) => {
-      log.warn("canary.notify_failed", {
-        url: hook.url, event: event.event,
-        detail: e instanceof Error ? e.message : String(e),
-      });
-    });
-  }
-
-  async function post(hook: { url: string; headers: Record<string, string>; timeoutMs: number }, payload: Record<string, unknown>): Promise<void> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), hook.timeoutMs);
-    timer.unref?.();
-    try {
-      const res = await fetch(hook.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...hook.headers },
-        body: JSON.stringify(payload),
-        signal: ctrl.signal,
-      });
-      // Drained so the socket can be reused, and a 4xx is worth a line.
-      await res.text().catch(() => "");
-      if (!res.ok) log.warn("canary.notify_rejected", { url: hook.url, status: res.status });
-    } finally {
-      clearTimeout(timer);
-    }
-  }
+  /** The opt-in canary, or null when `canary:` is not configured. */
+  const canary = createCanary(cfg, pool, log);
 
   /** What we lend right now: `share:` while lending is on, nothing while paused. Every share gate reads this. */
   const shared = (): readonly string[] => controls.share(cfg.share);
@@ -452,45 +231,20 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   }
 
   /**
-   * The fast, explicit error a degraded model owes a client.
-   *
-   * 200 with nothing worth reading costs every caller a confusing failure of
-   * their own; one 503 that names the model, the fault, a sample of what came
-   * back and since when costs them one clear one. The body carries the facts
-   * rather than only a sentence, because whoever sees this at 3am is the one who
-   * has to decide whether to restart the seat.
-   *
-   * Returned rather than thrown so every door can answer it: the chat route
-   * throws it, the passthrough hands it to `fail`, which already knows the
-   * envelope.
+   * The 503 a degraded model owes a client. Returned rather than thrown so every
+   * door can answer it: the chat route throws it, the passthrough hands it to `fail`.
    */
-  function degradedRefusal(model: string, sick: DegradedInfo): Refusal {
-    const backend = pool.for(model).name;
-    const since = new Date(sick.since).toISOString();
-    return new Refusal(
-      503,
-      `model "${model}" is degraded on ${backend}: ${sick.detail} (since ${since}). ` +
-        `hearth refuses new requests rather than serving broken output; it returns to ` +
-        `rotation after a clean canary probe.`,
-      "server_error",
-      {
-        code: "model_degraded",
-        model,
-        backend,
-        reason: sick.reason,
-        detail: sick.detail,
-        sample: sick.sample,
-        since,
-        failures: sick.failures,
-      },
-    );
+  function degradedRefusal(model: string): Refusal | null {
+    const sick = canary?.refuse(model);
+    if (sick === undefined || sick === null) return null;
+    const { message, fields } = degradedError(model, pool.for(model).name, sick);
+    return new Refusal(503, message, "server_error", fields);
   }
 
   /** Refuse a degraded model on the chat route. */
   function refuseDegraded(model: string): void {
-    const sick = canary?.refuse(model);
-    if (sick === undefined || sick === null) return;
-    throw degradedRefusal(model, sick);
+    const refusal = degradedRefusal(model);
+    if (refusal) throw refusal;
   }
 
   /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
@@ -612,22 +366,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     const sentAt = Date.now();
     const up = await send(`${url}/v1/chat/completions`, { json: emulate ? emulatedRequest(body) : body, ...opts });
     if (emulate) return relayEmulated(up, res, forwardable(up.headers), sentAt);
-    // Real traffic is the best evidence there is: under a broken seat every
-    // request is junk, so one canary interval is a long time to keep serving it.
-    // Observed as it is relayed, never held back — see StreamWatch.
-    const slot = pool.for(model);
-    const watch = canary !== null && cfg.canary?.passive === true && canary.watches(model, slot.name)
-      ? {
-        model, backend: slot.name, reported: false,
-        watcher: new StreamWatch(headerText(up.headers["content-type"])),
-      }
-      : null;
-    return pipeThrough(up, res, watch ?? undefined);
-  }
-
-  /** One header value as a string, whatever the header object says. */
-  function headerText(v: string | string[] | undefined): string | undefined {
-    return Array.isArray(v) ? v[0] : v;
+    // Observed as it is relayed, never held back: see RelayWatch.
+    return pipeThrough(up, res, canary?.watchRelay(model, pool.for(model).name, up.headers["content-type"]));
   }
 
   /** The text-completion paths a relayed answer is worth watching on, with or without an `/upstream/<model>` prefix. */
@@ -661,8 +401,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         await pipeline(up.body, res);
         return up.status;
       }
-      await pipeline(up.body, watcher(watch), res);
-      reportDegenerate(watch);
+      await pipeline(up.body, watch.through(), res);
+      watch.end();
       return up.status;
     }
     res.writeHead(up.status, {
@@ -676,56 +416,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       await pipeline(up.body, res);
       return up.status;
     }
-    await pipeline(up.body, watcher(watch), res);
-    // The response is complete, which is the only moment a non-streamed body
-    // can be judged at all. A stream has already reported mid-flight if it was
-    // going to, and this is a no-op for it.
-    reportDegenerate(watch);
+    await pipeline(up.body, watch.through(), res);
+    watch.end();
     return up.status;
-  }
-
-  /** A relayed answer being watched, and whether its reading has been counted. */
-  interface RelayWatch {
-    model: string;
-    backend: string;
-    watcher: StreamWatch;
-    reported: boolean;
-  }
-
-  /** Count the first degenerate reading of one relayed answer, once. */
-  function reportDegenerate(watch: RelayWatch): void {
-    if (watch.reported) return;
-    try {
-      const hit = watch.watcher.finish();
-      if (hit === null) return;
-      watch.reported = true;
-      canary?.observePassive(watch.model, watch.backend, hit);
-    } catch {
-      // Observing must never be able to break the relay.
-    }
-  }
-
-  /** The observing transform: writes each chunk straight on, never holds or alters one. */
-  function watcher(watch: RelayWatch): Transform {
-    return new Transform({
-      transform(chunk: Buffer, _encoding, done) {
-        if (!watch.reported) {
-          try {
-            watch.watcher.feed(chunk);
-            const hit = watch.watcher.verdict();
-            if (hit !== null) {
-              // Counted the moment it is seen, mid-stream, rather than at the
-              // end: the next request should already be refused.
-              watch.reported = true;
-              canary?.observePassive(watch.model, watch.backend, hit);
-            }
-          } catch {
-            // Observing must never be able to break the relay.
-          }
-        }
-        done(null, chunk);
-      },
-    });
   }
 
   /** Run one completion where it belongs. A peer that fails before the first byte is retried locally. */
@@ -1131,12 +824,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         total: cfg.peers.length,
         up: peers.all().filter((p) => p.up).length,
       },
-      // The canary's verdict, as a count: this endpoint is unauthenticated and
-      // may be bound wide, so it says how many models are out, never which.
-      canary: {
-        enabled: canary !== null,
-        degraded: canary?.degradedCount() ?? 0,
-      },
+      // Only with a canary configured, and as a count: this endpoint is unauthenticated
+      // and may be bound wide, so it says how many models are out, never which.
+      ...(canary ? { canary: { degraded: canary.degradedCount() } } : {}),
     });
     return;
   }
@@ -1610,9 +1300,8 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           const entry: Entry = { id };
           const stats = pool.statsFor(id);
           if (stats?.note) entry.description = stats.note;
-          // A degraded model is loaded and answering — it is just not answering
-          // anything true. Saying "loaded" here would be the same lie the
-          // incident was made of, so the status wins over warmth.
+          // A degraded model is loaded and answering, just not with an answer,
+          // so its status wins over warmth: "loaded" would read as healthy.
           const sick = canary?.refuse(id);
           if (sick) {
             entry.status = { value: "degraded" };
@@ -1914,12 +1603,10 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // `/upstream/<model>/...` all reach the same seat, and an answer of `!!!!`
     // costs the caller just as much there. `asked` is already resolved above —
     // from the path or the body — so this reads nothing new.
-    if (asked !== undefined) {
-      const sick = canary?.refuse(asked);
-      if (sick !== undefined && sick !== null) {
-        fail(res, degradedRefusal(asked, sick));
-        return;
-      }
+    const degraded = asked === undefined ? null : degradedRefusal(asked);
+    if (degraded) {
+      fail(res, degraded);
+      return;
     }
     const named = routed ? undefined : asked;
     const target = routed ? routed.slot : named ? pool.for(named) : pool.first();
@@ -1956,9 +1643,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     // answer of `!!!!` is counted rather than passed by. Only text-completion
     // paths: judging a rerank score or an image as "the model's words" would be
     // inventing a verdict about something that is not an answer.
-    const watching = (backend: string): boolean => canary !== null && cfg.canary?.passive === true
-      && asked !== undefined && canary.watches(asked, backend)
-      && COMPLETION_PATH.test(stripUpstream(path));
+    const watchable = COMPLETION_PATH.test(stripUpstream(path));
 
     const ctrl = new AbortController();
     res.on("close", () => {
@@ -1981,12 +1666,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       }
       // Watched on the backend actually used: a declared route may fall back to
       // a spare, and the label has to be the one that answered.
-      await pipeThrough(up, res, watching(to.name)
-        ? {
-          model: asked!, backend: to.name, reported: false,
-          watcher: new StreamWatch(headerText(up.headers["content-type"])),
-        }
-        : undefined);
+      await pipeThrough(up, res, watchable ? canary?.watchRelay(asked, to.name, up.headers["content-type"]) : undefined);
     };
 
     try {
@@ -2210,28 +1890,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   const proxying = new Set<{ id: string; backend: string; model: string | null }>();
   const { uiPayload, networkView } = createViews({
     cfg, pool, peers, history, controls, config, shared, proxying, writeMode,
-    // The page draws the canary whether or not it is on, so "not configured"
-    // and "configured and quiet" are not the same blank tile.
-    canary: () => ({
-      enabled: canary !== null,
-      passive: cfg.canary?.passive ?? false,
-      recovery: cfg.canary?.recovery !== null && cfg.canary?.recovery !== undefined
-        ? cfg.canary.recovery.unload
-        : false,
-      models: Object.fromEntries((canary?.snapshot() ?? []).map((m) => [m.model, {
-        backend: m.backend,
-        health: m.health,
-        failures: m.failures,
-        lastProbeAt: m.lastProbeAt,
-        lastProbeMs: m.lastProbeMs,
-        reason: m.degraded?.reason ?? null,
-        detail: m.degraded?.detail ?? null,
-        sample: m.degraded?.sample ?? null,
-        since: m.degraded?.since ?? null,
-        reloadPending: m.reloadPending,
-        recoveryCount: m.recoveryCount,
-      }])),
-    }),
+    // Drawn whether or not it is on, so "not configured" and "configured and
+    // quiet" are not the same blank tile.
+    canary: () => canary?.page() ?? { enabled: false, passive: false, recovery: false, models: {} },
   });
 
   /** Expired sessions, swept like any other in-memory state; unref'd so it never holds the process. */
