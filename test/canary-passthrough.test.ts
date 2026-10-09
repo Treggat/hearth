@@ -28,7 +28,7 @@ type Mode = "bad" | "split" | "good";
 
 function fakeSwap() {
   let mode: Mode = "bad";
-  const counts = { completions: 0, upstream: 0, embeddings: 0 };
+  const counts = { completions: 0, upstream: 0, embeddings: 0, canaryChats: 0 };
   const s = createServer((req, res) => {
     const path = new URL(req.url ?? "/", "http://x").pathname;
     const j = (b: unknown, code = 200) => {
@@ -53,6 +53,7 @@ function fakeSwap() {
       return body((b) => {
         const asked = b.messages?.[0]?.content ?? "";
         const fromCanary = /capital of France/i.test(asked);
+        if (fromCanary) counts.canaryChats++;
         const bad = mode === "bad" ? true : mode === "split" ? !fromCanary : false;
         j({ choices: [{ message: { content: bad ? "!".repeat(200) : "Paris is the capital of France." }, finish_reason: bad ? "length" : "stop" }] });
       });
@@ -192,11 +193,12 @@ const degradedCfg = (url: string, extra: Record<string, unknown> = {}) => ({
 // ===========================================================================
 // Junk relayed through the passthrough is evidence too
 // ===========================================================================
-// The canary's own question is answered correctly here, and a tenant of an hour
-// away: the only thing that can degrade the seat is the legacy completion a
-// client actually asked for, watched as it is relayed.
+// The canary's own question is answered correctly here, and a probe is an hour
+// away: a legacy completion a client actually asked for, watched as it is
+// relayed, brings that probe forward — and the probe, not the traffic, decides.
 {
   const swap = fakeSwap();
+  swap.setMode("split");          // the canary's question is answered; only client traffic is junk
   const url = await swap.url();
   const { node, base } = await start({
     name: "pt-passive",
@@ -205,7 +207,8 @@ const degradedCfg = (url: string, extra: Record<string, unknown> = {}) => ({
   });
 
   // The first tick probes, gets a good answer, and then nothing for an hour.
-  await until(async () => ((await swap.counts.completions) === 0 && (await statusOf(base, "m")) === "loaded" ? true : null));
+  await until(async () => (swap.counts.canaryChats >= 1 && (await statusOf(base, "m")) === "loaded" ? true : null));
+  assert.equal(swap.counts.completions, 0);
 
   const first = await post(base, "/v1/completions", { model: "m", prompt: "hello" });
   assert.equal(first.status, 200, "the junk still reaches the client, unchanged");
@@ -215,8 +218,17 @@ const degradedCfg = (url: string, extra: Record<string, unknown> = {}) => ({
   const second = await post(base, "/v1/completions", { model: "m", prompt: "hello" });
   assert.equal(second.status, 200);
 
+  await until(async () => (swap.counts.canaryChats >= 2 ? true : null));
+  assert.equal(await statusOf(base, "m"), "loaded", "the seat answered its own question: two odd replies do not refuse it to everyone");
+
+  // Now the seat really is broken: its own question fails too. The relayed junk
+  // keeps pulling the probe forward, and two failed probes degrade it.
+  swap.setMode("bad");
+  await post(base, "/v1/completions", { model: "m", prompt: "hello" });
+  await until(async () => (swap.counts.canaryChats >= 3 ? true : null));
+  await post(base, "/v1/completions", { model: "m", prompt: "hello" });
   await until(async () => ((await statusOf(base, "m")) === "degraded" ? true : null));
-  assert.equal(swap.counts.completions, 2, "no extra probe ran: the relayed answers did it");
+  assert.equal(swap.counts.canaryChats, 4, "two probes, brought forward by the traffic, did it");
 
   await node.close();
   swap.s.closeAllConnections();

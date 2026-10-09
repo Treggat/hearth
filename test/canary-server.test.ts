@@ -252,7 +252,7 @@ async function chat(base: string, stream = false) {
 }
 
 // ===========================================================================
-// Real traffic is evidence too: a degenerate stream degrades the model
+// Real traffic is a suspicion: a degenerate stream brings the probe forward
 // ===========================================================================
 {
   const swap = fakeSwap();
@@ -282,8 +282,17 @@ async function chat(base: string, stream = false) {
   const second = await chat(base, true);
   assert.equal(second.status, 200);
 
+  await until(async () => (swap.counts.canaryChats >= 2 ? true : null));
+  assert.equal(await statusOf(base, "m"), "loaded", "the seat answered its own question: two odd streams do not refuse it to everyone");
+
+  // The seat really breaks: its own question fails too. Each relayed `!` stream
+  // pulls the probe forward, and two failed probes degrade it.
+  swap.setMode("bad");
+  await chat(base, true);
+  await until(async () => (swap.counts.canaryChats >= 3 ? true : null));
+  await chat(base, true);
   await until(async () => ((await statusOf(base, "m")) === "degraded" ? true : null));
-  assert.equal(await swap.counts.canaryChats, 1, "no extra probe ran: the traffic itself did it");
+  assert.equal(swap.counts.canaryChats, 4, "two probes, brought forward by the traffic, did it");
 
   const refused = await chat(base);
   assert.equal(refused.status, 503, "and the next client is refused rather than fed junk");

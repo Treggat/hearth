@@ -737,12 +737,24 @@ export class Canary {
     return n;
   }
 
-  /** Record a degenerate completion seen in real traffic, through the same counters a probe uses. */
+  /**
+   * A degenerate completion seen in real traffic. It is a suspicion, never a count: a
+   * client's own prompt can legitimately draw a wall of one character, and two of those
+   * must not take a model away from everyone else. It brings the next probe forward
+   * instead, so the canary's own question — one right answer — is what decides, within a
+   * tick rather than an interval. Only probes move the failure counter.
+   */
   observePassive(model: string, backend: string, verdict: Verdict): void {
     if (!this.cfg.passive) return;
     if (this.has(model, backend) === false) return;
     if (verdict.reason === "thinking") return;
-    this.record({ model, backend }, verdict, "passive");
+    const st = this.state({ model, backend });
+    if (st.degraded !== null) return;
+    st.nextProbeAt = 0;
+    this.log.warn("canary.suspected", {
+      model, backend, reason: verdict.reason, detail: verdict.detail, sample: verdict.sample,
+      source: "passive", action: "the next tick probes it",
+    });
   }
 
   start(): void {
@@ -780,7 +792,8 @@ export class Canary {
         continue;
       }
       // A recovery reload is allowed to load, but only onto an empty card, so
-      // it cannot evict a neighbour that real traffic put there meanwhile.
+      // it cannot evict a neighbour that real traffic put there meanwhile. (The
+      // probe itself then claims the card through the arbiter, like a request.)
       if (!t.warm && t.loadedCount > 0) {
         this.log.debug("canary.reload_deferred", {
           model: t.model, backend: t.backend, loaded: t.loadedCount,
@@ -880,7 +893,7 @@ export class Canary {
   }
 
   /** Fold one verdict into a model's state, and announce whatever changed. */
-  private record(t: Pick<ProbeTarget, "model" | "backend">, v: Verdict, source: "probe" | "passive"): void {
+  private record(t: Pick<ProbeTarget, "model" | "backend">, v: Verdict, source: "probe"): void {
     const now = this.now();
     const st = this.state(t);
     const probe = this.probeFor(t.model, t.backend);

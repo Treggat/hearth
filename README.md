@@ -411,7 +411,7 @@ canary:
   intervalMs: 30000          # between probes of one model
   failureThreshold: 2        # consecutive failures before `degraded`
   recoverAfter: 1            # consecutive clean probes before back in rotation
-  passive: true              # count degenerate output in real traffic too
+  passive: true              # a degenerate real answer brings the next probe forward
 
   # Which models to ask. Opting in is naming one.
   models:
@@ -461,14 +461,14 @@ reasoning model given 16 tokens to answer in will produce an empty `content`
 with `finish_reason: length` while being perfectly healthy; that is our mistake
 and it is reported as inconclusive. So is a full queue. Neither degrades a seat.
 
-`passive: true` watches completions **as they are relayed** and counts a
-degenerate one immediately, through the same counters — so under a broken seat
-the second real client request is enough, without waiting for a probe. It
-observes, it does not filter: the bytes reach the client unchanged and undelayed,
-and a mangled answer is still the client's to see. The bar for calling real
-traffic degenerate is deliberately higher than for a canary answer (32 repeated
-characters, 8 repeated tokens), because refusing a working seat is worse than
-the outage.
+`passive: true` watches completions **as they are relayed**. A degenerate one
+is a suspicion, not a count: it brings the next probe forward to the next tick
+(about a second) instead of the next interval, and the canary's own question is
+what decides. Real traffic alone never takes a model out of rotation — a
+client's prompt can legitimately draw a wall of one character, and two of
+those must not refuse the model to everyone else. It observes, it does not
+filter: the bytes reach the client unchanged and undelayed, and a mangled
+answer is still the client's to see.
 
 ### When a model is degraded
 

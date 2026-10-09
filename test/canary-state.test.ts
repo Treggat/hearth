@@ -290,17 +290,38 @@ function mk(over: Record<string, unknown> = {}, target: FakeOver = {}) {
   assert.ok(n.canary.refuse("m"), "so the model stays degraded rather than thrashing the card");
 }
 
-// --- passive traffic counts the same way -----------------------------------
+// --- passive traffic is a suspicion, and the probe decides -----------------
+// Two clients can legitimately ask for a wall of one character. That must not
+// take the model away from everyone: it brings the probe forward, no more.
 {
   const h = mk({ passive: true });
   await h.canary.tick();
   assert.equal(h.t.calls, 1, "a warm, idle, ready model is probed");
+  await h.canary.tick();
+  assert.equal(h.t.calls, 1, "and not again inside the interval");
 
-  // Two degenerate completions relayed to real clients, with no probe involved.
+  // Two degenerate completions relayed to real clients, with the seat answering
+  // the canary's own question correctly.
   h.canary.observePassive("m", "cardb", BAD);
-  assert.equal(h.canary.refuse("m"), null, "one is not yet the threshold");
   h.canary.observePassive("m", "cardb", BAD);
-  assert.ok(h.canary.refuse("m"), "the second degrades it without waiting for a probe");
+  assert.equal(h.canary.refuse("m"), null, "real traffic alone never degrades a model");
+  assert.equal(h.canary.stateOf("m")!.failures, 0, "and never moves the failure counter");
+  await h.canary.tick();
+  assert.equal(h.t.calls, 2, "it brings the next probe forward to the next tick");
+  assert.equal(h.canary.refuse("m"), null, "a clean probe settles it: the seat stays in rotation");
+
+  // The same two sightings on a seat that fails its own question too: the
+  // probes do the counting, so two of them are still needed.
+  h.t.verdict = BAD;
+  h.canary.observePassive("m", "cardb", BAD);
+  await h.canary.tick();
+  assert.equal(h.t.calls, 3);
+  assert.equal(h.canary.stateOf("m")!.failures, 1, "one failed probe, not a sighting plus a probe");
+  assert.equal(h.canary.refuse("m"), null);
+  h.canary.observePassive("m", "cardb", BAD);
+  await h.canary.tick();
+  assert.equal(h.t.calls, 4);
+  assert.ok(h.canary.refuse("m"), "the second failed probe degrades it");
   assert.equal(h.canary.stateOf("m")!.lastVerdict!.reason, "degenerate");
 }
 
