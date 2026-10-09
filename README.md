@@ -1171,6 +1171,15 @@ is the caller's answer and is relayed. A request that names an id only the fallb
 goes straight there, and so does one for a name pinned to it with `models.<id>.backend`, which
 is how two backends that run the same model each get a name of their own.
 
+When several models share the path, give each its own counterpart with `models:`; one that is
+not listed uses `model`:
+
+```yaml
+      - path: /v1/embeddings
+        model: embed-small
+        fallback: { backend: cpu, model: embed-small-cpu, models: { embed-large: embed-large-cpu } }
+```
+
 **Synchronous endpoints only.** ComfyUI's `POST /prompt` → poll `/history/{id}`
 does not fit: holding a slot across two unrelated requests leaks it the moment
 a client stops polling. That needs its own mechanism and doesn't have one yet.

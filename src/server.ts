@@ -2214,7 +2214,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           const next = !strict && again ? again([...failed, as]) : null;
           const line = next && next.target === "local" && next.model !== as && !failed.includes(next.model) ? placeOf(next.model) : undefined;
           const more = line ? { slot: line, model: next!.model, line: next }
-            : spare && fb && !fellBack ? { slot: spare, model: fb.model, line: null } : null;
+            // Models that share the path each keep their own counterpart: a spare for one is no answer for another.
+            : spare && fb && !fellBack ? { slot: spare, model: fb.models[as] ?? fb.models[model] ?? fb.model, line: null } : null;
           try {
             await run(to, as, sendBody, more !== null);
             break;
