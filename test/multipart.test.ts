@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
+import { parseV1 } from "./v1.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
 import { multipartField, replaceMultipartField } from "../src/multipart.js";
@@ -141,7 +141,7 @@ await chat.listen();
 await stt.listen();
 
 const node = createNode(
-  parseConfig({
+  parseV1({
     name: "mp-test",
     // `chat` is first on purpose: an unrouted form used to fall through to it.
     backends: [

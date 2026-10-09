@@ -17,7 +17,8 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError } from "../src/config.js";
+import { parseV1 } from "./v1.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 
@@ -65,7 +66,7 @@ const cpu = fakeSwap(["rerank-cpu"]);
 await card.listen();
 await cpu.listen();
 
-const config = (cardUrl: string) => parseConfig({
+const config = (cardUrl: string) => parseV1({
   name: "sidecar",
   resources: { gpu: { kind: "gpu" }, cpu: { kind: "cpu", shared: true } },
   backends: [
@@ -198,7 +199,7 @@ try {
   assert.deepEqual(side.resident, { yield: null, resume: null }, "a resident that is never asked to move");
   const [r] = side.routes;
   assert.deepEqual(r!.fallback, { backend: "cpu", model: "rerank-cpu" });
-  const one = (route: Record<string, unknown>) => () => parseConfig({
+  const one = (route: Record<string, unknown>) => () => parseV1({
     name: "t",
     backends: [
       { name: "a", url: "http://127.0.0.1:1", kind: "none", routes: [{ path: "/x", ...route }] },

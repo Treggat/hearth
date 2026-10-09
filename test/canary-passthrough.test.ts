@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
+import { parseV1 } from "./v1.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 
@@ -82,7 +82,7 @@ function fakeSwap() {
 }
 
 const start = async (cfg: Record<string, unknown>) => {
-  const node = createNode(parseConfig(cfg), silentLogger);
+  const node = createNode(parseV1(cfg), silentLogger);
   node.start();
   const base = await new Promise<string>((ready) =>
     node.server.listen(0, "127.0.0.1", () =>

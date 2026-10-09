@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { parseConfig } from "../src/config.js";
+import { parseV1 } from "./v1.js";
 import { silentLogger } from "../src/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
 
@@ -65,7 +65,7 @@ async function listing(url: string, timeout = 3000): Promise<Entry[]> {
 for (const vision of [true, false]) {
   const be = swapBackend(vision);
   await be.listen();
-  const cfg = parseConfig({
+  const cfg = parseV1({
     name: "me",
     backend: { url: be.url(), kind: "llama-swap" },
     scheduler: { lanes: { chat: { priority: 0 } } },
