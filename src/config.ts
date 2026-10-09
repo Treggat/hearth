@@ -59,6 +59,11 @@ export interface RouteRule {
 export interface RouteFallback {
   backend: string;
   model: string;
+  /**
+   * For a path several models share: the id each one runs as on the fallback backend, keyed by
+   * the id it was queued as here. One not listed uses `model`.
+   */
+  models: Record<string, string>;
 }
 
 /**
@@ -659,9 +664,16 @@ function routeList(v: unknown, where: string): RouteRule[] {
 function routeFallback(v: unknown, where: string): RouteFallback | null {
   if (v === undefined || v === null) return null;
   const o = asRecord(v, where);
-  const out = { backend: str(o.backend, `${where}.backend`), model: str(o.model, `${where}.model`) };
+  const out = { backend: str(o.backend, `${where}.backend`), model: str(o.model, `${where}.model`), models: {} as Record<string, string> };
   if (out.backend === "" || out.model === "") {
     throw new ConfigError(where, `${where} needs both backend: and model: — the backend to try, and the id it serves`);
+  }
+  if (o.models !== undefined && o.models !== null) {
+    for (const [from, to] of Object.entries(asRecord(o.models, `${where}.models`))) {
+      const id = str(to, `${where}.models.${from}`);
+      if (id === "") throw bad(`${where}.models.${from}`, "must name the id the fallback backend serves");
+      out.models[from] = id;
+    }
   }
   return out;
 }

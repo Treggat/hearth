@@ -1716,11 +1716,13 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           } catch (e) {
             // A full lane is back-pressure, a closed socket has nobody to answer, and a started reply cannot be restarted.
             if (e instanceof QueueFullError || ctrl.signal.aborted || res.headersSent) throw e;
+            // Models that share the path each keep their own counterpart: a spare for one is no answer for another.
+            const spareModel = fb.models[model] ?? fb.model;
             log.warn("route.fallback", {
-              path, from: target.name, to: spare.name, model: fb.model,
+              path, from: target.name, to: spare.name, model: spareModel,
               detail: e instanceof Error ? e.message : String(e),
             });
-            await run(spare, fb.model, withModel(body, pool.outboundId(fb.model)), false);
+            await run(spare, spareModel, withModel(body, pool.outboundId(spareModel)), false);
           }
         }
       } else if (routed) {
