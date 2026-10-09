@@ -72,6 +72,11 @@ export class BackendState {
     private readonly url: string,
     kind: KindName,
     private readonly log: Logger,
+    /**
+     * Which of the ids this URL reports are this backend's. Two backends on one URL split
+     * what it serves, so a sidecar pinned beside a swapping model is nobody's resident but its own.
+     */
+    private readonly mine: (id: string) => boolean = () => true,
   ) {
     this.k = KINDS[kind];
     this.useEvents = this.k.events;
@@ -231,7 +236,7 @@ export class BackendState {
   }
 
   private apply(models: ModelStatus[]): void {
-    const r = readingFromStatus(models);
+    const r = readingFromStatus(models.filter((m) => this.mine(m.id)));
     this.catalogIds = r.catalog;
     this.loadingIds = r.loading;
     this.setLoaded(r.loaded);
@@ -255,11 +260,11 @@ export class BackendState {
       catalogRead.catch(() => this.catalogIds).then((ids) => this.k.readWarm(this.url, ids)),
     ]);
 
-    if (catalog.status === "fulfilled") this.catalogIds = catalog.value;
+    if (catalog.status === "fulfilled") this.catalogIds = catalog.value.filter((m) => this.mine(m));
 
     if (warm.status === "fulfilled" && warm.value !== null) {
-      this.setLoaded(warm.value.loaded);
-      this.loadingIds = warm.value.loading;
+      this.setLoaded(warm.value.loaded.filter((m) => this.mine(m)));
+      this.loadingIds = warm.value.loading.filter((m) => this.mine(m));
       if (warm.value.placements) this.placements = warm.value.placements;
     } else {
       // Missing warm endpoint isn't an error, it just means we never know
