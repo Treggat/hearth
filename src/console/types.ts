@@ -203,6 +203,43 @@ export interface Controls {
   borrowing: boolean;
 }
 
+/** One model the canary asks, and what its last answer was worth. */
+export interface CanaryModel {
+  backend: string;
+  health: "ok" | "degraded";
+  /** Consecutive failed checks. */
+  failures: number;
+  /** When it was last asked; 0 before the first probe. */
+  lastProbeAt: number;
+  /** How long that probe took, in ms. What the check costs. */
+  lastProbeMs: number;
+  /** Why it is out, when it is. */
+  reason: string | null;
+  detail: string | null;
+  /** A bounded sample of what it actually returned. */
+  sample: string | null;
+  /** When it went out of rotation. */
+  since: number | null;
+  /** A recovery drop has happened; the next request or probe reloads it. */
+  reloadPending: boolean;
+  /** Recovery drops attempted. */
+  recoveryCount: number;
+}
+
+/**
+ * The opt-in canary. Always present, so the page can say "off" rather than
+ * drawing nothing — "not configured" and "configured and quiet" must not look
+ * the same.
+ */
+export interface Canary {
+  enabled: boolean;
+  /** Degenerate output in real traffic counts as a failed check. */
+  passive: boolean;
+  /** The gentle recovery is armed. */
+  recovery: boolean;
+  models: Record<string, CanaryModel>;
+}
+
 export interface UiData {
   /** The operator logged in on this request, or null for loopback and key callers. */
   operator: string | null;
@@ -227,4 +264,6 @@ export interface UiData {
   calls?: Call[];
   /** Samples the server's ring holds, so the streamed page trims to the same window. */
   histKeep?: number;
+  /** The canary's verdict per model. Absent only on an older server's payload. */
+  canary?: Canary;
 }

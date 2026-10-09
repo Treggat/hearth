@@ -3,7 +3,7 @@ import { AlertTriangle, Boxes, CheckCircle2, FileCog, Flame, ListOrdered, LogOut
 import { useEffect, useState } from "react";
 
 import { Config } from "./config.js";
-import { History, Inspector, Models, Queue } from "./pages.js";
+import { CanaryAlert, History, Inspector, Models, Queue } from "./pages.js";
 import { Palette } from "./Palette.js";
 import type { UiData } from "./types.js";
 import { go, login, logout, restartNode, select, useStore, type Page } from "./store.js";
@@ -56,6 +56,16 @@ function findings(d: UiData): Finding[] {
   const now = Date.now();
   const self = d.net.nodes.find((n) => n.self)!;
   if (d.config.error) out.push({ tone: "bad", text: "hearth.yaml does not load — running the last good config", go: () => go("config") });
+  // Before anything else about reachability: a degraded seat is up, loaded and
+  // holding its card, so no other finding on this page can see it.
+  for (const [id, m] of Object.entries(d.canary?.models ?? {})) {
+    if (m.health !== "degraded") continue;
+    out.push({
+      tone: "bad",
+      text: `${id} degraded — ${m.reason ?? "not answering anything"}${m.since ? `, out for ${dur(now - m.since)}` : ""}`,
+      go: () => go("models"),
+    });
+  }
   for (const p of d.net.nodes.filter((n) => !n.self)) {
     if (p.up) { downSince.delete(p.name); continue; }
     const since = downSince.get(p.name) ?? now;
@@ -303,6 +313,10 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {/* Above the page, because a degraded seat is a fact about the node, not
+            about the tab you happen to be looking at. */}
+        {data && <CanaryAlert />}
 
         {!data ? (
           <div className="grid flex-1 place-items-center text-dim">{dead ? "hearth is not answering" : "connecting…"}</div>

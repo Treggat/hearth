@@ -19,6 +19,45 @@ function Row({ k, children }: { k: string; children: React.ReactNode }) {
   );
 }
 
+/* ------------------------------------------------- canary: seats that answer
+   with nothing */
+
+/**
+ * The one failure the topology cannot draw.
+ *
+ * A seat returning 200 and `!!!!` is up, loaded, holding its card, and every
+ * number on every page is green. So when the canary has a model out of
+ * rotation this says so on every page,
+ * rather than sitting somewhere an operator has to think to look.
+ */
+export function CanaryAlert() {
+  const d = useStore((s) => s.data)!;
+  const down = Object.entries(d.canary?.models ?? {}).filter(([, m]) => m.health === "degraded");
+  if (down.length === 0) return null;
+  return (
+    <div className="border-b border-bad bg-muted px-5 py-2 text-[12px]">
+      <div className="flex flex-wrap items-center gap-2">
+        <Pill tone="bad">{down.length === 1 ? "1 model degraded" : `${down.length} models degraded`}</Pill>
+        <span className="text-dim">
+          answering, but not with an answer. New requests get 503 until a clean canary probe.
+        </span>
+      </div>
+      {down.map(([id, m]) => (
+        <div key={id} className="mt-1 flex flex-wrap items-baseline gap-2">
+          <span className={cx(mono, "font-medium")}>{id}</span>
+          <span className="text-dim">{m.backend}</span>
+          <span className="text-bad">{m.reason ?? "degraded"}</span>
+          <span className="text-dim">
+            {m.since ? `out for ${ago(m.since)}` : "out"} · {m.failures} failed
+            {m.reloadPending ? " · dropped, awaiting a reload" : ""}
+          </span>
+          {m.sample ? <span className={cx(mono, "break-all text-dim")}>{JSON.stringify(m.sample.slice(0, 40))}</span> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function Inspector() {
   const d = useStore((s) => s.data)!;
   const sel = useStore((s) => s.sel);

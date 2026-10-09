@@ -28,6 +28,7 @@ const server = createServer((req, res) => {
   if (path === "/api/ps") return json({ models: [{ model: "warm" }] });
   if (path === "/api/show") return json({ model_info: { "x.context_length": 4096 } });
   if (path === "/api/models/unload") return json({}, unloadStatus);
+  if (path.startsWith("/api/models/unload/")) return json({}, unloadStatus);
   if (path.endsWith("/props")) return json({ default_generation_settings: { n_ctx: 4096 } });
   json({ error: "not found" }, 404);
 });
@@ -54,6 +55,32 @@ for (const [name, k] of Object.entries(KINDS) as [KindName, (typeof KINDS)[KindN
     unloadStatus = 200;
     assert.equal(await k.unload(url, silentLogger), true, `${name}: a clean unload says so`);
     assert.equal(await k.unload("http://127.0.0.1:1", silentLogger), false, `${name}: a down backend is not cleared`);
+  }
+
+  // --- dropping ONE model: what the canary's recovery is built on ------------------
+  // Unloading the whole card to recover one broken model would evict a neighbour
+  // that was working, so a recovery needs a per-model drop or none at all.
+  // llama-swap has one (`POST /api/models/unload/:model_id`) and the canary's
+  // gentle recovery is the reason it must keep having one.
+  if (name === "llama-swap") {
+    assert.ok(k.unloadModel, `${name}: a swapping backend must offer a per-model drop`);
+  }
+  if (k.unloadModel) {
+    asked.length = 0;
+    unloadStatus = 500;
+    assert.equal(await k.unloadModel(url, "warm", silentLogger), false,
+      `${name}: a refused per-model unload is not a drop`);
+    unloadStatus = 200;
+    assert.equal(await k.unloadModel(url, "warm", silentLogger), true,
+      `${name}: a clean per-model unload says so`);
+    assert.ok(asked.includes("/api/models/unload/warm"),
+      `${name}: the model is named in the path, and only that model is dropped`);
+    // An id with a slash stays ONE path segment, or llama-swap reads it as a different route.
+    await k.unloadModel(url, "author/model", silentLogger);
+    assert.ok(asked.includes("/api/models/unload/author%2Fmodel"),
+      `${name}: a slashed id is encoded, not left to become a deeper path`);
+    assert.equal(await k.unloadModel("http://127.0.0.1:1", "warm", silentLogger), false,
+      `${name}: a down backend is not dropped`);
   }
 
   // --- config: a kind that holds a model it cannot unload never shares a contested card

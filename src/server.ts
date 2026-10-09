@@ -7,10 +7,8 @@ import { pipeline } from "node:stream/promises";
 import { createHash, timingSafeEqual } from "node:crypto";
 
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
-import {
-  peersMapping, WARM_LANE,
-  type BackendConfig, type HearthConfig, type RoutePolicy,
-} from "./config.js";
+import { createCanary, degradedError, type RelayWatch } from "./canary.js";
+import { peersMapping, WARM_LANE, type BackendConfig, type HearthConfig, type RoutePolicy } from "./config.js";
 import { Controls } from "./controls.js";
 import { emulatedRequest, relayEmulated, streamErrorFrame } from "./emulate.js";
 import { ConfigFile, ConfigRefusal, deepFreeze, link, setNote, setShare, unlink } from "./configfile.js";
@@ -55,9 +53,15 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-/** OpenAI's error envelope, since that's what clients parse. */
-function apiError(res: ServerResponse, status: number, message: string, type = "invalid_request_error"): void {
-  json(res, status, { error: { message, type } });
+/** OpenAI's error envelope, since that's what clients parse. Extra fields ride beside `type`. */
+function apiError(
+  res: ServerResponse,
+  status: number,
+  message: string,
+  type = "invalid_request_error",
+  extra?: Record<string, unknown>,
+): void {
+  json(res, status, { error: { message, type, ...extra } });
 }
 
 /** Thrown, not returned, so the caller can answer 413 rather than the 400 an
@@ -139,6 +143,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   const config = new ConfigFile(cfg, log, () => queueMicrotask(() => void broadcast()));
   if (cfg.stateFile) config.migrateSidecar(cfg.stateFile);
   const peers = new PeerRegistry(cfg, log, controls);
+
+  /** The opt-in canary, or null when `canary:` is not configured. */
+  const canary = createCanary(cfg, pool, log);
 
   /** What we lend right now: `share:` while lending is on, nothing while paused. Every share gate reads this. */
   const shared = (): readonly string[] => controls.share(cfg.share);
@@ -223,6 +230,23 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     return typeof v === "string" && /^[\w.:-]{1,128}$/.test(v) ? v : undefined;
   }
 
+  /**
+   * The 503 a degraded model owes a client. Returned rather than thrown so every
+   * door can answer it: the chat route throws it, the passthrough hands it to `fail`.
+   */
+  function degradedRefusal(model: string): Refusal | null {
+    const sick = canary?.refuse(model);
+    if (sick === undefined || sick === null) return null;
+    const { message, fields } = degradedError(model, pool.for(model).name, sick);
+    return new Refusal(503, message, "server_error", fields);
+  }
+
+  /** Refuse a degraded model on the chat route. */
+  function refuseDegraded(model: string): void {
+    const refusal = degradedRefusal(model);
+    if (refusal) throw refusal;
+  }
+
   /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
   async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readBody(req, cfg.maxBodyBytes);
@@ -247,7 +271,7 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     const r = refusalOf(e);
     // The rest of an oversized body is never read, so the connection cannot be reused.
     if (e instanceof BodyTooLargeError) res.setHeader("Connection", "close");
-    apiError(res, r.status, r.message, r.type);
+    apiError(res, r.status, r.message, r.type, r.extra ?? undefined);
   }
 
   /** Which peer is calling, by token. Null if we don't recognise it. */
@@ -341,18 +365,44 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     const body = pool.outboundBody(model, payload);
     const sentAt = Date.now();
     const up = await send(`${url}/v1/chat/completions`, { json: emulate ? emulatedRequest(body) : body, ...opts });
-    return emulate ? relayEmulated(up, res, forwardable(up.headers), sentAt) : pipeThrough(up, res);
+    if (emulate) return relayEmulated(up, res, forwardable(up.headers), sentAt);
+    // Observed as it is relayed, never held back: see RelayWatch.
+    return pipeThrough(up, res, canary?.watchRelay(model, pool.for(model).name, up.headers["content-type"]));
+  }
+
+  /** The text-completion paths a relayed answer is worth watching on, with or without an `/upstream/<model>` prefix. */
+  const COMPLETION_PATH = /^\/(?:v1\/(?:completions|chat\/completions|responses)|completion)$/;
+
+  /** A passthrough path with llama-swap's `/upstream/<model>` prefix removed. */
+  function stripUpstream(path: string): string {
+    return path.replace(/^\/upstream\/[^/]+/, "");
   }
 
   /**
    * Relay an upstream answer verbatim, all headers included, and return its status: a backend's 4xx
    * reaches the client but is not a success. `pipeline` settles even if the client disconnects.
+   *
+   * `watch`, when given, sees each chunk on its way past and is never allowed to
+   * delay, alter or hold one: the transform writes the same buffer straight on.
    */
-  async function pipeThrough(up: UpstreamResponse, res: ServerResponse): Promise<number> {
+  async function pipeThrough(
+    up: UpstreamResponse,
+    res: ServerResponse,
+    watch?: RelayWatch,
+  ): Promise<number> {
     if (res.headersSent) {
       // Opened early for queue position: the status cannot change now, so a failure is a frame.
-      if (up.status >= 400) res.end(streamErrorFrame(up.status, await up.text()));
-      else await pipeline(up.body, res);
+      if (up.status >= 400) {
+        res.end(streamErrorFrame(up.status, await up.text()));
+        return up.status;
+      }
+      // A good body still gets watched, so a queue-position stream counts too.
+      if (watch === undefined) {
+        await pipeline(up.body, res);
+        return up.status;
+      }
+      await pipeline(up.body, watch.through(), res);
+      watch.end();
       return up.status;
     }
     res.writeHead(up.status, {
@@ -362,7 +412,12 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       // at once at the end and looks like a hang.
       "X-Accel-Buffering": "no",
     });
-    await pipeline(up.body, res);
+    if (watch === undefined) {
+      await pipeline(up.body, res);
+      return up.status;
+    }
+    await pipeline(up.body, watch.through(), res);
+    watch.end();
     return up.status;
   }
 
@@ -769,6 +824,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         total: cfg.peers.length,
         up: peers.all().filter((p) => p.up).length,
       },
+      // Only with a canary configured, and as a count: this endpoint is unauthenticated
+      // and may be bound wide, so it says how many models are out, never which.
+      ...(canary ? { canary: { degraded: canary.degradedCount() } } : {}),
     });
     return;
   }
@@ -1242,6 +1300,14 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
           const entry: Entry = { id };
           const stats = pool.statsFor(id);
           if (stats?.note) entry.description = stats.note;
+          // A degraded model is loaded and answering, just not with an answer,
+          // so its status wins over warmth: "loaded" would read as healthy.
+          const sick = canary?.refuse(id);
+          if (sick) {
+            entry.status = { value: "degraded" };
+            entry.description = `${sick.detail} (since ${new Date(sick.since).toISOString()})`;
+            return entry;
+          }
           if (!pool.for(id).state.knowsWarm()) return entry;
           entry.status = { value: warm.has(id) ? "loaded" : "unloaded" };
           const ctx = pool.contextLength(id);
@@ -1301,6 +1367,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       const payload = await readJson(c.req);
       const model = typeof payload.model === "string" ? payload.model : "";
       admit(c, model);
+      // Before anything is queued or routed: a degraded seat is out of rotation
+      // for everyone, peers included.
+      refuseDegraded(model);
       await chat(c, model, payload);
     } catch (e) {
       fail(c.res, e);
@@ -1529,6 +1598,16 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
     }
     // What the caller asked for, kept apart from the backend `named` picks.
     const asked = viaPath ?? viaBody;
+    // A degraded model is out of rotation on EVERY door, not only the chat one.
+    // `/v1/completions`, the declared routed paths and llama-swap's
+    // `/upstream/<model>/...` all reach the same seat, and an answer of `!!!!`
+    // costs the caller just as much there. `asked` is already resolved above —
+    // from the path or the body — so this reads nothing new.
+    const degraded = asked === undefined ? null : degradedRefusal(asked);
+    if (degraded) {
+      fail(res, degraded);
+      return;
+    }
     const named = routed ? undefined : asked;
     const target = routed ? routed.slot : named ? pool.for(named) : pool.first();
     if (named && !pool.single) {
@@ -1559,6 +1638,13 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       }
     }
 
+    // A completion relayed down here is watched exactly as one on the chat
+    // route is, so a legacy `/v1/completions` — or `/upstream/<model>/v1/…` —
+    // answer of `!!!!` is counted rather than passed by. Only text-completion
+    // paths: judging a rerank score or an image as "the model's words" would be
+    // inventing a verdict about something that is not an answer.
+    const watchable = COMPLETION_PATH.test(stripUpstream(path));
+
     const ctrl = new AbortController();
     res.on("close", () => {
       if (!res.writableEnded) ctrl.abort();
@@ -1578,7 +1664,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
         up.body.resume();
         throw new Error(`${to.name} answered ${up.status}`);
       }
-      await pipeThrough(up, res);
+      // Watched on the backend actually used: a declared route may fall back to
+      // a spare, and the label has to be the one that answered.
+      await pipeThrough(up, res, watchable ? canary?.watchRelay(asked, to.name, up.headers["content-type"]) : undefined);
     };
 
     try {
@@ -1802,6 +1890,9 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
   const proxying = new Set<{ id: string; backend: string; model: string | null }>();
   const { uiPayload, networkView } = createViews({
     cfg, pool, peers, history, controls, config, shared, proxying, writeMode,
+    // Drawn whether or not it is on, so "not configured" and "configured and
+    // quiet" are not the same blank tile.
+    canary: () => canary?.page() ?? { enabled: false, passive: false, recovery: false, models: {} },
   });
 
   /** Expired sessions, swept like any other in-memory state; unref'd so it never holds the process. */
@@ -1819,8 +1910,11 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
       peers.start();
       history.start();
       config.watch();
+      // Last, so the first probe sees a backend whose warm state has been read.
+      canary?.start();
     },
     close: async (graceMs = 0) => {
+      canary?.stop();
       clearInterval(sessionSweep);
       sessions.prune();
       config.close();

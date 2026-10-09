@@ -42,6 +42,7 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     shutdownGraceMs: ms("How long a shutdown waits for requests in flight. 0 drops them.", 30000),
     operator: { type: "raw", desc: "The console login. Written by `hearth set-operator`." },
     stateFile: { type: "raw", desc: "A pre-2.0 console sidecar, folded into this file once at startup." },
+    canary: { type: "raw", desc: "Ask named models a question with one right answer, on a schedule; a seat that answers 200 with nothing is taken out of rotation. Off unless set; restart-only." },
   },
   listen: {
     host: { type: "text", desc: "Widening the host is deliberate: see Security in the README.", def: "127.0.0.1" },

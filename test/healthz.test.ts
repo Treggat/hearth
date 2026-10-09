@@ -79,6 +79,7 @@ const until = async (base: string, want: (h: Health) => boolean, ms = 4_000) => 
     // `{ok, name}` this replaced) fails as an assertion naming the shape rather
     // than as a TypeError inside a predicate.
     assert.ok(h.body.backends, `/healthz must report backend counts, got ${JSON.stringify(h.body)}`);
+    assert.equal("canary" in h.body, false, "no canary configured, so the body has no canary field");
     if (want(h.body) || Date.now() - t0 > ms) return h;
     await new Promise((r) => setTimeout(r, 50));
   }

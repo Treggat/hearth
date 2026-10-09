@@ -422,4 +422,41 @@ function holdSlot(s: Scheduler, order: string[]) {
   assert.equal(arbiter.snapshot().length, 0, "the card is let go once the work is gone");
 }
 
+// --- a probe takes a lane without taking the card --------------------------
+// The canary asks its question on a timer, unprompted. Going through ordinary
+// turn-taking, it would clear neighbours off the card that real work had
+// loaded — and a health check that evicts a working model is worse than the
+// outage it was watching for. So a probe takes a lane (it still queues, yields
+// and shows up in the queue) but never claims or clears the hardware.
+{
+  const arbiter = new ResourceArbiter();
+  let evictions = 0;
+  const s = new Scheduler({
+    lanes,
+    resources: ["gpu0"],
+    arbiter,
+    evict: async () => {
+      evictions++;
+      throw new Error("nothing should be evicted for a probe");
+    },
+  });
+
+  const probed = await s.submit(
+    { lane: "warm", model: "m", caller: "canary", claimHardware: false },
+    async () => "probed",
+  );
+  assert.equal(probed, "probed", "a probe runs without taking the card");
+  assert.equal(evictions, 0, "and clears nobody off it");
+  assert.equal(arbiter.snapshot().length, 0, "and never holds it");
+
+  // The flag is the probe's, not the backend's: real work still evicts.
+  await assert.rejects(
+    s.submit({ lane: "chat", model: "m", caller: "local" }, async () => "ran"),
+    /nothing should be evicted for a probe/,
+    "ordinary work still takes the card, eviction and all",
+  );
+  assert.equal(evictions, 1);
+  assert.equal(arbiter.snapshot().length, 0, "and still hands it back");
+}
+
 console.log("scheduler.test.ts ok");
