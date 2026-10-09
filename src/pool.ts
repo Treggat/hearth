@@ -264,6 +264,13 @@ export class BackendPool {
     return false;
   }
 
+  /** Does another backend's app hold `b`'s hardware right now, whatever the lane? */
+  appHolds(b: BackendConfig): boolean {
+    const mine = this.arbitrated(b.resources);
+    return this.slots.some((s) =>
+      s.cfg.hold !== null && s.name !== b.name && s.cfg.resources.some((r) => mine.includes(r)) && this.holdActive(s));
+  }
+
   /** Is this backend's hold in force: its app in use, or its seat loading (or only just loaded)? */
   private holdActive(s: BackendSlot): boolean {
     const h = s.cfg.hold!;

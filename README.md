@@ -483,6 +483,8 @@ canary:
     chat: {}
     reasoner:
       maxTokens: 1024
+    # anything:              # a `follow` id: whatever the card holds answers under it
+    #   onlyAs: chat         # watched only while that is `chat`
 
   # Or every model a backend serves.
   # backends:
@@ -576,6 +578,18 @@ hearth does not phrase a title or a message, so a receiver that wants one (a
 chat webhook, a notification API with its own field names) builds it from these
 fields, in whatever sits at `url`. The hook is fire-and-forget: one that is
 slow, wrong or down gets a line in the log and changes nothing else.
+
+### A followed id: `onlyAs`
+
+A `follow` id goes out as whatever its card holds, so a probe of it asks whichever model is
+loaded. Where the question, the token budget or the cost of a wrong verdict only fit one of
+them, name it: `canary.models.<id>.onlyAs: <backend id>`. While the id goes out as anything
+else it is not probed, real traffic under it is not judged, a verdict it earned as the named
+model is not held against the one answering now, and recovery leaves that model alone. The
+moment the named model is back under the id, so is the canary, with the state it had.
+
+A recovery reload also treats a card that an app is keeping with `hold:` as occupied: it
+waits for the app to let go rather than swapping it out.
 
 ### recovery
 

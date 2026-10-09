@@ -211,6 +211,11 @@ export interface CanaryProbe {
   failureThreshold: number;
   /** This many consecutive clean probes brings it back. */
   recoverAfter: number;
+  /**
+   * Watch this id only while it goes out as this backend id: for a `follow` id, whose card may
+   * hold a model the question, or the cost of a wrong verdict, does not fit. null always watches.
+   */
+  onlyAs: string | null;
 }
 
 /** Where a state change is announced, and with what. */
@@ -749,6 +754,11 @@ function probeOverrides(raw: unknown, where: string): Partial<CanaryProbe> {
     out.failureThreshold = count(o.failureThreshold, `${where}.failureThreshold`, 1, 1);
   }
   if (o.recoverAfter !== undefined) out.recoverAfter = count(o.recoverAfter, `${where}.recoverAfter`, 1, 1);
+  if (o.onlyAs !== undefined) {
+    const onlyAs = str(o.onlyAs, `${where}.onlyAs`).trim();
+    if (onlyAs === "") throw bad(`${where}.onlyAs`, "must not be empty");
+    out.onlyAs = onlyAs;
+  }
   return out;
 }
 
@@ -770,6 +780,7 @@ function canaryDecl(v: unknown, backends: readonly BackendConfig[]): CanaryConfi
     intervalMs: count(c.intervalMs, "canary.intervalMs", 30_000, 1),
     failureThreshold: count(c.failureThreshold, "canary.failureThreshold", 2, 1),
     recoverAfter: count(c.recoverAfter, "canary.recoverAfter", 1, 1),
+    onlyAs: null,
   };
 
   const models: Record<string, Partial<CanaryProbe>> = {};
