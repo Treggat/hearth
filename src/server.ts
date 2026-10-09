@@ -213,14 +213,17 @@ export function createNode(cfg: HearthConfig, log: Logger): HearthNode {
 
   /** One probe, through the model's own lane at the lowest priority. */
   async function runCanaryProbe(
-    slot: BackendSlot, id: string, spec: CanaryProbe, signal: AbortSignal, _load: boolean,
+    slot: BackendSlot, id: string, spec: CanaryProbe, signal: AbortSignal, load: boolean,
   ): Promise<Verdict> {
     let out: Verdict | null = null;
     try {
       await slot.scheduler.submit(
-        // No hardware claim: a probe queues and yields like any job, but it can
-        // neither take the card nor clear a neighbour off one.
-        { lane: WARM_LANE, model: id, caller: "canary", signal, claimHardware: false },
+        // No hardware claim for an ordinary probe: it queues and yields like any
+        // job, but it can neither take the card nor clear a neighbour off one.
+        // A recovery reload is the one probe that LOADS, so it claims the card
+        // like a real request would — through the arbiter, which clears or
+        // waits for whatever else holds it — rather than loading around it.
+        { lane: WARM_LANE, model: id, caller: "canary", signal, claimHardware: load },
         async () => { out = await probeBackend(slot, id, spec, signal); },
       );
     } catch (e) {
