@@ -114,6 +114,28 @@ const config = (appUrl: string, idleMs: number, extra: Record<string, unknown> =
   assert.deepEqual(log, ["chat", "background"], "once the hold ends, a kick starts it");
 }
 
+// --- scheduler: maxWaitMs does not run against a held job --------------------
+{
+  let held = true;
+  const s = new Scheduler({
+    lanes: { memory: { priority: 90, maxWaitMs: 40 } },
+    concurrency: 1,
+    heldOff: () => held,
+  });
+  let outcome = "waiting";
+  void s.submit({ lane: "memory", model: "seat", caller: "a" }, async () => {}).then(
+    () => { outcome = "ran"; },
+    (e: Error) => { outcome = e.name; },
+  );
+  await settle(150);
+  assert.equal(outcome, "waiting", "held for several times maxWaitMs, and still queued");
+
+  // Hold over, but nothing kicks the queue: the backend is not moving, which is what the guard is for.
+  held = false;
+  await settle(150);
+  assert.equal(outcome, "QueueTimeoutError", "once the hold ends the guard runs again");
+}
+
 // --- pool: the hold follows the app's own busy signal -----------------------
 {
   const app = fakeApp();
@@ -126,8 +148,19 @@ const config = (appUrl: string, idleMs: number, extra: Record<string, unknown> =
   assert.equal(pool.heldOff(card.cfg, "memory"), false, "an app nobody has heard from holds nothing");
   assert.equal(pool.whenHeld("background", "memory"), null);
 
+  // Up and idle is what a restart of hearth or of the app looks like: no one is using it.
+  const idle = new BackendPool(cfg, silentLogger);
+  const quiet = idle.get("app")!;
+  await quiet.state.sampleActivity(quiet.cfg.activity!);
+  assert.equal(idle.heldOff(idle.get("card")!.cfg, "memory"), false, "an idle app answering for the first time holds nothing");
+  const sinceUp = idle.holds()[0]!.quietMs;
+  assert.ok(sinceUp !== null && sinceUp < 1_000, "and is quiet since it began answering");
+  idle.stop();
+
+  app.state.running = 1;
   await read();
-  assert.equal(pool.heldOff(card.cfg, "memory"), true, "coming up counts as use: the first job is still ahead of it");
+  app.state.running = 0;
+  assert.equal(pool.heldOff(card.cfg, "memory"), true, "a reading that shows work starts the hold");
   assert.equal(pool.heldOff(card.cfg, "chat"), false, "only the lanes it names");
   assert.equal(pool.heldOff(pool.get("spare")!.cfg, "memory"), false, "only backends on its hardware");
   assert.equal(pool.heldOff(holder.cfg, "memory"), false, "never the holder itself");
@@ -194,7 +227,8 @@ const config = (appUrl: string, idleMs: number, extra: Record<string, unknown> =
   assert.equal(before.body.choices?.[0]?.message.content, "card", "no hold: the request runs on its own backend");
   assert.equal(before.body.model, "main");
 
-  // start() begins reading the app, whose first answer starts the hold.
+  // start() begins reading the app, whose work starts the hold.
+  app.state.running = 1;
   node.start();
   for (let i = 0; i < 100 && !node.pool.heldOff(node.pool.get("card")!.cfg, "memory"); i++) await settle(20);
   const during = await ask("background");
@@ -249,6 +283,11 @@ const config = (appUrl: string, idleMs: number, extra: Record<string, unknown> =
   running = [{ model: "image-seat", state: "ready" }];
   await loader.state.refresh();
   assert.equal(pool.heldOff(card.cfg, "memory"), true, "just loaded: the hold bridges the moment before the app's first answer");
+
+  const since = loader.state.sinceLoading("image-seat");
+  await settle(40);
+  pool.holds();
+  assert.ok(loader.state.sinceLoading("image-seat") >= since + 30, "the bridge is timed from the load, and reading the status does not restart it");
 
   // Another model loading on that swapper is not this app's business.
   const other = new BackendPool(cfg, silentLogger);

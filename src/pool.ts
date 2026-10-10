@@ -75,8 +75,6 @@ export class BackendPool {
   /** Reads the activity path of every backend with a `hold`, and what each read last decided. */
   private holdTimer: ReturnType<typeof setInterval> | null = null;
   private readonly holdWas = new Map<BackendSlot, boolean>();
-  /** When a holder's seat was last seen loading, so the hold bridges the moment between "ready" and the app's first answer. */
-  private readonly seatLoadingAt = new Map<BackendSlot, number>();
 
   /** The last twenty handoffs, so a card changing hands shows on the status page. */
   private readonly evicted: { t: number; backend: string; for: string; resources: string[] }[] = [];
@@ -269,12 +267,7 @@ export class BackendPool {
     const h = s.cfg.hold!;
     const loader = h.seat === null ? undefined : this.slots.find((o) => o.cfg.serves.includes(h.seat!));
     if (loader !== undefined) {
-      const now = Date.now();
-      if (loader.state.loading().includes(h.seat!)) {
-        this.seatLoadingAt.set(s, now);
-        return true;
-      }
-      if (now - (this.seatLoadingAt.get(s) ?? -Infinity) < SEAT_READY_GRACE_MS) return true;
+      if (loader.state.sinceLoading(h.seat!) < SEAT_READY_GRACE_MS) return true;
       // A seat its swapper says is gone holds nothing, whatever the app last reported.
       if (loader.state.knowsWarm() && !loader.state.isWarm(h.seat!)) return false;
     }

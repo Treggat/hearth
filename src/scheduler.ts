@@ -704,7 +704,8 @@ export class Scheduler {
         const arm = () => {
           job.waitTimer = setTimeout(() => {
             if (job.state !== "queued") return;
-            if (this.lastStartAt > checked) {
+            // A held job waits on a neighbour's app, not on this backend: the guard does not run against it.
+            if (this.lastStartAt > checked || this.held(job as Job)) {
               checked = Date.now();
               arm();
               return;
