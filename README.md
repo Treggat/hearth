@@ -176,6 +176,8 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `operator` | unset | the console login, `{user, passHash}`. Written by the console's first-run setup or `hearth set-operator`; applies live; see [The console](#the-console) |
 | `maxBodyBytes` | `33554432` | largest accepted request body |
 | `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them |
+| `routers.<name>` | none | A rulebook besides `flows:`: `flows` in the same shape, and `strict: true` to switch off backend route fallbacks for its callers. See [Routers](#routers). |
+| `callers.<who>` | none | Which rulebook a caller goes by: an api key's label, `local`, or `*` for everyone else, each to a name under `routers:` or `default`. |
 | `layout.<node>` | none | `{ x, y }`: where the console's topology draws a node you placed. Written by [its editor](#editing-on-the-graph); nodes without one are laid out |
 | `modelHeader` | `true` | send `x-hearth-model` on every chat answer: the id the request ran as. See [Flows](#flows) |
 | `historyFile` | unset | a file that keeps the console's day of history and its recent log lines across restarts, written every minute and at shutdown. Unset keeps them in memory |
@@ -1428,6 +1430,59 @@ to choose from unless two models answer the same path.
 Requests a peer borrows are served as the model it was lent and do not pass
 through types. Maintenance calls that hearth forwards without queueing (a
 model swapper's own endpoints) are not affected.
+
+#### Routers
+
+`flows:` is the default rulebook. A router is another one, and `callers:` says
+who goes by which: an api key by its label, `local` for this machine with no
+key, and `*` for everyone not named. A value is a name under `routers:`, or
+`default` for `flows:`. With no `callers:`, everyone goes by `flows:`.
+
+```yaml
+routers:
+  direct:
+    strict: true
+    flows:
+      chat: { inputs: [chat], steps: [{ to: my-model }] }
+      anything-else: { inputs: ["*"], steps: [{ to: { refuse: "not offered here" } }] }
+callers:
+  local: direct        # requests from this machine go by routers.direct
+  # "*": direct        # ...or everyone does, with `app: default` to send one key back to flows:
+```
+
+Here a request from this machine for `chat` runs on `my-model` whatever the
+rules in `flows:` would have done with it, and nothing else is offered to it.
+A caller is listed its own router's names on `/v1/models`. Each router needs its
+own flow for `*`, as `flows:` does, and none may be called `default`.
+
+`strict: true` also switches off a backend route's `fallback` for a router's
+callers, so a request runs on the model its rule names or fails. That is the
+setting for testing a model without wondering whether something else answered.
+
+A step's `max`, a flow's `sticky` and the line counts are kept by flow name, so
+two routers with a flow of the same name share them; only `flows:` is counted.
+
+The Topology page draws this node as a frame with its callers inside: `default`
+(everyone else), `local`, and every labelled api key, each with a line to the
+router its requests go by, and each router under the default one. Drag a
+caller's dot onto a router to send it there. A caller with a dashed line only
+follows `default`; one you have sent somewhere stays there when `default` moves.
+The change joins the routing draft and is published from the Routing page.
+Clicking a router opens its rules there.
+
+The rest of the Topology page is edited where it stands too, into the same
+draft: **+ backend**, **+ hardware** and **+ machine** add one; clicking a
+backend, a card or a machine opens its settings beside the picture; and a
+backend's card is dragged onto other hardware or another machine to say where
+it runs. Hardware and machines with nothing on them yet are drawn empty, to be
+dragged onto. Backends drawn as chips (more than three on one card) are moved
+from their settings. **review & publish** there shows the diff and says what
+needs a restart before anything is written.
+
+On the Routing page the first button says which rulebook is on the map. Its
+menu switches between them and starts a new one, from the rules shown or from
+one that refuses everything. With a router shown, the buttons beside it say
+whose requests go by it, set **never fall back**, and delete it.
 
 #### Actions
 

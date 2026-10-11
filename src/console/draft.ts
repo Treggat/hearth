@@ -98,8 +98,10 @@ export function draftView(doc: Doc, live: UiData): UiData {
   const peers: NetNode[] = Object.entries(obj(doc.peers)).map(([name, p]) =>
     live.net.nodes.find((n) => !n.self && n.name === name)
       ?? { name, up: false, map: obj(obj(p).models) as Record<string, string>, free: null, slots: null, queued: null });
+  // What holds a card right now is the running node's to say; what the card is, the draft's.
   const resources: Resource[] = Object.entries(obj(doc.resources)).map(([name, r]) => ({
-    name, kind: (text(obj(r).kind) || "gpu") as Resource["kind"], shared: obj(r).shared === true, holder: null, backends: [],
+    holder: null, backends: [], ...(live.net.resources ?? []).find((x) => x.name === name),
+    name, kind: (text(obj(r).kind) || "gpu") as Resource["kind"], shared: obj(r).shared === true,
   }));
   const routing: Record<string, Routing> = {};
   for (const [id, m] of Object.entries(obj(doc.models))) {
@@ -431,6 +433,64 @@ export function beside(ends: string[], from: (end: string) => number[], step: nu
     next = at + step;
   }
   return out;
+}
+
+/**
+ * A draft as one router's rulebook: its flows stand as `flows`, and its map has places of its own
+ * (kept as `routing@<router>/...`). With `null` the draft is its own view: the rules everyone else goes by.
+ */
+export function scoped(doc: Doc, router: string | null): Doc {
+  if (router === null) return doc;
+  const pre = `routing@${router}/`;
+  const layout = Object.fromEntries(Object.entries(obj(doc.layout)).flatMap(([id, at]) =>
+    (id.startsWith(pre) ? [[`routing/${id.slice(pre.length)}`, at]] : id.startsWith("routing/") ? [] : [[id, at]])));
+  return { ...doc, flows: obj(obj(obj(doc.routers)[router]).flows), ...(isObj(doc.layout) ? { layout } : {}) };
+}
+
+/** The whole draft again, from one router's view of it and `whole`, the draft that view was taken of. */
+export function unscoped(view: Doc, whole: Doc, router: string | null): Doc {
+  if (router === null) return view;
+  const pre = `routing@${router}/`;
+  const layout = {
+    ...Object.fromEntries(Object.entries(obj(whole.layout)).filter(([id]) => id.startsWith("routing/"))),
+    ...Object.fromEntries(Object.entries(obj(view.layout)).map(([id, at]) => [id.startsWith("routing/") ? pre + id.slice(8) : id, at])),
+  };
+  const { layout: _, ...rest } = view;
+  return {
+    ...rest, flows: whole.flows,
+    routers: { ...obj(view.routers), [router]: { ...obj(obj(view.routers)[router]), flows: view.flows } },
+    ...(Object.keys(layout).length ? { layout } : {}),
+  };
+}
+
+/** The caller that stands for everyone `callers:` does not name. */
+export const EVERYONE = "*";
+
+/** Who can be given a router: everyone else as one, whoever calls from this machine without a key, and each api key by its label. */
+export const callersIn = (doc: Doc): string[] =>
+  [EVERYONE, "local", ...(Array.isArray(doc.apiKeys) ? doc.apiKeys : []).map((k) => text(obj(k).label)).filter(Boolean)];
+
+/** The router a caller goes by, null for the default one. `own` is false where it only goes where everyone else does. */
+export function routerFor(doc: Doc, caller: string): { router: string | null; own: boolean } {
+  const given = text(obj(doc.callers)[caller]);
+  const name = given || text(obj(doc.callers)[EVERYONE]);
+  return { router: name && name !== "default" ? name : null, own: caller === EVERYONE || given !== "" };
+}
+
+/** The callers that go by a router (null: the default one), those that only follow everyone else included. */
+export const usersOf = (doc: Doc, router: string | null): string[] => callersIn(doc).filter((c) => routerFor(doc, c).router === router);
+
+/**
+ * Send a caller's requests by a router, or with null by the default one. A caller sent where
+ * everyone else goes follows them from then on; one sent elsewhere stays there when they move.
+ */
+export function withCaller(doc: Doc, caller: string, router: string | null): Doc {
+  const { [caller]: _, ...kept } = obj(doc.callers);
+  const to = router ?? "default";
+  const rest = text(kept[EVERYONE]) || "default";
+  if (caller === EVERYONE ? to !== "default" : to !== rest) kept[caller] = to;
+  const { callers: _c, ...others } = doc;
+  return Object.keys(kept).length ? { ...others, callers: kept } : others;
 }
 
 /** Remember where a node was put, to the pixel: a layout is a picture, not a measurement. */
