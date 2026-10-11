@@ -236,7 +236,9 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/queue/events` | local | the caller's own jobs, pushed over SSE: a `snapshot` on connect, then `jobs` whenever the list changes (queued, started, finished, moved in line). One connection serves every job a client has, so it never needs to poll |
 | `X-Hearth-Job: <id>` | request header | the client's own id for this request (letters, digits, `._:-`, up to 128). It comes back as the job's `id` on `/queue` and `/queue/events`, so a client can match updates to its own work |
 | `X-Hearth-Queue: stream` | request header | on a streamed chat, open the stream while the request waits and send `: hearth-queue {"position":N}` comments (how many are ahead, the running turn included). OpenAI-style parsers skip comments. A failure after that arrives as an SSE `data: {"error": …}` frame, since the 200 is already sent |
-| `/config` | local | the config file itself: `GET` its text and status, `PATCH` paths or the whole text |
+| `/config` | local | the config file itself: `GET` its text and status, `PATCH` paths or the whole text (`name` labels the version written) |
+| `/config/draft` | local | the console's unpublished draft, kept beside the file: `GET`, `PUT` a JSON body, `DELETE` |
+| `/config/versions` | local | `GET` the versions written through the node (`at`, `name`, `hash`); `POST { hash, dryRun? }` makes one the file again |
 | `/flows/try` | local | `POST { model, images?, tools?, tokens?, caller?, lane?, flows?, actions?, pretend? }`: where that request would go right now, the step that decides it in each flow, and the actions those steps name. Sends nothing, sets nothing off and counts nothing. `flows` and `actions` try unsaved sections; `pretend: { idle, used, busy, warm, unready, held }` lists models to read as in that state, `pretend.full` steps to read as at their `max` (each `<step>:<flow>`), and `pretend.now` a time of day to read the clock as |
 | `/login`, `/logout` | anyone | `POST {user, pass}` for the operator session cookie; 404 with no `operator` set |
 | `/setup` | anyone, once | `GET` says `{needed}`; `POST {user, pass}` writes the first `operator` and signs it in. `409` once one exists |
@@ -743,6 +745,10 @@ line; **route a name** brings one onto the map.
   [Actions](#actions).
 - **Drag a box** to arrange the map. Where you put things is saved with the
   rest, under `layout:`; **tidy up** goes back to the automatic arrangement.
+- **A type's ⋯** on the Router (it shows as you point at the name) renames it,
+  moves it up or down the list, or removes it; double-clicking the name
+  renames it too. The new name follows into the rule that takes it. The order
+  is kept with the layout.
 - **Try a request** along the bottom asks the node where a request would go
   under the map as you have it now, saved or not, lights the way it takes and
   names the line that decided. **pretend…** lists the state your rules test
@@ -754,20 +760,35 @@ line; **route a name** brings one onto the map.
   several, red for a refusal, amber for an action, grey for nowhere yet.
 - **find** (or the `/` key) searches the map for a rule, an action, a name or
   a model and brings it into view. **Right-click** the map to add a rule or an
-  action there, or a rule or an action to edit it, switch it off or delete it.
+  action there, or a rule or an action to edit it, duplicate it, switch it off
+  or delete it.
+- **Keys**: with a rule or an action selected, Delete or Backspace removes it,
+  Ctrl/⌘+D makes a second one, and Ctrl/⌘+C then Ctrl/⌘+V pastes a copy. A
+  copied rule takes no names until you give it some. Ctrl/⌘+Z undoes. A rule
+  and an action also carry a bin of their own.
 - **?** beside the buttons says what each thing on the map means. A rule or an
-  action is renamed by clicking its name in the panel, and the name follows
-  everywhere it is used.
+  action is renamed by clicking its name, on the map or in the panel, and the
+  name follows everywhere it is used.
 - **A number at the end of a line** is how many requests it has decided since
   the rules last changed or the node started.
 - **In a rule's panel**: switch it off without deleting it, keep a conversation
   on the model it started with, and leave a note on what it is for.
 
-Nothing is written while you edit. The strip along the top counts what you
-have changed and says what still needs attention; **undo** steps back, and
-**review & save** shows the change to the file as a diff, checks that it loads,
-and writes it only when you confirm. A draft survives a reload, and if the file
-changes underneath it your changes are carried over.
+What you edit is a draft: nothing is written and nothing about routing changes
+until you publish it. The strip along the top counts what the draft changes and
+says what still needs attention; **undo** steps back, **discard draft** drops
+it, and **review & publish** shows the change to the file as a diff, checks
+that it loads, and writes it only when you confirm. The node keeps the draft
+beside the config file (`<file>.draft.json`), so it is there the next day and
+from another browser, and if the file changes underneath it your changes are
+carried over.
+
+A publish can be given a name. **versions** lists what has been written through
+the node, newest first, with the file as it stood before the first change;
+picking one shows what going back would change and writes it on confirm. The
+last 50 are kept in `<file>.versions.json`, with the same permissions as the
+config file since they are copies of it. A hand edit to the file is not a
+version.
 
 The **Topology** page is the other picture: the machines, hardware and
 backends, and the requests in flight. It is watched, not edited; backends,
