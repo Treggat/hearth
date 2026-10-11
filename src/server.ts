@@ -2084,7 +2084,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
               path, from: target.name, to: spare.name, model: fb.model,
               detail: e instanceof Error ? e.message : String(e),
             });
-            await run(spare, fb.model, withModel(body, pool.outboundId(fb.model)), false);
+            // A form names its model in a field, which is rewritten as a JSON body's is.
+            const wire = pool.outboundId(fb.model);
+            const spareBody = isForm && body ? replaceMultipartField(body, contentType, "model", wire) ?? body : withModel(body, wire);
+            await run(spare, fb.model, spareBody, false);
           }
         }
       } else if (routed) {

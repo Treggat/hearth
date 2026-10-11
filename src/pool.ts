@@ -444,7 +444,9 @@ export class BackendPool {
 
   /** Is this id this backend's own: pinned to it, declared by it, or in its catalogue? */
   owns(slot: BackendSlot, model: string): boolean {
-    if (this.cfg.models[model]?.backend === slot.name) return true;
+    // A pin decides it: two backends may run the same id, and a name pinned to one is not the other's.
+    const pinned = this.cfg.models[model]?.backend;
+    if (pinned && this.byName.has(pinned)) return pinned === slot.name;
     const wire = this.outboundId(model);
     return slot.cfg.serves.includes(wire) || slot.state.catalog().includes(wire);
   }

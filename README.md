@@ -1138,8 +1138,10 @@ A queued route can name somewhere else to run when its backend cannot answer:
 ```
 
 Unreachable, or a 5xx before any byte, and the same request is queued on `cpu` with its
-`model` renamed to the id that backend serves. A 4xx is the caller's answer and is relayed.
-A request that names an id only the fallback serves goes straight there.
+`model` renamed to the id that backend serves, in a JSON body or a form's `model` field. A 4xx
+is the caller's answer and is relayed. A request that names an id only the fallback serves
+goes straight there, and so does one for a name pinned to it with `models.<id>.backend`, which
+is how two backends that run the same model each get a name of their own.
 
 **Synchronous endpoints only.** ComfyUI's `POST /prompt` → poll `/history/{id}`
 does not fit: holding a slot across two unrelated requests leaks it the moment
