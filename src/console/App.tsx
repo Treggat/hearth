@@ -8,7 +8,7 @@ import { CanaryAlert, History, Inspector, Models, Queue } from "./pages.js";
 import { Palette } from "./Palette.js";
 import type { UiData } from "./types.js";
 import { go, login, logout, restartNode, select, useStore, type Page } from "./store.js";
-import { EditBar, EditRail, Menu, Picker, TryStrip } from "./editor.js";
+import { EditBar, EditRail, Menu, Picker, TryStrip, VersionsHere } from "./editor.js";
 import { changed, useEdit } from "./editStore.js";
 import { Routing } from "./Routing.js";
 import { Topology } from "./Topology.js";
@@ -342,10 +342,13 @@ export default function App() {
           <div className="flex min-h-0 flex-1 flex-col p-5">
             <Card className="flex min-h-[420px] flex-1 flex-col overflow-hidden">
               <div className="flex min-h-0 flex-1">
-                <div className="relative min-w-0 flex-1">
-                  {/* Its own instance: the two pictures share nothing but the node they draw. */}
-                  <Routing />
+                {/* The strip stands over the map, not on it: nothing drawn is ever under it. */}
+                <div className="flex min-w-0 flex-1 flex-col">
                   <EditBar />
+                  <div className="relative min-h-0 flex-1">
+                    {/* Its own instance: the two pictures share nothing but the node they draw. */}
+                    <Routing />
+                  </div>
                   <Picker />
                   <Menu />
                 </div>
@@ -360,7 +363,8 @@ export default function App() {
           <div className="min-h-0 flex-1 overflow-auto p-5">
             {page === "models" && <Models />}
             {page === "queue" && <><Queue /><History /></>}
-            {page === "config" && <Config />}
+            {/* What has been published, and the way back to it, wherever the file is edited. */}
+            {page === "config" && <><div className="mb-2 flex justify-end"><VersionsHere /></div><Config /></>}
           </div>
         )}
       </main>
