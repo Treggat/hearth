@@ -3,7 +3,7 @@
  * concurrency, warm state), so an embedder never waits behind a GPU generation. Nothing
  * schedules across backends; shared hardware only makes one wait for another.
  */
-import { ANY, type BackendConfig, type HearthConfig, type ModelRoute, type RouteRule } from "./config.js";
+import { ANY, backendAuth, type BackendConfig, type HearthConfig, type ModelRoute, type RouteRule } from "./config.js";
 import { BackendState } from "./backend.js";
 import { KINDS } from "./kinds.js";
 import type { Logger } from "./log.js";
@@ -86,7 +86,7 @@ export class BackendPool {
   ) {
     this.arbiter.onRelease(() => this.scheduleResume());
     for (const b of cfg.backends) {
-      const state = new BackendState(b.url, b.kind, log, this.mineOn(b), b.key ? { Authorization: `Bearer ${b.key}` } : {});
+      const state = new BackendState(b.url, b.kind, log, this.mineOn(b), backendAuth(b.format, b.key));
       const slot: BackendSlot = {
         name: b.name,
         cfg: b,
@@ -283,6 +283,13 @@ export class BackendPool {
       if (this.holdActive(s)) return true;
     }
     return false;
+  }
+
+  /** Does another backend's app hold `b`'s hardware right now, whatever the lane? */
+  appHolds(b: BackendConfig): boolean {
+    const mine = this.arbitrated(b.resources);
+    return this.slots.some((s) =>
+      s.cfg.hold !== null && s.name !== b.name && s.cfg.resources.some((r) => mine.includes(r)) && this.holdActive(s));
   }
 
   /** Is this backend's hold in force: its app in use, or its seat loading (or only just loaded)? */

@@ -116,6 +116,8 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `backends.<name>.hold` | none | `{ lanes, idleMs, seat? }`: while this backend's app has work (read off `activity`), keep these lanes off its hardware until it has been idle this long. See [Keeping background work off the card](#keeping-background-work-off-the-card-while-the-app-is-in-use) |
 | `backends.<name>.resident` | `false` | stays loaded beside the card's swapping model and is asked to yield when it needs the memory. See [Something small that lives on a card](#something-small-that-lives-on-a-card) |
 | `backends.<name>.key` | none | sent to this backend as `Authorization: Bearer` on every call, in place of anything the client sent. `env:NAME` keeps it out of the file |
+| `backends.<name>.format` | `openai` | the API it speaks: `openai` (chat completions) or `anthropic` (Messages). See [Anthropic's API](#anthropics-api) |
+| `backends.<name>.promptCache` | `true` | with `format: anthropic`: mark each request's system prompt, tools and conversation so far for the provider's prompt cache |
 | `backends.<name>.cloud` | `false` | a provider's server on the internet: no hardware here, no warm state, and only the models under `serves`. See [A provider's models](#a-providers-models) |
 | `backends.<name>.routes` | none | paths this backend answers besides chat, each with its lane and model. See [Backends that don't speak the OpenAI API](#backends-that-dont-speak-the-openai-api) |
 | `resources.<name>.kind` | `gpu` | `gpu`, `cpu` or `other`. Picks the icon; `gpu` and `other` are exclusive unless shared |
@@ -123,6 +125,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `resources.<name>.shared` | `false` | many backends at once, never arbitrated: CPUs, mostly. See [Hardware that is not a card](#hardware-that-is-not-a-card) |
 | `backendDefaults.concurrency` | `1` | jobs at once per backend, unless it sets its own |
 | `backendDefaults.firstByteMs` | `900000` | how long a backend may take to start answering. Catches one that accepts the connection and then never answers, which would otherwise hold its slot — and its card — until a restart. `0` waits forever |
+| `backendDefaults.restMs` | `30000` | after three failures in a row (no answer, a 5xx, a 429, its key refused), how long a backend is passed over. Only a request whose flow has another line that fits is moved; one with nowhere else to go still tries it. The first request after the rest tries it again, and one more failure rests it again. `0` never passes one over. Chat only |
 | `backendDefaults.idleMs` | `600000` | how long a backend may go silent once its answer has started. Catches a generation that hangs mid-stream. `0` waits forever |
 | `scheduler.lanes` | `chat`, `batch` | named lanes and their base priority |
 | `scheduler.lanes.<lane>.priority` | `0` | base priority. Lower goes first |
@@ -159,6 +162,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `models.<id>.pool` | unset | token budget shared by this model's running turns: `tokens`, and `output` to cap what each turn reserves. See [One backend, models with different ceilings](#one-backend-models-with-different-ceilings) |
 | `models.<id>.stats` | unset | what the model takes, for one that hasn't loaded or a backend that can't say: `context`, `vision`, `tools`, `thinking`, `effort`, `quant`. See [Knowing what a borrowed model can take](#knowing-what-a-borrowed-model-can-take) |
 | `models.<id>.shareAfterMs` | unset | a turn joins this model's running turns only once each has run this long, so two turns started together do not both pay for sharing the card. Only matters where `concurrency` is above 1 |
+| `models.<id>.price` | unset | `{ in, out }`: what a million tokens sent to it and answered by it cost, in dollars. Usage is then shown as spend on the Keys page, `/usage` lists the prices, and a key's `limits.dollarsPerDay` counts it. Spend is worked out from the token counts at the price set now |
 | `models.<id>.cacheMs` | `0` | keep an answer this long and give it to an identical request without running it. Identical means the same model and every request field the same. Shared by every caller, held in memory, and lost on restart. 0 keeps none. See [Keeping answers](#keeping-answers) |
 | `models.<id>.videoTokens` | `49152` | what one video costs this model when checking a request fits its context window. Size it from the seat: frames sampled per clip × tokens per frame |
 | `peers.<name>` | — | one entry per friend: `url` and `token` to borrow from them, `accept` to lend to them, or both |
@@ -226,9 +230,10 @@ apiKeys:
 
 A key can **expire** and be **limited**. `expires` is a day, and the key works
 through the end of it (UTC); after that it is refused like any unknown key.
-`limits` holds it to so many requests a minute and so many tokens a UTC day,
-counted in and out; a request over either is answered `429`. Leave one out, or
-set it to 0, for no limit. The token count is the one [`/usage`](#endpoints)
+`limits` holds it to so many requests a minute, so many tokens a UTC day,
+counted in and out, and so many dollars a UTC day (`dollarsPerDay`) on models
+that carry a [`price`](#configuration); a request over any is answered `429`.
+Leave one out, or set it to 0, for no limit. The token count is the one [`/usage`](#endpoints)
 reports, so it is the backend's own where its answer carries one and an
 estimate where it does not.
 
@@ -258,10 +263,10 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/config` | local | the config file itself: `GET` its text and status, `PATCH` paths or the whole text (`name` labels the version written) |
 | `/config/draft` | local | the console's unpublished draft, kept beside the file: `GET`, `PUT` a JSON body, `DELETE` |
 | `/config/versions` | local | `GET` the versions written through the node (`at`, `name`, `hash`); `POST { hash, dryRun? }` makes one the file again |
-| `/backends/probe` | local | `POST { url, key? }` asks that server for its model list with that key and answers `{ ok, url, models }` or `{ ok: false, problem }`. Nothing is kept; the console uses it before a provider is added |
+| `/backends/probe` | local | `POST { url, key?, format? }` asks that server for its model list with that key and answers `{ ok, url, models }` or `{ ok: false, problem }`. Nothing is kept; the console uses it before a provider is added |
 | `/keys/mint`, `/keys/revoke` | local | `POST { label, models?, expires?, limits? }` writes a new `apiKeys` entry and answers with its key, once; `POST { label }` removes the entry with that label. Both take effect at once |
 | `/v1/evict` | local | `POST { model }` drops a resident model off the backend that serves it. `409` while it is answering a request, when it is not resident, or when the backend can only clear everything and holds other models |
-| `/usage` | local | `GET ?days=N` (31 at most): requests, failures and tokens in and out, as day → caller → model. Days are UTC. Tokens are the backend's own `usage` where its answer carries one; a stream without one is counted by its events, and the request by its estimated size |
+| `/usage` | local | `GET ?days=N` (31 at most): requests, failures and tokens in and out, as day → caller → model, with `prices` for the models that carry one. Days are UTC. Tokens are the backend's own `usage` where its answer carries one; a stream without one is counted by its events, and the request by its estimated size |
 | `/flows/try` | local | `POST { model, images?, tools?, tokens?, caller?, lane?, headers?, flows?, actions?, pretend? }`: where that request would go right now, the step that decides it in each flow, and the actions those steps name. Sends nothing, sets nothing off and counts nothing. `flows` and `actions` try unsaved sections; `pretend: { idle, used, busy, warm, unready, held }` lists models to read as in that state, `pretend.full` steps to read as at their `max` (each `<step>:<flow>`), and `pretend.now` a time of day to read the clock as |
 | `/login`, `/logout` | anyone | `POST {user, pass}` for the operator session cookie; 404 with no `operator` set |
 | `/setup` | anyone, once | `GET` says `{needed}`; `POST {user, pass}` writes the first `operator` and signs it in. `409` once one exists |
@@ -537,6 +542,8 @@ canary:
     chat: {}
     reasoner:
       maxTokens: 1024
+    # anything:              # a `follow` id: whatever the card holds answers under it
+    #   onlyAs: chat         # watched only while that is `chat`
 
   # Or every model a backend serves.
   # backends:
@@ -630,6 +637,18 @@ hearth does not phrase a title or a message, so a receiver that wants one (a
 chat webhook, a notification API with its own field names) builds it from these
 fields, in whatever sits at `url`. The hook is fire-and-forget: one that is
 slow, wrong or down gets a line in the log and changes nothing else.
+
+### A followed id: `onlyAs`
+
+A `follow` id goes out as whatever its card holds, so a probe of it asks whichever model is
+loaded. Where the question, the token budget or the cost of a wrong verdict only fit one of
+them, name it: `canary.models.<id>.onlyAs: <backend id>`. While the id goes out as anything
+else it is not probed, real traffic under it is not judged, a verdict it earned as the named
+model is not held against the one answering now, and recovery leaves that model alone. The
+moment the named model is back under the id, so is the canary, with the state it had.
+
+A recovery reload also treats a card that an app is keeping with `hold:` as occupied: it
+waits for the app to let go rather than swapping it out.
 
 ### recovery
 
@@ -778,7 +797,7 @@ line; **route a name** brings one onto the map.
   automatic arrangement. What you have not placed fits itself around what you
   have: a model sits level with the lines that reach it, rules stand in the
   order of the names that enter them, and a box that would lie on another is
-  drawn below it.
+  drawn below it. Boxes that only touch are left where you put them.
 - **+ type** takes a name typed straight into it. Drawn onto a model that is
   not chat, a new type takes the paths that model answers on.
 - **A type's ⋯** on the Router (it shows as you point at the name) renames it,
@@ -817,6 +836,12 @@ line; **route a name** brings one onto the map.
   copied rule takes no names until you give it some. Ctrl/⌘+Z undoes and
   Ctrl/⌘+Shift+Z redoes, across routers and both pages; Escape closes the panel. A rule
   and an action also carry a bin of their own.
+- **Several at once**: hold Ctrl/⌘ and drag across the map to draw a box round
+  nodes, or Ctrl/⌘+click to add one or take it out. What is picked out wears a
+  ring and moves as one. Delete, Ctrl/⌘+D and copy and paste then act on every
+  rule and action among them, as one change, and the copies land beside the
+  originals already picked out. A model, a peer or a refusal is moved with the
+  rest and otherwise left alone. Escape or a click on the map lets go.
 - **?** beside the buttons says what each thing on the map means. A rule or an
   action is renamed by clicking its name, on the map or in the panel, and the
   name follows everywhere it is used.
@@ -1075,12 +1100,45 @@ off a peer, by a header, a caller or a lane.
   backend, and keeps the extra event from a caller who did not ask for it. Per-key
   usage and `tokensPerDay` then count what the provider billed, not an estimate.
 
-The API has to be OpenAI-shaped. One with a format of its own is not reached
-this way. Where a provider offers an OpenAI-compatible layer beside a native
+The API has to be OpenAI-shaped, or Anthropic's (below). One with another
+format of its own is not reached this way. Where a provider offers an OpenAI-compatible layer beside a native
 API, the layer is what this talks to, and it usually leaves things out: prompt
 caching, strict tool schemas and reasoning text are common ones, and a field it
 does not know is often dropped without an error. Check the provider's notes on
 its compatibility layer before relying on one of those.
+
+#### Anthropic's API
+
+`format: anthropic` on a backend makes the node speak the Messages API to it.
+Callers still send and receive chat completions; the request and the answer
+are rewritten on the way through, streams included.
+
+```yaml
+backends:
+  provider:
+    url: https://api.anthropic.com
+    cloud: true
+    format: anthropic
+    key: env:PROVIDER_KEY
+    serves: [their-model-id]
+```
+
+- The key goes out as `x-api-key` with the API's version header.
+- **Prompt caching is on.** Each request's system prompt, its tools and the
+  conversation so far are marked as cached prefixes, so the next turn of the
+  same conversation pays for them as a cache read. A cache write costs more
+  than plain input, so for one-off requests with long prompts that are never
+  repeated, set `promptCache: false`.
+- `usage.prompt_tokens` counts all input, cached or not, and
+  `usage.prompt_tokens_details.cached_tokens` says how much was read from the
+  cache. Per-key usage counts the same totals.
+- What is carried across: system and developer messages, text and images,
+  tools, tool calls and their results, `tool_choice`, `max_tokens`
+  (4096 when the request names none: this API requires one), `temperature`,
+  `top_p`, `stop`, and streaming. Reasoning text comes back as
+  `reasoning_content`. Other request fields are not sent.
+- The [canary](#canary) probes with a chat completion and so cannot probe a
+  model on such a backend.
 
 ### Backends that share a card
 

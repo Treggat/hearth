@@ -12,7 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { actionDecls, runAction, type Action, type ActionFacts } from "./actions.js";
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import { createCanary, degradedError, type RelayWatch } from "./canary.js";
-import { ANY, backendBase, ConfigError, flowsFor, resolveSecret, peersMapping, WARM_LANE, type BackendConfig, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
+import { ANY, backendAuth, backendBase, ConfigError, flowsFor, resolveSecret, peersMapping, WARM_LANE, type BackendConfig, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
 import { Controls } from "./controls.js";
 import { emulatedRequest, relayEmulated, streamErrorFrame } from "./emulate.js";
 import { ConfigFile, ConfigRefusal, deepFreeze, link, setNote, setShare, unlink, writeFileAtomic } from "./configfile.js";
@@ -27,8 +27,9 @@ import { KEEP_DAYS, meter, Usage, withoutUsage, type Meter } from "./usage.js";
 import { Answers } from "./answers.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
 import { CONSOLE_HTML } from "./ui.js";
-import { createViews, type CallerUse, type KeyInfo } from "./views.js";
+import { createViews, type CallerUse, type KeyInfo, type Spent } from "./views.js";
 import { multipartField, replaceMultipartField } from "./multipart.js";
+import { relayAnthropic, toAnthropic } from "./anthropic.js";
 import { troubleSays } from "./backend.js";
 import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
 
@@ -111,9 +112,6 @@ const HOP_BY_HOP = new Set([
 /** Said to a caller whose own key was fine: a 401 passed on from the backend would read as this node refusing them. */
 const KEY_REFUSED = "the backend refused the key this node sends it; the key you sent this node was accepted";
 const refusedKey = (status: number): boolean => status === 401 || status === 403;
-
-/** A backend's own key as the header it is sent in; `name` matches the case of the headers it joins. */
-const keyed = (key: string, name = "Authorization"): Record<string, string> => ({ [name]: `Bearer ${key}` });
 
 function forwardable(
   headers: IncomingMessage["headers"] | UpstreamResponse["headers"],
@@ -231,6 +229,19 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** When each limited key last asked, for its requests-a-minute limit. */
   const asked = new Map<string, number[]>();
 
+  /**
+   * What a caller used over some days, with what it cost. ponytail: priced at what each model
+   * costs now, not on the day; keep dollars in the ledger if prices change often enough to matter.
+   */
+  function spent(caller: string, days: number): Spent {
+    let cost = 0;
+    for (const [model, row] of Object.entries(usage.byModel(caller, days))) {
+      const p = cfg.models[model]?.price;
+      if (p) cost += (row.in * p.in + row.out * p.out) / 1_000_000;
+    }
+    return { ...usage.total(caller, days), cost };
+  }
+
   /** Hold a key to its limits: so many requests a minute, so many tokens a UTC day. Counts the request it lets through. */
   function withinLimits(caller: string): void {
     if (!caller.startsWith("key:")) return;
@@ -241,6 +252,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       const used = usage.total(caller, 1);
       if (used.in + used.out >= rule.tokensPerDay) throw new Refusal(429, `this key has used its ${rule.tokensPerDay} tokens for today (UTC)`, "rate_limit_error");
     }
+    if (rule.dollarsPerDay > 0 && spent(caller, 1).cost >= rule.dollarsPerDay) throw new Refusal(429, `this key has spent its $${rule.dollarsPerDay} for today (UTC)`, "rate_limit_error");
     if (rule.requestsPerMinute > 0) {
       const now = Date.now();
       const recent = (asked.get(caller) ?? []).filter((t) => now - t < 60_000);
@@ -454,10 +466,19 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   }
 
   /** Sends a chat completion to a local backend, emulating another server's answers if the route asks. */
-  async function sendLocal(url: string, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; headers?: Record<string, string>; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
+  async function sendLocal(to: BackendConfig, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
     const emulate = cfg.models[model]?.emulate ?? null;
-    const { count, ...reach } = opts;
+    const { count, ...deadline } = opts;
+    const url = to.url;
+    const reach = { ...deadline, headers: backendAuth(to.format, to.key) };
     const sent = pool.outboundBody(model, payload);
+    if (to.format === "anthropic") {
+      const up = await send(`${url}/v1/messages`, { json: toAnthropic(sent, to.promptCache), ...reach });
+      if (to.key && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
+      if (spare && up.status >= 500 && !res.headersSent) throw new BackendFailed(up.status, (await up.text()).slice(0, 200));
+      const asks = typeof sent.stream_options === "object" && sent.stream_options !== null && (sent.stream_options as Record<string, unknown>).include_usage === true;
+      return relayAnthropic(up, res, { model: String(sent.model ?? model), usage: asks, ...(count ? { meter: count } : {}) });
+    }
     const options = typeof sent.stream_options === "object" && sent.stream_options !== null ? sent.stream_options as Record<string, unknown> : {};
     // A provider says what a stream cost only when asked. Asked here for the count, the report is kept from a caller who did not ask for it.
     const ask = count !== undefined && sent.stream === true && options.include_usage !== true;
@@ -467,7 +488,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Errors on either side end both, so the relay below sees a failed stream as it would the backend's own.
     const up = ask && got.status < 400 ? { ...got, body: pipeline_(got.body, withoutUsage(count!), () => {}) } : got;
     // The key refused was this node's, not the caller's: said as such, and the request may move on.
-    if (opts.headers && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
+    if (to.key && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
     // With somewhere else to run it, a backend's own failure is not relayed: the request moves on.
     if (spare && up.status >= 500 && !res.headersSent) throw new BackendFailed(up.status, (await up.text()).slice(0, 200));
     if (emulate) return relayEmulated(up, res, relayable(up), sentAt);
@@ -841,7 +862,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       ranOn = local.name;
       await local.state.ensureFresh();
     // Our id and the route's params on the way to the backend; untouched when neither is set.
-      localStatus = await sendLocal(local.cfg.url, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.key ? { headers: keyed(local.cfg.key) } : {}), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}) }, spare);
+      localStatus = await sendLocal(local.cfg, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}) }, spare);
     };
 
     const t: Timing = { enqueuedAt: Date.now(), startedAt: 0, meter: meter(res), need: Math.max(0, (need?.tokens ?? 0) - (need?.output ?? 0)) };
@@ -878,6 +899,18 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         const spare = (): ReturnType<typeof resolve> => (routerOf(caller)?.strict
           ? { ...decision, target: "unavailable" as const, reason: "its router never falls back" }
           : resolve(asked, { ...world, noPeers: true, skip: new Set([...failed, model]) }));
+        // A backend that keeps failing is not made to fail once more for each request, while another line fits.
+        if (local.state.restingMs() > 0 && !res.headersSent) {
+          const next = spare();
+          if (next.target === "local" && !failed.has(next.model) && next.model !== model) {
+            log.debug("route.resting_trying_next", { asked, model, backend: local.name, next: next.model, restingMs: local.state.restingMs() });
+            failed.add(model);
+            land(next);
+            fire(next);
+            why = next.reason;
+            continue;
+          }
+        }
         // Refused here only on reported limits, before queueing or evicting; the backend stays the authority.
         const fitted = fitOutput(pool.statsFor(model), needsOf(payload, cfg.models[model]?.videoTokens), payload);
         const tooMuch = unfit(pool.statsFor(model), fitted);
@@ -897,6 +930,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           );
         } catch (e) {
           logRequest(t, { model, lane, caller, backend: local.name, target: "local", reason: why }, false, e);
+          // Its own fault, not the caller's or a full queue's: counted towards resting it.
+          if (!signal.aborted && !(e instanceof QueueFullError) && (e instanceof BackendFailed || !(e instanceof Refusal))) local.state.struck(cfg.backendRestMs);
           const mayMove = !res.headersSent && !signal.aborted && !(e instanceof QueueFullError) && (e instanceof BackendFailed || !(e instanceof Refusal));
           const next = mayMove ? spare() : null;
           if (!next || next.target !== "local" || failed.has(next.model) || next.model === model) throw e;
@@ -907,6 +942,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           why = next.reason;
           continue;
         }
+        // An answer of its own making that says it cannot serve (overloaded, rate limited) counts as a failure too.
+        if (localStatus >= 500 || localStatus === 429) local.state.struck(cfg.backendRestMs);
+        else local.state.answered();
         logRequest(
           t,
           { model, lane, caller, backend: local.name, target: "local", reason: why,
@@ -1595,19 +1633,20 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   const keysView = (): KeyInfo[] =>
     cfg.apiKeys.map((k, i) => {
       const caller = "key:" + (cfg.apiKeyLabels[i] || keyId(k));
-      return { label: cfg.apiKeyLabels[i] ?? "", id: keyId(k), models: cfg.apiKeyModels[i] ?? null, lastSeen: keySeen.get(caller) ?? null, today: usage.total(caller, 1), month: usage.total(caller, KEEP_DAYS), rule: cfg.apiKeyRules[i] ?? null };
+      return { label: cfg.apiKeyLabels[i] ?? "", id: keyId(k), models: cfg.apiKeyModels[i] ?? null, lastSeen: keySeen.get(caller) ?? null, today: spent(caller, 1), month: spent(caller, KEEP_DAYS), rule: cfg.apiKeyRules[i] ?? null };
     });
 
   /** Whoever else used this node in the last month: this machine with no key, and peers. */
   const othersView = (): CallerUse[] => {
     const keys = new Set(cfg.apiKeys.map((k, i) => "key:" + (cfg.apiKeyLabels[i] || keyId(k))));
-    return usage.callers().filter((c) => !keys.has(c)).map((caller) => ({ caller, today: usage.total(caller, 1), month: usage.total(caller, KEEP_DAYS) }));
+    return usage.callers().filter((c) => !keys.has(c)).map((caller) => ({ caller, today: spent(caller, 1), month: spent(caller, KEEP_DAYS) }));
   };
 
   // What was used, by whom: the last `days` days (31 at most) as day -> caller -> model -> counts.
   async function routeUsage(c: Call): Promise<void> {
     const days = Math.min(KEEP_DAYS, Math.max(1, Number(c.url.searchParams.get("days")) || KEEP_DAYS));
-    json(c.res, 200, { days, usage: usage.since(days) });
+    const prices = Object.fromEntries(Object.entries(cfg.models).flatMap(([id, m]) => (m.price ? [[id, m.price]] : [])));
+    json(c.res, 200, { days, usage: usage.since(days), prices });
   }
 
   // Drop a model off the card that serves it. Per-model where the backend can, because that
@@ -1651,10 +1690,11 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       const body = await readJson(c.req);
       if (typeof body.url !== "string") throw new Refusal(400, "url is required");
       const key = typeof body.key === "string" && body.key.trim() !== "" ? resolveSecret(body.key.trim(), "key") : null;
+      const format = body.format === "anthropic" ? "anthropic" : "openai";
       let url: string;
       try { url = backendBase(body.url.trim(), "url"); } catch (e) { throw new Refusal(400, e instanceof Error ? e.message : String(e)); }
       try {
-        const got = await getJson<{ data?: { id?: unknown }[] }>(`${url}/v1/models`, { headers: key ? keyed(key) : {}, headersTimeoutMs: 5_000 });
+        const got = await getJson<{ data?: { id?: unknown }[] }>(`${url}/v1/models`, { headers: backendAuth(format, key), headersTimeoutMs: 5_000 });
         const models = (got.data ?? []).map((m) => m.id).filter((m): m is string => typeof m === "string" && m !== "").sort();
         json(c.res, 200, { ok: true, url, models });
       } catch (e) {
@@ -2006,7 +2046,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           t.startedAt = Date.now();
           await serving.state.ensureFresh();
           // A lent request gets the same id rewrite and params as a local one.
-          lentStatus = await sendLocal(serving.cfg.url, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
+          lentStatus = await sendLocal(serving.cfg, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
         },
       );
     } catch (e) {
@@ -2305,7 +2345,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         ...(sendBody && sendBody.length > 0 ? { raw: sendBody } : {}),
         // Client headers minus hop-by-hop, and minus our own key if that is what it carries.
         // A backend with a key of its own is sent that, whatever the client carried.
-        headers: { ...stripOurKey(req), ...(to.cfg.key ? keyed(to.cfg.key, "authorization") : {}) } as Record<string, string>,
+        headers: { ...stripOurKey(req), ...backendAuth(to.cfg.format, to.cfg.key) } as Record<string, string>,
         signal: ctrl.signal,
         ...backendDeadline(to.cfg),
       });

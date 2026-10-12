@@ -496,8 +496,10 @@ export type Box = { id: string; x: number; y: number; w: number; h: number };
 /**
  * Where each box sits once none overlaps another: taken top to bottom, a box that would lie on one
  * above it moves down past it. `carry` names the boxes drawn beside another, which move with it.
+ * `gap` is how near two may come before they count as overlapping: none, so boxes that only
+ * touch stay where they were put.
  */
-export function spread(boxes: Box[], carry: Map<string, string[]> = new Map(), gap = 12): Map<string, number> {
+export function spread(boxes: Box[], carry: Map<string, string[]> = new Map(), gap = 0): Map<string, number> {
   const ys = new Map(boxes.map((b) => [b.id, b.y]));
   const settled: Box[] = [];
   for (const b of [...boxes].sort((p, q) => p.y - q.y)) {
@@ -636,6 +638,40 @@ export function summary(from: Doc, to: Doc): string[] {
 /** Remember where a node was put, to the pixel: a layout is a picture, not a measurement. */
 export const placed = (doc: Doc, id: string, at: { x: number; y: number }): Doc =>
   put(doc, "layout", id, { x: Math.round(at.x), y: Math.round(at.y) });
+
+/** A node picked out on the map and where it stands. */
+export type Picked = { node: string; x: number; y: number };
+/** One of them that stands in the file on its own, and what it said when it was copied. */
+export type Copied = Picked & { kind: "flow" | "action"; id: string; entry: Doc };
+
+/**
+ * The nodes among `many` that are a thing of their own in the file: a rule or an action, as its
+ * kind and name. A node that is part of one, or is only somewhere a line ends, is moved and nothing more.
+ */
+export function wholes(many: Picked[]): (Picked & { kind: "flow" | "action"; id: string })[] {
+  return many.flatMap((m) => {
+    const at = nodeOf(m.node);
+    const on = at.kind.opens?.(at.id);
+    return on && on.id === at.id ? [{ ...m, ...on }] : [];
+  });
+}
+
+/**
+ * Everything in `copied` put in again, each under a free name with its node a little down and
+ * right of the one it came from; `made` is the new nodes, in the same order.
+ */
+export function pastedAll(doc: Doc, copied: Copied[]): { doc: Doc; made: Picked[] } {
+  const made: Picked[] = [];
+  let out = doc;
+  for (const c of copied) {
+    const next = added(out, c.kind === "flow" ? "flows" : "actions", c.id, c.entry);
+    const node = `${c.node.slice(0, c.node.indexOf(":"))}:${next.name}`;
+    const at = { x: c.x + 40, y: c.y + 40 };
+    out = placed(next.doc, `routing/${node}`, at);
+    made.push({ node, ...at });
+  }
+  return { doc: out, made };
+}
 
 const at = (doc: unknown, path: (string | number)[]): unknown => path.reduce<unknown>((cur, k) => (cur as Record<string | number, unknown> | undefined)?.[k], doc);
 

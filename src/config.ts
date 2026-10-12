@@ -128,6 +128,19 @@ export interface BackendConfig {
    * and serves only what `serves` names. A request sent to it leaves this machine and this network.
    */
   cloud: boolean;
+  /** The API it speaks: OpenAI's chat completions, or Anthropic's Messages, which requests and answers are rewritten for. */
+  format: BackendFormat;
+  /** With `format: anthropic`: mark each request's system prompt, tools and conversation so far for the provider's prompt cache. */
+  promptCache: boolean;
+}
+
+export const BACKEND_FORMATS = ["openai", "anthropic"] as const;
+export type BackendFormat = (typeof BACKEND_FORMATS)[number];
+
+/** What a backend is sent to say who is calling: its key in the header its API reads, and for Messages the version. */
+export function backendAuth(format: BackendFormat, key: string | null): Record<string, string> {
+  if (format === "anthropic") return { "anthropic-version": "2023-06-01", ...(key ? { "x-api-key": key } : {}) };
+  return key ? { authorization: `Bearer ${key}` } : {};
 }
 
 /**
@@ -293,6 +306,8 @@ export interface ModelRoute {
   emulate: Emulation | null;
   /** Tokens the model's running requests share (vLLM's KV cache, llama.cpp `--kv-unified`); `output` caps each request's counted `max_tokens`, null counts it whole. */
   pool: { tokens: number; output: number | null } | null;
+  /** What a million tokens in and out cost, in dollars, where using this model is paid for. null is not priced. */
+  price: { in: number; out: number } | null;
   /** A turn shares the backend with this model's running turns only once each has run this long; unset never waits. */
   shareAfterMs?: number;
   /** How long an answer is kept for an identical request; unset or 0 keeps none. */
@@ -327,6 +342,11 @@ export interface CanaryProbe {
   failureThreshold: number;
   /** This many consecutive clean probes brings it back. */
   recoverAfter: number;
+  /**
+   * Watch this id only while it goes out as this backend id: for a `follow` id, whose card may
+   * hold a model the question, or the cost of a wrong verdict, does not fit. null always watches.
+   */
+  onlyAs: string | null;
 }
 
 /** Where a state change is announced, and with what. */
@@ -478,6 +498,8 @@ export interface HearthConfig {
    * Catches a generation that hangs mid-stream, which would otherwise hold its slot and card.
    */
   backendIdleMs: number;
+  /** How long a backend is passed over, where a flow has another line that fits, after three failures in a row. 0 never passes one over. */
+  backendRestMs: number;
   /**
    * How long shutdown waits for in-flight requests, in ms; 0 kills them at once. Keep the
    * service manager's stop timeout above it.
@@ -873,6 +895,14 @@ function modelConcurrency(entry: Record<string, unknown>, id: string): number | 
   return count(entry.concurrency, `models.${id}.concurrency`, 1, 1);
 }
 
+/** `price: { in: 3, out: 15 }`: dollars per million tokens. */
+function modelPrice(v: unknown, id: string): ModelRoute["price"] {
+  if (v === undefined || v === null) return null;
+  const p = asRecord(v, `models.${id}.price`);
+  only(p, "price", `models.${id}.price`);
+  return { in: atLeast(p.in, `models.${id}.price.in`, 0), out: atLeast(p.out, `models.${id}.price.out`, 0) };
+}
+
 /** `pool: 144000`, or `pool: { tokens: 144000, output: 8192 }`. */
 function modelPool(v: unknown, id: string): ModelRoute["pool"] {
   if (v === undefined || v === null) return null;
@@ -923,8 +953,10 @@ export interface KeyRule {
   expires: number | null;
   requestsPerMinute: number;
   tokensPerDay: number;
+  /** What it may spend in a UTC day, in dollars, on models that carry a `price`. 0 is no limit. */
+  dollarsPerDay: number;
 }
-const NO_RULE: KeyRule = { expires: null, requestsPerMinute: 0, tokensPerDay: 0 };
+const NO_RULE: KeyRule = { expires: null, requestsPerMinute: 0, tokensPerDay: 0, dollarsPerDay: 0 };
 
 /** `apiKeys:` entries: a bare secret, or `{ key, label }`. Labels are shown wherever caller ids are. */
 function apiKeyList(
@@ -1000,13 +1032,13 @@ function apiKeyList(
       expires = t + 86_400_000;
     }
     const limits = entry.limits === undefined ? {} : asRecord(entry.limits, `${at}.limits`);
-    only(limits, ["requestsPerMinute", "tokensPerDay"], `${at}.limits`);
+    only(limits, ["requestsPerMinute", "tokensPerDay", "dollarsPerDay"], `${at}.limits`);
     const cap = (k: "requestsPerMinute" | "tokensPerDay"): number => {
       const n = num(limits[k], `${at}.limits.${k}`, 0);
       if (!Number.isInteger(n) || n < 0) throw bad(`${at}.limits.${k}`, "must be a whole number, 0 or more");
       return n;
     };
-    take(key, label, at, scope, { expires, requestsPerMinute: cap("requestsPerMinute"), tokensPerDay: cap("tokensPerDay") });
+    take(key, label, at, scope, { expires, requestsPerMinute: cap("requestsPerMinute"), tokensPerDay: cap("tokensPerDay"), dollarsPerDay: atLeast(limits.dollarsPerDay, `${at}.limits.dollarsPerDay`, 0) });
   });
   return { keys, labels, models, rules };
 }
@@ -1174,6 +1206,11 @@ function probeOverrides(raw: unknown, where: string): Partial<CanaryProbe> {
     out.failureThreshold = count(o.failureThreshold, `${where}.failureThreshold`, 1, 1);
   }
   if (o.recoverAfter !== undefined) out.recoverAfter = count(o.recoverAfter, `${where}.recoverAfter`, 1, 1);
+  if (o.onlyAs !== undefined) {
+    const onlyAs = str(o.onlyAs, `${where}.onlyAs`).trim();
+    if (onlyAs === "") throw bad(`${where}.onlyAs`, "must not be empty");
+    out.onlyAs = onlyAs;
+  }
   return out;
 }
 
@@ -1195,6 +1232,7 @@ function canaryDecl(v: unknown, backends: readonly BackendConfig[]): CanaryConfi
     intervalMs: count(c.intervalMs, "canary.intervalMs", 30_000, 1),
     failureThreshold: count(c.failureThreshold, "canary.failureThreshold", 2, 1),
     recoverAfter: count(c.recoverAfter, "canary.recoverAfter", 1, 1),
+    onlyAs: null,
   };
 
   const models: Record<string, Partial<CanaryProbe>> = {};
@@ -1330,8 +1368,12 @@ export function parseConfig(raw: unknown): HearthConfig {
       if (server !== null) throw bad(`${at}.server`, "is a machine on your network; a cloud backend takes a url");
       if (strList(entry.serves, `${at}.serves`).length === 0) throw bad(`${at}.serves`, "is required on a cloud backend: name the models to offer from it, as its provider names them or as `models.<id>.as` maps them");
     }
+    const format = str(entry.format, `${at}.format`, "openai");
+    if (!BACKEND_FORMATS.includes(format as BackendFormat)) throw bad(`${at}.format`, `is "${format}" — expected ${BACKEND_FORMATS.join(" or ")}`);
     backends.push({
       name,
+      format: format as BackendFormat,
+      promptCache: bool(entry.promptCache, `${at}.promptCache`, true),
       key: entry.key === undefined ? null : resolveSecret(str(entry.key, `${at}.key`), `${at}.key`),
       cloud,
       url: backendUrl(entry, at, server === null ? null : servers[server]!.host),
@@ -1567,6 +1609,7 @@ export function parseConfig(raw: unknown): HearthConfig {
       stats: declaredStats(entry.stats, id),
       emulate: emulate === "" ? null : (emulate as Emulation),
       pool: modelPool(entry.pool, id),
+      price: modelPrice(entry.price, id),
     };
     if (entry.shareAfterMs !== undefined) {
       models[id].shareAfterMs = count(entry.shareAfterMs, `models.${id}.shareAfterMs`, 0, 0);
@@ -1671,6 +1714,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     peerFirstByteMs: atLeast(borrowing.firstByteMs, "borrowing.firstByteMs", 180_000),
     backendFirstByteMs: atLeast(defaults.firstByteMs, "backendDefaults.firstByteMs", 900_000),
     backendIdleMs: atLeast(defaults.idleMs, "backendDefaults.idleMs", 600_000),
+    backendRestMs: atLeast(defaults.restMs, "backendDefaults.restMs", 30_000),
     coldPenalty: atLeast(borrowing.coldPenalty, "borrowing.coldPenalty", 2),
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.

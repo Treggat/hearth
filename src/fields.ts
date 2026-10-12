@@ -22,7 +22,7 @@ export type Field =
 
 export type Scope =
   | "node" | "listen" | "backendDefaults" | "backend" | "activity" | "resource" | "server" | "flow" | "action" | "scheduler" | "lane"
-  | "model" | "stats" | "pool" | "peer" | "lending" | "borrowing" | "operator";
+  | "model" | "stats" | "pool" | "price" | "peer" | "lending" | "borrowing" | "operator";
 
 const ms = (desc: string, def?: number | string, min?: number): Field =>
   ({ type: "ms", desc, ...(def !== undefined ? { def } : {}), ...(min !== undefined ? { min } : {}) });
@@ -57,6 +57,7 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     concurrency: { type: "number", min: 1, desc: "Jobs at once on a backend.", def: 1 },
     firstByteMs: ms("How long a backend may take to start answering. 0 waits forever.", 900000),
     idleMs: ms("How long a backend may go silent mid-answer. 0 waits forever.", 600000),
+    restMs: ms("After three failures in a row, how long a backend is passed over where a flow has another line that fits. 0 never passes one over.", 30000),
   },
   backend: {
     url: { type: "text", desc: "The OpenAI-compatible server hearth fronts. Or set server and port." },
@@ -73,6 +74,8 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     hold: { type: "raw", desc: "`{ lanes, idleMs, seat? }`: while this backend's app has work (read off `activity`), keep these lanes off its hardware until it has been idle this long. `seat` is the id a model swapper loads the app under, so the hold starts as the seat loads." },
     routes: { type: "raw", desc: "Paths this backend answers besides chat, each with its lane and model." },
     key: { type: "secret", desc: "Sent to this backend as its bearer key on every call. env:NAME keeps it out of the file." },
+    format: { type: "enum", options: ["openai", "anthropic"], desc: "The API it speaks. anthropic is the Messages API: requests and answers are rewritten, so callers still see chat completions.", def: "openai" },
+    promptCache: { type: "bool", desc: "With format anthropic: mark each request's system prompt, tools and conversation so far for the provider's prompt cache.", def: true },
     cloud: { type: "bool", desc: "A provider's server on the internet: no hardware here, and only the models under serves. Requests sent to it leave this network.", def: false },
   },
   activity: {
@@ -129,6 +132,7 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     videoTokens: { type: "number", min: 1, desc: "What one video costs when checking a request fits the context window.", def: 49152 },
     params: { type: "object", desc: "Request fields stamped on every call: temperature, top_p and the like.", seed: {} },
     stats: { type: "object", scope: "stats", desc: "What the model takes, for one that hasn't loaded or a backend that can't say.", seed: {} },
+    price: { type: "object", scope: "price", desc: "What a million tokens in and out cost, in dollars: usage is then shown as spend, and a key can be capped by it.", seed: { in: 0, out: 0 } },
     pool: { type: "object", scope: "pool", desc: "Token budget shared by this model's running turns.", seed: { tokens: 131072 } },
     emulate: { type: "enum", options: ["llama-server"], desc: "Reshape this backend's answers into another server's format." },
   },
@@ -139,6 +143,10 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     thinking: { type: "bool", desc: "Reasons before answering." },
     effort: { type: "bool", desc: "Takes a reasoning-effort setting." },
     quant: { type: "text", desc: "Quantization, shown to borrowers." },
+  },
+  price: {
+    in: { type: "number", min: 0, desc: "Dollars per million tokens sent to it." },
+    out: { type: "number", min: 0, desc: "Dollars per million tokens it answers with." },
   },
   pool: {
     tokens: { type: "number", min: 1, desc: "Tokens shared by this model's running turns." },
