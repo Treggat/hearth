@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { applyOps, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
+import { applyOps, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -325,6 +325,14 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   // Ends sit level with the lines that reach them, in that order, never closer than a step; one no line reaches goes last.
   const from: Record<string, number[]> = { low: [300, 340], high: [20], mid: [40], none: [] };
   assert.deepEqual(Object.fromEntries(beside(["low", "high", "mid", "none"], (id) => from[id]!, 50)), { high: 0, mid: 50, low: 295, none: 345 });
+  // A box of one caller is as wide as the card under it, its chip in the middle: cards under two such boxes side by side stay clear.
+  const [chip, edge, card, gap] = [{ w: 150, h: 30, gap: 6, cols: 2 }, { head: 24, pad: 10 }, 200, 12];
+  const one = bayRoom(1, chip, edge, card);
+  assert.deepEqual(one, { cols: 1, w: 200, h: 64, inset: 25 });
+  const middles = [one.w / 2, one.w + gap + one.w / 2];
+  assert.ok(middles[1]! - middles[0]! >= card + gap);
+  // One wider than the card keeps its own width, a row short of two chips starting at its edge.
+  assert.deepEqual(bayRoom(3, chip, edge, card), { cols: 2, w: 326, h: 100, inset: 10 });
 }
 
 // --- a router's rulebook as the one on the map --------------------------------------------------------
