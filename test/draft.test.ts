@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { applyOps, put, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
+import { applyOps, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -201,6 +201,22 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual(saved, { doc: mine });
   const { servers: _gone, ...dropped } = doc();
   assert.deepEqual(rebase(doc(), dropped, dropped), { doc: dropped }, "a removal that already happened included");
+}
+
+// --- several nodes picked out on the map, copied and put in again together ----------------------------------------
+{
+  // Only a node that is a rule or an action in its own right is copied or deleted; the rest are moved and nothing more.
+  const many = [{ node: "flow:pick", x: 10, y: 20 }, { node: "refuse:pick:0", x: 0, y: 0 }, { node: "model:chat", x: 5, y: 5 }, { node: "action:note", x: 1, y: 2 }];
+  assert.deepEqual(wholes(many).map((w) => [w.kind, w.id, w.node]), [["flow", "pick", "flow:pick"], ["action", "note", "action:note"]]);
+  // Each copy goes in under a free name, a little down and right of the node it came from.
+  const from = put(doc(), "actions", "note", { log: "hello" });
+  const copied = wholes(many).map((w) => ({ ...w, entry: (from[w.kind === "flow" ? "flows" : "actions"] as Record<string, Doc>)[w.id]! }));
+  const { doc: out, made } = pastedAll(from, copied);
+  assert.deepEqual(made, [{ node: "flow:pick-copy", x: 50, y: 60 }, { node: "action:note-copy", x: 41, y: 42 }]);
+  assert.deepEqual(out.layout, { "routing/flow:pick-copy": { x: 50, y: 60 }, "routing/action:note-copy": { x: 41, y: 42 } });
+  assert.deepEqual([(out.flows as Record<string, Doc>)["pick-copy"]!.inputs, (out.actions as Record<string, Doc>)["note-copy"]], [[], { log: "hello" }], "a copied rule takes no names");
+  assert.doesNotThrow(() => parseConfig(out));
+  assert.deepEqual(pastedAll(from, []), { doc: from, made: [] });
 }
 
 // --- what a person can fix is said before the file refuses it -----------------------------------------------------
