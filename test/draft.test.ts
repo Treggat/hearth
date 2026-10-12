@@ -303,6 +303,9 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
     { id: "c", x: 500, y: 30, w: 100, h: 50 }, { id: "d", x: 60, y: 90, w: 100, h: 20 },
   ], new Map([["b", ["b-side"]]]), 10);
   assert.deepEqual(Object.fromEntries(ys), { a: 0, b: 60, "b-side": 70, c: 30, d: 120 });
+  // Boxes set against each other are left alone: only one that lies on another is moved, and then to just below it.
+  const flush = spread([{ id: "a", x: 0, y: 0, w: 100, h: 50 }, { id: "under", x: 0, y: 50, w: 100, h: 50 }, { id: "beside", x: 100, y: 0, w: 100, h: 50 }, { id: "on", x: 150, y: 40, w: 100, h: 50 }]);
+  assert.deepEqual(Object.fromEntries(flush), { a: 0, under: 50, beside: 0, on: 50 });
   // Ends sit level with the lines that reach them, in that order, never closer than a step; one no line reaches goes last.
   const from: Record<string, number[]> = { low: [300, 340], high: [20], mid: [40], none: [] };
   assert.deepEqual(Object.fromEntries(beside(["low", "high", "mid", "none"], (id) => from[id]!, 50)), { high: 0, mid: 50, low: 295, none: 345 });
