@@ -778,7 +778,7 @@ line; **route a name** brings one onto the map.
   automatic arrangement. What you have not placed fits itself around what you
   have: a model sits level with the lines that reach it, rules stand in the
   order of the names that enter them, and a box that would lie on another is
-  drawn below it.
+  drawn below it. Boxes that only touch are left where you put them.
 - **+ type** takes a name typed straight into it. Drawn onto a model that is
   not chat, a new type takes the paths that model answers on.
 - **A type's ⋯** on the Router (it shows as you point at the name) renames it,
