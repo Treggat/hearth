@@ -274,11 +274,13 @@ export function EditBar() {
       </div>
       {adding === "flows" && (
         <NewDialog spec={{ noun: "routing rule", scope: "flow", keys: [] }} taken={Object.keys(obj(draft.flows))} onClose={() => setAdding(null)}
-                   note="The name is only a label for the rule. Next you say which model names it handles, and where each kind of request goes."
+                   note="The name is only a label for the rule. It is drawn on the map: its pencil, or any of its lines, opens it to say which model names it handles and where each kind of request goes."
                    onCreate={(id) => {
-                     // One line that always applies and goes nowhere yet: the rule opens to be filled in.
+                     // One line that always applies and goes nowhere yet. It is left on the map, picked out and in view,
+                     // so where it landed is seen before anything opens over it.
                      change((d) => put(d, "flows", id, { inputs: [], steps: [{ to: "" }] }));
-                     openRule(id);
+                     editSelect({ kind: "flow", id });
+                     focusOn(`flow:${id}`);
                      setAdding(null);
                    }} />
       )}
