@@ -797,7 +797,17 @@ line; **route a name** brings one onto the map.
   (one on a card, one on the CPU) are told apart at a glance.
 - **Dots and lines are coloured** by what they are plugged into: green for a
   model here, violet for a peer, blue for a rule, teal for the fastest of
-  several, red for a refusal, amber for an action, grey for nowhere yet.
+  several or several in order, red for a refusal, amber for an action, grey for nowhere yet.
+- **Then try…** in a line's menu gives the line somewhere to go when the place
+  it names fails before it answers. The line then ends at an **in order** node:
+  the places to try, first to last, each with its own dot. **then try another**
+  adds a place, the arrow tries one sooner, and the × takes one out; with one
+  place left the node goes and the line names that place again. In the file it
+  is a rule no name enters whose lines test nothing, and any such rule is drawn
+  this way. It is clicked, copied, pasted and deleted like a rule, a line's dot
+  can be let go on it, and several lines can share one. A request that failed
+  on a model here is only moved to another model here, so a peer placed after
+  one is marked as not reached.
 - **find** (or the `/` key) searches the map for a rule, an action, a name or
   a model and brings it into view. **Right-click** the map to add a rule or an
   action there, or a rule or an action to edit it, duplicate it, switch it off
@@ -1439,7 +1449,10 @@ is one step:
 
 A step is also passed over when its target cannot take the request: a peer
 that is down or whose model is too small. So a step that only names a peer
-needs no `when`, and "try my friend, else run it here" is two lines. The last
+needs no `when`, and "try my friend, else run it here" is two lines. A step
+that only names a model here needs none either: the lines after it are where
+the request goes when that model fails before it answers, as described next,
+so "run it on the card, else on the CPU" is two lines too. The last
 step has no `when` and somewhere that can always answer (a model, a flow or
 `refuse`), so every request gets a decision. If a peer fails before sending
 anything back, the flow is asked again without peers, and the request runs
