@@ -776,8 +776,9 @@ line; **route a name** brings one onto the map.
 - **+ rule** adds a routing rule: a flow drawn as a box whose lines read as
   sentences, `If … send to …`, ending in `Otherwise …`. Start from a common
   one (borrow an idle model, send images or long prompts somewhere else, stay
-  off a busy model, give one caller its own model) or from a blank. Click a
-  rule to edit it line by line in the panel beside the map.
+  off a busy model, give one caller its own model) or from a blank. A new
+  rule is left on the map, picked out and in view; its pencil, or any of its
+  lines, opens it to be edited line by line.
 - **A line that cannot work is not drawn.** Routing decides chat requests, so
   a name whose backend takes its requests on paths of its own (image
   generation and the like) is marked **not chat** and has no dot, and a chat
