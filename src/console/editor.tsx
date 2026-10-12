@@ -21,6 +21,7 @@ const LEGEND: [string, string][] = [
   ["Router", "this node deciding where a request runs; the same Router the Topology page draws"],
   ["A name with a dot", "a model name clients ask for; drag the dot to say where its requests go"],
   ["Routing rule", "lines checked top to bottom; the first that fits decides"],
+  ["In order", "places a line tries in turn: the next one when one fails before it answers"],
   ["\"the target\"", "the model that line sends to"],
   ["Dashed line to an action", "the line also runs that action; it does not change where the request goes"],
   ["3×", "how many requests that line has decided since the rules last changed"],

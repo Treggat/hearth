@@ -176,6 +176,68 @@ export function directTo(name: string, flow: { inputs: string[]; steps: { when?:
 }
 
 /**
+ * A flow that is only an order to try places in: no name enters it and no line of it tests
+ * anything, so each line is where the request goes when the one above fails. The canvas draws it
+ * as a node beside the first line that hands to it, not as a rule.
+ */
+export function orderOf(flow: { inputs: string[]; off?: boolean; sticky?: number; steps: { when?: unknown; to?: unknown; lane?: unknown; params?: unknown; do?: unknown; max?: unknown }[] }): End[] | null {
+  if (flow.inputs.length !== 0 || flow.steps.length < 2 || flow.off === true || flow.sticky !== undefined) return null;
+  const ends: End[] = [];
+  for (const s of flow.steps) {
+    const to = toOf(s.to);
+    const bare = (!isObj(s.when) || Object.keys(s.when).length === 0) && !s.lane && !isObj(s.params) && list(s.do).length === 0 && s.max === undefined;
+    if (!bare || (to.kind !== "model" && to.kind !== "peer")) return null;
+    ends.push(to);
+  }
+  return ends;
+}
+
+/**
+ * Give step `i` of a flow somewhere to go when the place it sends work fails: the line hands to an
+ * order of its own, the place it named first and `to` after it. Null when the line names no one place.
+ */
+export function thenTry(doc: Doc, flow: string, i: number, to: To): Doc | null {
+  const steps = stepsOf(doc, flow);
+  const first = steps?.[i] ? toOf(steps[i]!.to) : null;
+  if (!steps || !first || (first.kind !== "model" && first.kind !== "peer") || (to.kind !== "model" && to.kind !== "peer")) return null;
+  if (JSON.stringify(rawTo(first)) === JSON.stringify(rawTo(to))) return null;
+  const base = `${first.kind === "model" ? first.model : first.model ?? first.peer}-then`;
+  let name = base;
+  for (let n = 2; isObj(obj(doc.flows)[name]); n++) name = `${base}-${n}`;
+  // An order answers the same requests as the rule that hands to it.
+  const takes = list(obj(obj(doc.flows)[flow]).takes);
+  const made = put(doc, "flows", name, { inputs: [], ...(takes.length ? { takes } : {}), steps: [{ to: rawTo(first) }, { to: rawTo(to) }] });
+  return withSteps(made, flow, steps.map((s, k) => (k === i ? { ...s, to: { flow: name } } : s)));
+}
+
+/** Add a place to the end of an order. */
+export function addPlace(doc: Doc, order: string, to: To): Doc | null {
+  const steps = stepsOf(doc, order);
+  return steps && (to.kind === "model" || to.kind === "peer") ? withSteps(doc, order, [...steps, { to: rawTo(to) }]) : null;
+}
+
+/** Try place `k` of an order one place sooner. */
+export function raisePlace(doc: Doc, order: string, k: number): Doc {
+  const steps = stepsOf(doc, order);
+  if (!steps || k < 1 || !steps[k]) return doc;
+  return withSteps(doc, order, steps.map((s, n) => (n === k - 1 ? steps[k]! : n === k ? steps[k - 1]! : s)));
+}
+
+/**
+ * Take place `k` out of an order. With one place left there is nothing to fall back to, so the
+ * order goes too and every line that handed to it names that place again.
+ */
+export function dropPlace(doc: Doc, order: string, k: number): Doc {
+  const steps = stepsOf(doc, order);
+  if (!steps || !steps[k]) return doc;
+  const left = steps.filter((_, n) => n !== k);
+  if (left.length > 1) return withSteps(doc, order, left);
+  const flows = Object.fromEntries(Object.entries(obj(doc.flows)).filter(([name]) => name !== order).map(([name, f]) => [name, Array.isArray(obj(f).steps)
+    ? { ...obj(f), steps: (obj(f).steps as unknown[]).map((s) => (isObj(obj(s).to) && (obj(s).to as Doc).flow === order ? { ...obj(s), to: left[0]!.to } : s)) } : f]));
+  return { ...doc, flows };
+}
+
+/**
  * What becomes of a name no flow takes: every one runs as itself (`asked`), every one is turned
  * away (`refuse`), a flow with lines of its own decides (`rule`), or the draft has yet to say (`none`).
  */
@@ -237,6 +299,9 @@ export const TEMPLATES: { label: string; hint: string; name: string; steps: Doc[
 
 /** A rule or an action taken out of the draft. An action goes from every line that ran it too, so the file still loads. */
 export function removed(doc: Doc, section: "flows" | "actions", id: string): Doc {
+  // An order taken out leaves its first place behind: every line that handed to it goes straight there.
+  const steps = section === "flows" ? stepsOf(doc, id) : null;
+  if (steps && orderOf({ ...obj(obj(doc.flows)[id]), inputs: list(obj(obj(doc.flows)[id]).inputs), steps })) return steps.slice(1).reduce<Doc>((d) => dropPlace(d, id, 1), doc);
   const gone = put(doc, section, id, undefined);
   if (section !== "actions") return gone;
   return linesRunning(gone, id).reduce<Doc>((d, [rule, i]) => withDo(d, rule, i, id, false) ?? d, gone);
@@ -262,7 +327,9 @@ export function renamed(doc: Doc, section: "flows" | "actions", from: string, to
   const flows = Object.fromEntries(Object.entries(section === "flows" ? Object.fromEntries(Object.entries(all).map(([n, f]) => [n === from ? to : n, f])) : obj(doc.flows))
     .map(([n, f]) => [n, Array.isArray(obj(f).steps) ? { ...obj(f), steps: (obj(f).steps as unknown[]).map((s) => step(obj(s))) } : f]));
   const kind = section === "flows" ? "flow" : "action";
-  const layout = Object.fromEntries(Object.entries(obj(doc.layout)).map(([id, at]) => [id === `routing/${kind}:${from}` ? `routing/${kind}:${to}` : id, at]));
+  // A rule drawn as an order was placed under that node's id, and keeps its place the same way.
+  const moved = (id: string) => (id === `routing/${kind}:${from}` ? `routing/${kind}:${to}` : section === "flows" && id === `routing/inorder:${from}` ? `routing/inorder:${to}` : id);
+  const layout = Object.fromEntries(Object.entries(obj(doc.layout)).map(([id, at]) => [moved(id), at]));
   return {
     ...doc, flows,
     ...(section === "actions" ? { actions: Object.fromEntries(Object.entries(all).map(([n, a]) => [n === from ? to : n, a])) } : {}),
@@ -386,6 +453,8 @@ export const NODES: Record<string, NodeKind> = {
     outlet: (doc, id, handle) => {
       const i = Number(/^step-(\d+)/.exec(handle ?? "")?.[1] ?? NaN);
       const step = stepsOf(doc, id)?.[i];
+      // `step-<n>-then`: not where the line goes, but where it goes next when that fails.
+      if (step && /^step-\d+-then$/.test(handle ?? "")) return { when: obj(step.when), endsOnly: true, paths: list(obj(obj(doc.flows)[id]).takes).length > 0, send: (to) => thenTry(doc, id, i, to) };
       return step ? { when: obj(step.when), rule: id, paths: list(obj(obj(doc.flows)[id]).takes).length > 0, send: (to) => pointStep(doc, id, i, to), also: (a) => withDo(doc, id, i, a, true) } : null;
     },
   },
@@ -397,6 +466,16 @@ export const NODES: Record<string, NodeKind> = {
       const line = stepsOf(doc, flow)?.[step];
       const k = /^end-(\d+)/.exec(handle ?? "");
       return line ? { when: obj(line.when), endsOnly: true, paths: list(obj(obj(doc.flows)[flow]).takes).length > 0, send: (to) => pointEnd(doc, flow, step, k ? Number(k[1]) : null, to) } : null;
+    },
+  },
+  // An order to try places in: an outlet per place, `end-<k>`, and any other handle adds a place after the last.
+  // Its id is not `order:`, which is where the layout keeps the order of the types (RANK).
+  inorder: {
+    lands: (id) => ({ kind: "flow", flow: id }),
+    opens: (id) => ({ kind: "flow", id }),
+    outlet: (doc, id, handle) => {
+      const k = /^end-(\d+)/.exec(handle ?? "");
+      return stepsOf(doc, id) ? { when: null, endsOnly: true, paths: list(obj(obj(doc.flows)[id]).takes).length > 0, send: (to) => (to.kind !== "model" && to.kind !== "peer" ? null : k ? pointStep(doc, id, Number(k[1]), to) : addPlace(doc, id, to)) } : null;
     },
   },
   refuse: { opens: (id) => ({ kind: "flow", id: lineOf(id).flow }) },
@@ -687,7 +766,8 @@ export function problems(doc: Doc, facts?: Facts): string[] {
       if (no) out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: ${no}`);
       for (const k of ["header", "headerNot"]) if ("" in obj(obj(s.when)[k])) out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: say which header it tests, by name.`);
       if (to.kind === "unset") out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: choose where it sends requests.`);
-      else if (!last && to.kind !== "peer" && typeof s.max !== "number" && Object.keys(obj(s.when)).length === 0) out.push(`Rule "${f.name}", line ${i + 1}: choose a condition, or the lines after it are never reached.`);
+      // In an order a line with nothing to test is the point: the next is where the request goes when it fails.
+      else if (!last && to.kind !== "peer" && typeof s.max !== "number" && Object.keys(obj(s.when)).length === 0 && orderOf({ ...obj(obj(doc.flows)[f.name]), inputs: f.inputs, steps: f.steps }) === null) out.push(`Rule "${f.name}", line ${i + 1}: choose a condition, or the lines after it are never reached.`);
       for (const a of list(s.do)) if (!isObj(obj(doc.actions)[a])) out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: it runs the action "${a}", which is gone.`);
     });
   }
