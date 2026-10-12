@@ -6,8 +6,8 @@ import type { UiData, Used } from "./types.js";
 import { Refs, refsOf, Value } from "./config.js";
 import { draftView, isObj, obj, put } from "./draft.js";
 import { change, useEdit } from "./editStore.js";
-import { control, evict, go, mintKey, revokeKey, select, useStore, warm } from "./store.js";
-import { ago, Card, cx, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
+import { control, doneWithKey, evict, go, mintKey, revokeKey, rotateKey, select, useStore, warm } from "./store.js";
+import { ago, Button, Card, cx, Dialog, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
 
 const selfOf = (d: UiData) => d.net.nodes.find((n) => n.self)!;
 
@@ -314,6 +314,27 @@ function limitsOf(rule: Rule | null | undefined, today?: Used) {
   return <span className={gone || spent ? "text-bad" : undefined} title={spent ? "today's tokens are used up; it works again at midnight UTC" : undefined}>{parts.join(" · ")}</span>;
 }
 
+/** A key just minted or rotated, shown once over whichever page made it. The keys page shows it in place instead. */
+export function KeyOnce() {
+  const shown = useStore((s) => s.fresh);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => setCopied(false), [shown]);
+  if (shown === null) return null;
+  return (
+    <Dialog title={`${shown.rotated ? "New key" : "Key"} for ${shown.label}`} onClose={doneWithKey}>
+      <div className="flex flex-col gap-3 p-4">
+        <p className="text-[12px] text-dim">Shown once: after this it exists only in hearth.yaml.{shown.rotated ? " The old key has stopped working." : ""}</p>
+        <code className={cx("select-all overflow-x-auto whitespace-nowrap rounded-md border border-line bg-bg px-3 py-2", mono)}>{shown.key}</code>
+      </div>
+      <div className="flex justify-end gap-2 border-t border-line px-4 py-3">
+        {/* The text stays selectable where the clipboard is not allowed. */}
+        <Button onClick={() => void navigator.clipboard.writeText(shown.key).then(() => setCopied(true), () => {})}>{copied ? "copied" : "copy"}</Button>
+        <Button tone="primary" onClick={doneWithKey}>done</Button>
+      </div>
+    </Dialog>
+  );
+}
+
 export function Keys() {
   const keys = useStore((s) => s.data!.keys ?? []);
   const others = useStore((s) => s.data!.others ?? []);
@@ -323,7 +344,7 @@ export function Keys() {
   const [expires, setExpires] = useState("");
   const [perMinute, setPerMinute] = useState("");
   const [perDay, setPerDay] = useState("");
-  const [shown, setShown] = useState<{ label: string; key: string } | null>(null);
+  const shown = useStore((s) => s.fresh);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const mint = async () => {
@@ -335,7 +356,6 @@ export function Keys() {
     const key = await mintKey(l, models.length > 0 ? models : null, { ...(expires ? { expires } : {}), ...(Object.keys(limits).length ? { limits } : {}) });
     setBusy(false);
     if (key !== null) {
-      setShown({ label: l, key });
       setCopied(false);
       setLabel("");
       setScope("");
@@ -381,6 +401,11 @@ export function Keys() {
               <td className="tabular px-4 py-2"><UsedCell used={k.month} /></td>
               <td className={cx("tabular px-4 py-2 text-right", k.lastSeen === null ? "text-dim" : "text-fg")}>{k.lastSeen === null ? "never" : ago(k.lastSeen)}</td>
               <td className="px-4 py-2 text-right">
+                <button disabled={busy || k.label === ""} title={k.label === "" ? "a key with no label is changed in the config file" : "a new secret for this key, shown once; the old one stops working straight away"}
+                        onClick={() => { if (confirm(`Rotate ${k.label}? Whatever uses the old key stops working until it is given the new one.`)) void rotateKey(k.label); }}
+                        className="mr-3 text-[12px] text-dim hover:text-fg hover:underline disabled:opacity-40">
+                  rotate
+                </button>
                 <button disabled={busy || k.label === ""} title={k.label === "" ? "a key with no label is removed in the config file" : undefined}
                         onClick={() => { if (confirm(`Revoke ${k.label}? It stops working straight away.`)) void revokeKey(k.label); }}
                         className="text-[12px] text-bad hover:underline disabled:opacity-40">
@@ -425,11 +450,11 @@ export function Keys() {
       </div>
       {shown !== null && (
         <div className="border-t border-line bg-muted/40 px-4 py-3">
-          <div className="text-[12px] text-dim">The key for <b className="text-fg">{shown.label}</b> — shown once; after this it exists only in hearth.yaml.</div>
+          <div className="text-[12px] text-dim">The {shown.rotated ? "new key" : "key"} for <b className="text-fg">{shown.label}</b> — shown once; after this it exists only in hearth.yaml.</div>
           <div className="mt-1.5 flex items-center gap-2">
             <code className={cx("flex-1 select-all overflow-x-auto whitespace-nowrap rounded-md border border-line bg-bg px-3 py-2", mono)}>{shown.key}</code>
             <button onClick={() => void copy(shown.key)} className="h-8 rounded-md border border-line px-3 text-[12px] hover:bg-muted">{copied ? "copied" : "copy"}</button>
-            <button onClick={() => setShown(null)} className="h-8 rounded-md px-2 text-[12px] text-dim hover:text-fg">done</button>
+            <button onClick={doneWithKey} className="h-8 rounded-md px-2 text-[12px] text-dim hover:text-fg">done</button>
           </div>
         </div>
       )}
