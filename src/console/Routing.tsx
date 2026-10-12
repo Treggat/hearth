@@ -6,10 +6,10 @@
 import { applyNodeChanges, Background, Controls, MiniMap, ReactFlow, type Edge, type Node, type ReactFlowInstance } from "@xyflow/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { ANY, beside as besideLines, directTo, draftView, factsOf, groupRows, list, nodeOf, ordered, refusal, restOf, spread, toOf, unchecked, type End, type Facts, type To } from "./draft.js";
+import { ANY, beside as besideLines, directTo, draftView, factsOf, groupRows, list, nodeOf, ordered, orderOf, refusal, restOf, spread, toOf, unchecked, type End, type Facts, type To } from "./draft.js";
 import { connect, editSelect, pick, place, useEdit, type EditSel, type Tried } from "./editStore.js";
 import { contextMenu } from "./editor.js";
-import { HUE, takesWork, VIEWS, type ActionBox, type Dest, type FastestBox, type Hub, type RefuseBox, type SwitchBox } from "./flowNodes.js";
+import { HUE, takesWork, VIEWS, type ActionBox, type Dest, type FastestBox, type Hub, type OrderBox, type RefuseBox, type SwitchBox } from "./flowNodes.js";
 import { arrive, edgeTypes, held, type Line } from "./Topology.js";
 import type { UiData } from "./types.js";
 import { useStore } from "./store.js";
@@ -23,10 +23,11 @@ const SIDE = { refuse: 66, fastest: 70, place: 28, action: 70 };
 const GAP = 24;
 
 /** What each kind of box is on the small map in the corner: the same theme colours the box itself wears. */
-const MINI: Record<string, string> = { hub: "var(--dim)", flow: "var(--info)", fastest: "var(--pick)", refuse: "var(--bad)", action: "var(--warn)" };
+const MINI: Record<string, string> = { hub: "var(--dim)", flow: "var(--info)", fastest: "var(--pick)", order: "var(--pick)", refuse: "var(--bad)", action: "var(--warn)" };
 
 /** How tall the node a line's target is drawn as beside its rule; 0 for a model, a peer or another rule, which are not drawn there. */
-const sideOf = (to: To): number => (to.kind === "refuse" ? SIDE.refuse : to.kind === "fastest" ? SIDE.fastest + to.of.length * SIDE.place : 0);
+const sideOf = (to: To, order?: End[]): number => (to.kind === "refuse" ? SIDE.refuse : to.kind === "fastest" ? SIDE.fastest + to.of.length * SIDE.place
+  : order ? SIDE.fastest + (order.length + 1) * SIDE.place : 0);
 
 /**
  * Names | rules, a column per step of hand-on | what the lines end at. Deterministic, so nothing
@@ -49,9 +50,16 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
   // The flow for every other name, while it only says "run it" or "refuse it", is a line on the router and not a rule of its own.
   const plainRest = ([, f]: [string, { inputs: string[]; steps: { when?: unknown; to?: unknown; do?: unknown }[] }]) =>
     f.inputs.includes(ANY) && f.steps.length === 1 && ["asked", "refuse"].includes(toOf(f.steps[0]!.to).kind) && list(f.steps[0]!.do).length === 0;
+  // A flow that is only an order to try places in is a node of its own and not a rule: beside the first line that hands to it.
+  const orders = new Map<string, End[]>();
+  for (const [name, f] of Object.entries(d.flows ?? {})) { const ends = orderOf(f); if (ends) orders.set(name, ends); }
+  const seat = new Map<string, string>();
+  for (const [name, f] of Object.entries(d.flows ?? {})) if (!orders.has(name)) f.steps.forEach((s, i) => { const to = toOf(s.to); if (to.kind === "flow" && orders.has(to.flow) && !seat.has(to.flow)) seat.set(to.flow, `${name}:${i}`); });
+  /** The order drawn beside line `i` of a rule, where that line is the first to hand to it. */
+  const seated = (rule: string, i: number, to: To) => (to.kind === "flow" && seat.get(to.flow) === `${rule}:${i}` ? orders.get(to.flow) : undefined);
   const flows = Object.entries(d.flows ?? {}).filter((entry) => {
     const [name, f] = entry;
-    if (plainRest(entry)) return false;
+    if (plainRest(entry) || orders.has(name)) return false;
     const to = directTo(name, f);
     if (to) direct.set(name, to);
     return to === null;
@@ -73,7 +81,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
   for (const [name, f] of flows) for (const s of f.steps) for (const a of list(s.do)) if (!home.has(a) && d.actions?.[a]) home.set(a, name);
   const homed = (rule: string) => actions.filter(([a]) => home.get(a) === rule);
   // A column is as wide as its rules, plus room for what is drawn beside them.
-  const beside = (col: number) => flows.some(([n, f]) => depth.get(n) === col && (homed(n).length > 0 || f.steps.some((s) => sideOf(toOf(s.to)) > 0)));
+  const beside = (col: number) => flows.some(([n, f]) => depth.get(n) === col && (homed(n).length > 0 || f.steps.some((s, i) => sideOf(toOf(s.to), seated(n, i, toOf(s.to))) > 0)));
   const colX: number[] = [];
   let x = 330;
   for (let col = 0; col < columns; col++) { colX.push(x); x += RULE.width + (beside(col) ? 280 : 0) + 70; }
@@ -81,7 +89,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
 
   // Only what a line ends at is drawn: the models and peers the rules and the redirected names use.
   let y = 0;
-  const used: End[] = [...direct.values(), ...flows.flatMap(([, f]) => f.steps.flatMap((s) => { const t = toOf(s.to); return t.kind === "fastest" ? t.of : t.kind === "model" || t.kind === "peer" ? [t] : []; }))];
+  const used: End[] = [...direct.values(), ...[...orders.values()].flat(), ...flows.flatMap(([, f]) => f.steps.flatMap((s) => { const t = toOf(s.to); return t.kind === "fastest" ? t.of : t.kind === "model" || t.kind === "peer" ? [t] : []; }))];
   for (const model of new Set(used.flatMap((e) => (e.kind === "model" ? [e.model] : [])))) {
     const on = d.routing?.[model]?.backend ?? (self.backends ?? []).find((b) => (b.serves ?? []).includes(model) || (b.routes ?? []).some((r) => r.model === model))?.name;
     const where = (self.backends ?? []).find((b) => b.name === on);
@@ -141,6 +149,14 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
   const to = (line: ReturnType<typeof wire>, source: string, handle: string, end: End): void => {
     edges.push({ ...line, source, sourceHandle: handle, target: end.kind === "peer" ? `peer:${end.peer}` : `model:${end.model}` });
   };
+  /** An order and the lines from it to each of its places. */
+  const order = (name: string, at: { x: number; y: number }, lit: boolean, unused = false): Node => {
+    const id = `inorder:${name}`;
+    const ends = orders.get(name)!;
+    const won = lit ? decided.get(name) ?? -1 : -1;
+    ends.forEach((e, k) => to(wire(`e:${id}:${k}`, won === k, e.kind), id, `end-${k}`, e));
+    return { id, type: "order", position: at, zIndex: 1000, data: { flow: name, ends, editable: Boolean(edit), selected: is("flow", name), on: lit, ...(won >= 0 ? { lit: won } : {}), unused, takes: d.flows?.[name]?.takes } satisfies OrderBox };
+  };
   const action = (name: string, at: { x: number; y: number }, unused = false): Node => ({
     id: `action:${name}`, type: "action", position: at, zIndex: 1000,
     data: { name, kind: d.actions![name]!.kind, says: d.actions![name]!.says, editable: Boolean(edit), selected: is("action", name), on: tried?.actions?.includes(name) ?? false, unused } satisfies ActionBox,
@@ -166,7 +182,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
     const sides = ([name, f]: (typeof here)[number]) => {
       let at = 0;
       const tops = f.steps.map((s, i) => {
-        const h = sideOf(toOf(s.to));
+        const h = sideOf(toOf(s.to), seated(name, i, toOf(s.to)));
         if (h === 0) return 0;
         const top = Math.max(at, RULE.head + i * RULE.row + groupRows(f.steps, i) - 16);
         at = top + h;
@@ -189,7 +205,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
         // Above the lines that pass behind it on their way to what they end at.
         id, type: "flow", position: { x: colX[col]!, y: fy }, zIndex: 1000,
         data: {
-          name, inputs: f.inputs, steps: f.steps as SwitchBox["steps"], selected: is("flow", name), editable, lit: step,
+          name, inputs: f.inputs, steps: f.steps as SwitchBox["steps"], selected: is("flow", name), editable, lit: step, orders: Object.fromEntries(orders),
           models: edit?.models ?? [], lanes: edit?.lanes ?? [], actions: actions.map(([a]) => a), off: f.off, note: f.note, sticky: f.sticky !== undefined, takes: f.takes,
           ...(d.flowHits && !edit?.changed(name) ? { hits: f.steps.map((_, i) => d.flowHits![name]?.[i] ?? 0) } : {}),
           ...(edit ? { marks: f.steps.map((s) => { const t = toOf(s.to); const no = refusal(s.when, t, edit.facts, (f.takes ?? []).length > 0); return no ? { bad: no } : unchecked(s.when, t, edit.facts) ? { unsure: true as const } : null; }) } : {}),
@@ -200,8 +216,16 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
       f.steps.forEach((s, i) => {
         const t = toOf(s.to);
         const lit = step === i;
-        const line = wire(`e:${id}:${i}`, lit, t.kind);
-        if (t.kind === "flow") edges.push({ ...line, source: id, sourceHandle: `step-${i}`, target: `flow:${t.flow}` });
+        const line = wire(`e:${id}:${i}`, lit, t.kind === "flow" && orders.has(t.flow) ? "fastest" : t.kind);
+        if (t.kind === "flow" && orders.has(t.flow)) {
+          // The first line that hands to an order has it beside it; any other line is drawn across to it.
+          const end = `inorder:${t.flow}`;
+          if (seated(name, i, t)) {
+            nodes.push(order(t.flow, { x: sideX, y: fy + beside.tops[i]! }, decided.has(t.flow)));
+            mine.push(end);
+          }
+          edges.push({ ...line, source: id, sourceHandle: `step-${i}`, target: end });
+        } else if (t.kind === "flow") edges.push({ ...line, source: id, sourceHandle: `step-${i}`, target: `flow:${t.flow}` });
         else if (t.kind === "model" || t.kind === "peer") to(line, id, `step-${i}`, t);
         else if (t.kind === "fastest" || t.kind === "refuse") {
           // A line that ends in a choice or a refusal gets that as a node beside it.
@@ -230,6 +254,9 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
   }
   // An action no line runs yet waits under the rules, clear of the map's own buttons in the corner.
   actions.filter(([a]) => !home.has(a)).forEach(([a], k) => nodes.push(action(a, { x: colX[0] ?? 330, y: lowest + k * SIDE.action }, true)));
+  // So does an order no line hands to yet: a copy just pasted, say.
+  let waiting = lowest;
+  for (const name of orders.keys()) if (!seat.has(name)) { nodes.push(order(name, { x: (colX[0] ?? 330) + 260, y: waiting }, false, true)); waiting += SIDE.fastest + (orders.get(name)!.length + 1) * SIDE.place + GAP; }
 
   // What was placed by hand stays there, and a rule carries the nodes beside it unless one of those was placed on its own.
   const placed = (id: string) => d.layout?.[`routing/${id}`];
@@ -290,7 +317,9 @@ export function Routing() {
   useEffect(() => {
     const rf = flow.current;
     if (!rf || !edit.focus) return;
-    const node = edit.focus.node;
+    // A rule that is drawn as an order is found under that node's id.
+    const asked = edit.focus.node;
+    const node = asked.startsWith("flow:") && !laid.nodes.some((n) => n.id === asked) && laid.nodes.some((n) => n.id === `inorder:${asked.slice(5)}`) ? `inorder:${asked.slice(5)}` : asked;
     // After the layout has caught up with whatever was just added.
     const t = setTimeout(() => void rf.fitView(node === "*" ? { padding: 0.08, duration: 300 } : { nodes: [{ id: node }], maxZoom: 1, minZoom: 0.7, padding: 0.6, duration: 300 }), 60);
     return () => clearTimeout(t);

@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { applyOps, put, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
+import { addPlace, applyOps, dropPlace, orderOf, put, raisePlace, thenTry, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -201,6 +201,54 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual(saved, { doc: mine });
   const { servers: _gone, ...dropped } = doc();
   assert.deepEqual(rebase(doc(), dropped, dropped), { doc: dropped }, "a removal that already happened included");
+}
+
+// --- an order: places to try in turn, kept as a rule that tests nothing and drawn as one node ----------------------
+{
+  // A line that names one place is given somewhere to go when that fails: the place it named, then the new one.
+  const made = thenTry(doc(), "pick", 1, { kind: "model", model: "other" })!;
+  assert.deepEqual(steps(made)[1]!.to, { flow: "chat-then" });
+  assert.deepEqual(steps(made, "chat-then").map((s) => s.to), ["chat", "other"]);
+  assert.doesNotThrow(() => parseConfig(made), "a line that only names a model here may stand before the one it falls back to");
+  assert.equal(thenTry(doc(), "pick", 1, { kind: "model", model: "chat" }), null, "the same place twice is no order");
+  assert.equal(thenTry(doc(), "pick", 1, { kind: "refuse", why: "no" }), null, "only somewhere work can run will do");
+  // It answers the paths of the rule that hands to it.
+  const typed = thenTry(put(doc(), "flows", "pick", { ...(doc().flows as Record<string, Doc>).pick, takes: ["/v1/embeddings"] }), "pick", 1, { kind: "model", model: "other" })!;
+  assert.deepEqual((typed.flows as Record<string, Doc>)["chat-then"]!.takes, ["/v1/embeddings"]);
+
+  // What makes a flow an order: no name enters it and no line of it tests anything.
+  const ends = [{ kind: "model", model: "chat" }, { kind: "model", model: "other" }];
+  assert.deepEqual(orderOf({ inputs: [], steps: steps(made, "chat-then") }), ends);
+  assert.equal(orderOf({ inputs: ["auto"], steps: steps(made, "chat-then") }), null, "a rule a name enters is a rule");
+  assert.equal(orderOf({ inputs: [], steps: steps(doc()) }), null, "and so is one whose lines test something");
+  assert.equal(orderOf({ inputs: [], steps: [{ to: "chat" }] }), null, "one place is not an order");
+  // A line with nothing to test is the point of an order, and still a mistake in a rule.
+  assert.ok(!problems(made).some((p) => /never reached/.test(p)));
+  assert.ok(problems(put(doc(), "flows", "pick", { inputs: ["auto"], steps: [{ to: "chat" }, { to: "other" }] })).some((p) => /"pick", line 1: choose a condition/.test(p)));
+
+  // Its node: a line let go on it hands to it, each place has an outlet, and any other handle adds a place.
+  assert.deepEqual(lands("inorder:chat-then"), { kind: "flow", flow: "chat-then" });
+  assert.deepEqual(nodeOf("inorder:chat-then").kind.opens?.("chat-then"), { kind: "flow", id: "chat-then" });
+  assert.deepEqual(steps(outlet(made, "inorder:chat-then", "end-1")!.send({ kind: "model", model: "image" })!, "chat-then").map((s) => s.to), ["chat", "image"]);
+  const longer = outlet(made, "inorder:chat-then", "new")!.send({ kind: "model", model: "image" })!;
+  assert.deepEqual(steps(longer, "chat-then").map((s) => s.to), ["chat", "other", "image"]);
+  assert.deepEqual(longer, addPlace(made, "chat-then", { kind: "model", model: "image" }));
+  assert.equal(outlet(made, "inorder:chat-then", "new")!.send({ kind: "refuse", why: "no" }), null);
+  // A rule's line has an outlet for "then try" beside the one for where it goes.
+  assert.deepEqual(outlet(doc(), "flow:pick", "step-1-then")!.send({ kind: "model", model: "other" }), made);
+
+  // A place is tried sooner, or taken out. With one left there is nothing to fall back to: the line names it again.
+  assert.deepEqual(steps(raisePlace(made, "chat-then", 1), "chat-then").map((s) => s.to), ["other", "chat"]);
+  assert.deepEqual(steps(dropPlace(longer, "chat-then", 0), "chat-then").map((s) => s.to), ["other", "image"]);
+  const back = dropPlace(made, "chat-then", 0);
+  assert.deepEqual([Object.keys(back.flows as object), steps(back)[1]!.to], [["pick", "heavy"], "other"]);
+  // Deleting the order leaves its first place behind, so no line is left handing to nothing.
+  const gone = removed(longer, "flows", "chat-then");
+  assert.deepEqual([Object.keys(gone.flows as object), steps(gone)[1]!.to], [["pick", "heavy"], "chat"]);
+  assert.doesNotThrow(() => parseConfig(gone));
+  // Renamed, it keeps the place its node was given.
+  const named = renamed(placed(made, "routing/inorder:chat-then", { x: 3, y: 4 }), "flows", "chat-then", "talk")!;
+  assert.deepEqual([steps(named)[1]!.to, named.layout], [{ flow: "talk" }, { "routing/inorder:talk": { x: 3, y: 4 } }]);
 }
 
 // --- what a person can fix is said before the file refuses it -----------------------------------------------------
