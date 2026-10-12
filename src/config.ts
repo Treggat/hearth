@@ -802,7 +802,9 @@ function flowDecls(
       if (last && (when !== null || skippable(to))) {
         throw bad(`${at}.steps`, "must end with a step that always applies: no `when`, and somewhere that can always answer (a model, a flow or refuse)");
       }
-      if (!last && when === null && max === undefined && !skippable(to)) throw bad(here, "has no `when`, so the steps after it can never be reached");
+      // A model here can fail before it answers, and the next line is where the request goes then.
+      const mayFail = "model" in to && !("peer" in to);
+      if (!last && when === null && max === undefined && !skippable(to) && !mayFail) throw bad(here, "has no `when`, so the steps after it can never be reached");
       for (const end of "fastest" in to ? to.fastest : "peer" in to ? [to] : []) {
         if (!("peer" in end)) continue;
         const peer = peers.find((x) => x.name === end.peer);
