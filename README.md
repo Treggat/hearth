@@ -1148,9 +1148,12 @@ to install it and one to remove it, and a switch per backend:
 
 - **Install** makes a Python environment in a `headroom` directory beside
   the config file and puts one pinned release of `headroom-ai` in it, then
-  starts it. That needs Python 3.10 or newer on the machine and several
-  hundred megabytes of disk, and takes minutes; the page shows what the
-  install writes as it goes. hearth starts it again with the node and when it
+  starts it. It uses Python 3.10 or newer where the machine has one; where
+  it has none, on Linux, it first fetches a pinned release of
+  [uv](https://github.com/astral-sh/uv) into the same directory, checks it
+  against its checksum, and lets that bring a Python. Either way it is
+  several hundred megabytes of disk and takes minutes; the page shows what
+  the install writes as it goes. hearth starts it again with the node and when it
   stops.
 - It listens on this machine only, on a port chosen as it starts, and is
   started with its usage reporting and update checks switched off.

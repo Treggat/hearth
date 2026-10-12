@@ -90,6 +90,11 @@ export async function compress(body: Doc, h: { url: string; token: string | null
 /** The release the console installs. A newer one is a change to this line, tried before it is made. */
 export const HEADROOM_VERSION = "0.40.0";
 
+/** The release of uv fetched where the machine has no Python to hold Headroom: it brings one. */
+export const UV_VERSION = "0.13.0";
+/** The builds of it that can be fetched, by `platform-arch`. Elsewhere a Python has to be there already. */
+const UV_BUILDS: Record<string, string> = { "linux-x64": "uv-x86_64-unknown-linux-gnu", "linux-arm64": "uv-aarch64-unknown-linux-gnu" };
+
 /** What the console is told about the Headroom this node installed and runs. */
 export interface HostView {
   /** `absent`: not installed. `installing`, `starting`, `removing`: on its way. `running`: answering. `failed`: installed, and not running. */
@@ -120,11 +125,11 @@ function lines(child: ChildProcess, say: (line: string) => void): void {
 }
 
 /** Runs one program to its end. Never a shell: the arguments go as they are. */
-function run(cmd: string, args: string[], say: (line: string) => void, hold?: (child: ChildProcess) => void): Promise<number> {
+function run(cmd: string, args: string[], say: (line: string) => void, hold?: (child: ChildProcess) => void, env?: Record<string, string>): Promise<number> {
   return new Promise((done) => {
     let child: ChildProcess;
     try {
-      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, ...(env ? { env: { ...process.env, ...env } } : {}) });
     } catch {
       return done(-1);
     }
@@ -215,6 +220,25 @@ export class HeadroomHost {
     return null;
   }
 
+  /**
+   * Fetches uv into the directory and answers where it is, or null where there is no build for this
+   * machine or the download is not what its release says it is.
+   */
+  private async fetchUv(dir: string): Promise<string | null> {
+    const build = UV_BUILDS[`${process.platform}-${process.arch}`];
+    if (build === undefined) return null;
+    const from = `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${build}.tar.gz`;
+    this.say(`this machine has no Python that can hold it: fetching uv ${UV_VERSION}, which brings one`);
+    const [got, sum] = await Promise.all([fetch(from), fetch(`${from}.sha256`)]);
+    if (!got.ok || !sum.ok) { this.say(`${from} answered ${got.status}`); return null; }
+    const bytes = Buffer.from(await got.arrayBuffer());
+    if (createHash("sha256").update(bytes).digest("hex") !== (await sum.text()).trim().split(/\s+/)[0]) { this.say("what was fetched does not match its checksum"); return null; }
+    const file = join(dir, "uv.tar.gz");
+    writeFileSync(file, bytes);
+    if (await run("tar", ["-xzf", file, "-C", dir], this.say) !== 0) { this.say("it could not be unpacked: tar is needed"); return null; }
+    return join(dir, build, "uv");
+  }
+
   /** Installs it and starts it. Returns at once; `view()` says how it is going. */
   install(): void {
     if (this.dir === null || this.state === "installing" || this.state === "starting" || this.state === "removing") return;
@@ -226,16 +250,36 @@ export class HeadroomHost {
     const turn = ++this.turn;
     const hold = (c: ChildProcess): void => { this.child = c; };
     void (async () => {
+      mkdirSync(dir, { recursive: true });
+      const wanted = `headroom-ai[proxy]==${HEADROOM_VERSION}`;
+      const size = `installing headroom-ai ${HEADROOM_VERSION}: several hundred megabytes, so this takes minutes`;
       const python = await this.findPython();
       if (turn !== this.turn) return;
-      if (python === null) return this.fail("Python 3.10 or newer was not found on this machine, and Headroom is a Python program");
-      mkdirSync(dir, { recursive: true });
-      this.say("making its Python environment");
-      const made = await run(python[0]!, [...python.slice(1), "-m", "venv", join(dir, "venv")], this.say, hold);
+      let code = -1;
+      let made = false;
+      // A Python that is there may still be one that cannot make an environment, as a system's often is.
+      if (python !== null) {
+        this.say("making its Python environment");
+        made = await run(python[0]!, [...python.slice(1), "-m", "venv", join(dir, "venv")], this.say, hold) === 0;
+        if (turn !== this.turn) return;
+        if (made) {
+          this.say(size);
+          code = await run(this.python, ["-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--progress-bar", "off", wanted], this.say, hold);
+        } else await rm(join(dir, "venv"), { recursive: true, force: true });
+      }
       if (turn !== this.turn) return;
-      if (made !== 0) return this.fail("its Python environment could not be made");
-      this.say(`installing headroom-ai ${HEADROOM_VERSION}: several hundred megabytes, so this takes minutes`);
-      const code = await run(this.python, ["-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--progress-bar", "off", `headroom-ai[proxy]==${HEADROOM_VERSION}`], this.say, hold);
+      if (!made) {
+        const uv = await this.fetchUv(dir);
+        if (turn !== this.turn) return;
+        if (uv === null) return this.fail("Python 3.10 or newer with venv was not found on this machine, and one could not be fetched for it. Headroom is a Python program");
+        // Everything it downloads stays in the directory, so removing the directory removes all of it.
+        const here = { UV_PYTHON_INSTALL_DIR: join(dir, "python"), UV_CACHE_DIR: join(dir, "cache"), UV_NO_PROGRESS: "1" };
+        this.say("making its Python environment");
+        if (await run(uv, ["venv", "--python", "3.12", join(dir, "venv")], this.say, hold, here) !== 0) return turn === this.turn ? this.fail("its Python environment could not be made") : undefined;
+        if (turn !== this.turn) return;
+        this.say(size);
+        code = await run(uv, ["pip", "install", "--python", this.python, wanted], this.say, hold, here);
+      }
       if (turn !== this.turn) return;
       this.child = null;
       if (code !== 0) return this.fail("the install did not finish; the lines above say why");
