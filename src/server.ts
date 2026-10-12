@@ -31,6 +31,7 @@ import { createViews, type CallerUse, type KeyInfo, type Spent } from "./views.j
 import { multipartField, replaceMultipartField } from "./multipart.js";
 import { relayAnthropic, toAnthropic } from "./anthropic.js";
 import { troubleSays } from "./backend.js";
+import { compress } from "./headroom.js";
 import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
 
 /** Constant-time compare over sha256 digests, so neither length nor content leaks. */
@@ -465,13 +466,31 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     });
   }
 
+  /** Backends whose last compression did not happen, and why: said once when it starts and once when it ends. */
+  const uncompressed = new Map<string, string>();
+  /** What a backend's requests have been made smaller by, in tokens as Headroom counts them. */
+  const savedBy = new Map<string, number>();
+  /** `body` as it goes to `to`: compressed where the backend asks for it, and as it came where that fails. */
+  async function squeezed(to: BackendConfig, body: Record<string, unknown>, who: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+    if (!to.headroom || cfg.headroom === null) return body;
+    const got = await compress(body, cfg.headroom, `${to.name}
+${who}`, cfg.maxBodyBytes, signal);
+    if (got.problem !== undefined && !signal.aborted) {
+      if (!uncompressed.has(to.name)) log.warn("headroom.failed", { backend: to.name, error: got.problem });
+      uncompressed.set(to.name, got.problem);
+    } else if (got.problem === undefined && uncompressed.delete(to.name)) log.info("headroom.recovered", { backend: to.name });
+    if (got.saved > 0) savedBy.set(to.name, (savedBy.get(to.name) ?? 0) + got.saved);
+    return got.body;
+  }
+
   /** Sends a chat completion to a local backend, emulating another server's answers if the route asks. */
-  async function sendLocal(to: BackendConfig, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
+  async function sendLocal(to: BackendConfig, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter; /** Who asked, which tells one conversation from another's where the backend's are compressed. */ who?: string } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
     const emulate = cfg.models[model]?.emulate ?? null;
-    const { count, ...deadline } = opts;
+    const { count, who, ...deadline } = opts;
     const url = to.url;
     const reach = { ...deadline, headers: backendAuth(to.format, to.key) };
-    const sent = pool.outboundBody(model, payload);
+    const whole = pool.outboundBody(model, payload);
+    const sent = to.headroom ? await squeezed(to, whole, who ?? "", opts.signal) : whole;
     if (to.format === "anthropic") {
       const up = await send(`${url}/v1/messages`, { json: toAnthropic(sent, to.promptCache), ...reach });
       if (to.key && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
@@ -862,7 +881,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       ranOn = local.name;
       await local.state.ensureFresh();
     // Our id and the route's params on the way to the backend; untouched when neither is set.
-      localStatus = await sendLocal(local.cfg, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}) }, spare);
+      localStatus = await sendLocal(local.cfg, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}), who: caller }, spare);
     };
 
     const t: Timing = { enqueuedAt: Date.now(), startedAt: 0, meter: meter(res), need: Math.max(0, (need?.tokens ?? 0) - (need?.output ?? 0)) };
@@ -2046,7 +2065,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           t.startedAt = Date.now();
           await serving.state.ensureFresh();
           // A lent request gets the same id rewrite and params as a local one.
-          lentStatus = await sendLocal(serving.cfg, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
+          lentStatus = await sendLocal(serving.cfg, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg), who: `peer:${fromPeer}` });
         },
       );
     } catch (e) {
@@ -2607,6 +2626,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Drawn whether or not it is on, so "not configured" and "configured and
     // quiet" are not the same blank tile.
     canary: () => canary?.page() ?? { enabled: false, passive: false, recovery: false, models: {} },
+    squeezed: (backend) => ({ saved: savedBy.get(backend) ?? 0, ...(uncompressed.has(backend) ? { trouble: uncompressed.get(backend)! } : {}) }),
     keys: keysView,
     others: othersView,
   });

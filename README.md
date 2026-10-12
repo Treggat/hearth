@@ -118,6 +118,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `backends.<name>.key` | none | sent to this backend as `Authorization: Bearer` on every call, in place of anything the client sent. `env:NAME` keeps it out of the file |
 | `backends.<name>.format` | `openai` | the API it speaks: `openai` (chat completions) or `anthropic` (Messages). See [Anthropic's API](#anthropics-api) |
 | `backends.<name>.promptCache` | `true` | with `format: anthropic`: mark each request's system prompt, tools and conversation so far for the provider's prompt cache |
+| `backends.<name>.headroom` | `false` | compress each conversation with the server under `headroom:` before it is sent here. See [Compressing what is sent](#compressing-what-is-sent) |
 | `backends.<name>.cloud` | `false` | a provider's server on the internet: no hardware here, no warm state, and only the models under `serves`. See [A provider's models](#a-providers-models) |
 | `backends.<name>.routes` | none | paths this backend answers besides chat, each with its lane and model. See [Backends that don't speak the OpenAI API](#backends-that-dont-speak-the-openai-api) |
 | `resources.<name>.kind` | `gpu` | `gpu`, `cpu` or `other`. Picks the icon; `gpu` and `other` are exclusive unless shared |
@@ -187,6 +188,9 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `callers.<who>` | none | Which rulebook a caller goes by: an api key's label, `local`, or `*` for everyone else, each to a name under `routers:` or `default`. |
 | `layout.<node>` | none | `{ x, y }`: where the console's topology draws a node you placed. Written by [its editor](#editing-on-the-graph); nodes without one are laid out |
 | `modelHeader` | `true` | send `x-hearth-model` on every chat answer: the id the request ran as. See [Flows](#flows) |
+| `headroom.url` | `http://127.0.0.1:8787` | where a [Headroom](https://github.com/headroomlabs-ai/headroom) server listens. Setting `headroom:` changes nothing by itself: a backend asks for it with `headroom: true` |
+| `headroom.token` | unset | its proxy token, where it is started with one. `env:NAME` keeps it out of the file |
+| `headroom.timeoutMs` | `10000` | how long one compression may take before the request is sent as it came |
 | `historyFile` | unset | a file that keeps the console's day of history, its recent log lines and the month of usage per caller across restarts, written every minute and at shutdown. Unset keeps them in memory |
 | `stateFile` | unset | a console sidecar from an earlier version. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 
@@ -1129,6 +1133,52 @@ backends:
   `reasoning_content`. Other request fields are not sent.
 - The [canary](#canary) probes with a chat completion and so cannot probe a
   model on such a backend.
+
+### Compressing what is sent
+
+A long agent conversation is mostly tool output: logs, file listings, JSON.
+[Headroom](https://github.com/headroomlabs-ai/headroom) is a separate program
+that shortens those before a model reads them. hearth can ask one to do so for
+the backends you choose, which is worth most where input is paid for by the
+token.
+
+Run its proxy beside hearth (`headroom proxy`), say where it is, and turn it
+on per backend:
+
+```yaml
+headroom:
+  url: http://127.0.0.1:8787
+
+backends:
+  provider:
+    url: https://api.example.com
+    cloud: true
+    key: env:PROVIDER_KEY
+    serves: [their-model-id]
+    headroom: true
+```
+
+- Only the conversation is sent to it (`POST /v1/compress`), with the model's
+  name. The system prompt and the tools are not, and the backend's key never
+  is. It answers with the same turns, some shorter, and hearth sends those.
+- **It never fails a request.** If it is down, slow past `timeoutMs` or
+  answers something that is not the conversation it was sent, the request
+  goes out as it came. The log says so once (`headroom.failed`) and once when
+  it is back (`headroom.recovered`), and the backend's card on the status page
+  says which of the two it is and how many tokens have been saved.
+- A conversation is named by who asked, the model and how it opened, and
+  Headroom returns the turns it has already answered unchanged. So what the
+  provider cached of them is still read, with `format: anthropic` or without.
+  That memory is in its process: after it restarts, the next request of a
+  conversation is compressed afresh and read from no cache, once.
+- **This is lossy.** A model sees a shortened tool result, not the one the
+  tool returned, and cannot ask for the rest. Leave it off where a request
+  must reach the backend exactly as it was sent.
+- Everything a backend with `headroom: true` is asked goes to that server.
+  Keep it on this machine or on a network you trust. Headroom refuses callers
+  from another machine unless it is started to allow them, and reports
+  anonymous usage counts to its authors unless that is switched off; both are
+  its settings, not hearth's.
 
 ### Backends that share a card
 

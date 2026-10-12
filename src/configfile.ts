@@ -77,6 +77,7 @@ function secretTable(doc: unknown): Map<string, string> {
   // Only a hash, but one that can be attacked offline, and nothing on the page needs it.
   if (isObj(d.operator)) grab(d.operator.passHash);
   if (isObj(d.backends)) for (const b of Object.values(d.backends)) if (isObj(b)) grab(b.key);
+  if (isObj(d.headroom)) grab(d.headroom.token);
   return table;
 }
 
@@ -104,6 +105,7 @@ function maskSecrets(text: string, doc: unknown): { text: string; doc: unknown }
   }
   if (isObj(d.operator)) d.operator.passHash = swap(d.operator.passHash);
   if (isObj(d.backends)) for (const b of Object.values(d.backends)) if (isObj(b) && b.key !== undefined) b.key = swap(b.key);
+  if (isObj(d.headroom) && d.headroom.token !== undefined) d.headroom.token = swap(d.headroom.token);
   let masked = text;
   for (const [m, s] of table) masked = masked.split(s).join(m);
   return { text: masked, doc: d };

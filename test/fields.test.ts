@@ -30,7 +30,7 @@ const AT: Record<Scope, (string | number)[]> = {
   scheduler: ["scheduler"],
   lane: ["scheduler", "lanes", "chat"], model: ["models", "m"], stats: ["models", "m", "stats"],
   pool: ["models", "m", "pool"], price: ["models", "m", "price"], peer: ["peers", "p"], lending: ["lending"], borrowing: ["borrowing"],
-  operator: ["operator"],
+  operator: ["operator"], headroom: ["headroom"],
 };
 
 /** Set `value` at `path` inside `doc`, creating plain objects on the way. */

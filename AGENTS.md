@@ -16,6 +16,8 @@ comment is read by strangers. Write for them.
 - `src/kinds.ts`: what each backend `kind` supports
 - `src/anthropic.ts`: a backend that speaks the Messages API: the request and
   the answer rewritten each way
+- `src/headroom.ts`: a backend's conversations compressed by a Headroom
+  server before they are sent
 - `src/console/`: the React status page and config editor (built to `dist/`).
   The routing map is `Routing.tsx` (layout), `flowNodes.tsx` (one view per
   kind of node) and `draft.ts` (`NODES`: what drawing a line from or onto each
