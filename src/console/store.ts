@@ -35,6 +35,8 @@ interface State {
   toast: Toast;
   /** A pending key request from a write, resolved by the key dialog. */
   askKey: ((key: string | null) => void) | null;
+  /** A key just minted or rotated: its plaintext, to be shown once and then let go. */
+  fresh: { label: string; key: string; rotated?: boolean } | null;
 }
 
 export const useStore = create<State>(() => ({
@@ -45,6 +47,7 @@ export const useStore = create<State>(() => ({
   setupRequired: false,
   page: (location.hash.slice(1) as Page) || "topology",
   sel: null,
+  fresh: null,
   toast: null,
   askKey: null,
 }));
@@ -188,13 +191,29 @@ export async function evict(model: string): Promise<void> {
 export async function mintKey(label: string, models: string[] | null, more: { expires?: string; limits?: { requestsPerMinute?: number; tokensPerDay?: number } } = {}): Promise<string | null> {
   try {
     const d = await request<{ key: string }>("POST", "/keys/mint", { label, ...(models !== null && models.length > 0 ? { models } : {}), ...more });
-    toast("ok", `key for ${label} minted — it is shown once, below`);
+    useStore.setState({ fresh: { label, key: d.key } });
+    toast("ok", `key for ${label} minted — it is shown once`);
     return d.key;
   } catch (e) {
     toast("bad", (e as Error).message);
     return null;
   }
 }
+
+/** Give a key a new secret and keep the rest of it; the old secret stops authenticating at once. */
+export async function rotateKey(label: string): Promise<string | null> {
+  try {
+    const d = await request<{ key: string }>("POST", "/keys/rotate", { label });
+    useStore.setState({ fresh: { label, key: d.key, rotated: true } });
+    toast("ok", `${label} rotated — the new key is shown once`);
+    return d.key;
+  } catch (e) {
+    toast("bad", (e as Error).message);
+    return null;
+  }
+}
+/** Let go of the key that was being shown. */
+export const doneWithKey = () => useStore.setState({ fresh: null });
 
 /** Revoke a key by label; it stops authenticating at once. */
 export async function revokeKey(label: string): Promise<void> {

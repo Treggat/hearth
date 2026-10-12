@@ -259,7 +259,7 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/config/draft` | local | the console's unpublished draft, kept beside the file: `GET`, `PUT` a JSON body, `DELETE` |
 | `/config/versions` | local | `GET` the versions written through the node (`at`, `name`, `hash`); `POST { hash, dryRun? }` makes one the file again |
 | `/backends/probe` | local | `POST { url, key? }` asks that server for its model list with that key and answers `{ ok, url, models }` or `{ ok: false, problem }`. Nothing is kept; the console uses it before a provider is added |
-| `/keys/mint`, `/keys/revoke` | local | `POST { label, models?, expires?, limits? }` writes a new `apiKeys` entry and answers with its key, once; `POST { label }` removes the entry with that label. Both take effect at once |
+| `/keys/mint`, `/keys/revoke`, `/keys/rotate` | local | `POST { label, models?, expires?, limits? }` writes a new `apiKeys` entry and answers with its key, once; `POST { label }` removes the entry with that label, or for rotate gives it a new key, answered once, and keeps the rest of it (its label, and so its router, scope, limits and usage). An entry that reads its key from `env:NAME` is not rotated here. All take effect at once |
 | `/v1/evict` | local | `POST { model }` drops a resident model off the backend that serves it. `409` while it is answering a request, when it is not resident, or when the backend can only clear everything and holds other models |
 | `/usage` | local | `GET ?days=N` (31 at most): requests, failures and tokens in and out, as day → caller → model. Days are UTC. Tokens are the backend's own `usage` where its answer carries one; a stream without one is counted by its events, and the request by its estimated size |
 | `/flows/try` | local | `POST { model, images?, tools?, tokens?, caller?, lane?, headers?, flows?, actions?, pretend? }`: where that request would go right now, the step that decides it in each flow, and the actions those steps name. Sends nothing, sets nothing off and counts nothing. `flows` and `actions` try unsaved sections; `pretend: { idle, used, busy, warm, unready, held }` lists models to read as in that state, `pretend.full` steps to read as at their `max` (each `<step>:<flow>`), and `pretend.now` a time of day to read the clock as |
@@ -671,6 +671,11 @@ Five pages, and ⌘K jumps to anything on them:
   click opens that page. With callers wired to routers of their own, the node
   is a frame holding its callers, boxed by the router each goes by, and every
   router's line meets at one point that the peers and hardware hang off.
+  **Right-click a caller** to say which router its requests go by, or to make
+  a new router for it; that joins the routing draft. For a key the same menu
+  rotates or revokes it, and a right-click anywhere in the frame mints a new
+  one from a label. Those three are written at once, as on the Keys page, and
+  a new key is shown once over the page.
 - **Routing**: every model name, the rules some pass through, and where each
   ends up, as a map you edit. See [Editing on the graph](#editing-on-the-graph).
 - **Models**: every model on one row: which nodes hold it, whether it is loaded
@@ -678,7 +683,7 @@ Five pages, and ⌘K jumps to anything on them:
   view; this is all of them at once. A model served here can be warmed or
   evicted from its row.
 - **Keys**: every api key by label, what it may run, its limits and expiry,
-  what it used today and over 31 days, and when it last spoke to this node. Mint one (shown once) or revoke one by its label.
+  what it used today and over 31 days, and when it last spoke to this node. Mint one (shown once), revoke one by its label, or rotate one: a new key for the same label, shown once, with the old one refused from then on.
 - **Queue**: jobs in flight, and finished requests per model with how long they
   waited and ran, over the last ten minutes or the last day; a row opens to
   its individual calls. The day view adds
