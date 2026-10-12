@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { addPlace, applyOps, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
+import { addPlace, applyOps, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, callerChoices, paneChoices } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -249,6 +249,33 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   // Renamed, it keeps the place its node was given.
   const named = renamed(placed(made, "routing/inorder:chat-then", { x: 3, y: 4 }), "flows", "chat-then", "talk")!;
   assert.deepEqual([steps(named)[1]!.to, named.layout], [{ flow: "talk" }, { "routing/inorder:talk": { x: 3, y: 4 } }]);
+}
+
+// --- the menu for a right-click among the callers -----------------------------------------------------------------
+{
+  const d = { ...doc(), apiKeys: [{ key: "k", label: "app" }], routers: { side: { flows: {} } }, callers: { app: "side" } };
+  const said = (id: string | null) => callerChoices(d, id).map((c) => (c.head ? (c.label === "" ? "--" : `# ${c.label}`) : `${c.value}${c.on ? " ✓" : ""}`));
+  // A key: which router it goes by, with the one in force marked, then what can be done with the key, then a new one.
+  assert.deepEqual(said("app"), ["# app goes by", "to:", "to:side ✓", "follow", "new-router", "--", "# its key", "rotate", "revoke", "--", "mint"]);
+  // This machine with no key is sent by a router too, and has no key to rotate. It follows everyone else until it is sent somewhere.
+  assert.deepEqual(said("local"), ["# local goes by", "to:", "to:side", "follow ✓", "new-router", "--", "mint"]);
+  // Everyone else is who the others follow, so it cannot follow.
+  assert.deepEqual(said("*"), ["# everyone else goes by", "to: ✓", "to:side", "new-router", "--", "mint"]);
+  // The frame the callers stand in: only what adds one. With no draft read, the routers are not offered.
+  assert.deepEqual(said(null), ["# callers", "mint"]);
+  assert.deepEqual(callerChoices(null, "app").map((c) => c.value).filter(Boolean), ["rotate", "revoke", "mint"]);
+  assert.equal(callerChoices(d, "app").find((c) => c.value === "revoke")!.danger, true);
+}
+
+// --- the menu for a right-click on the empty part of the topology ------------------------------------------------
+{
+  // Everything the strip over the picture adds, by the section it joins, then a provider, the versions and the view.
+  const menu = paneChoices([{ section: "backends", noun: "backend" }, { section: "resources", noun: "hardware" }, { section: "servers", noun: "machine" }]);
+  assert.deepEqual(menu.filter((c) => !c.head).map((c) => [c.label, c.value]), [
+    ["New backend…", "add:backends"], ["New hardware…", "add:resources"], ["New machine…", "add:servers"], ["New provider…", "provider"],
+    ["Versions…", "versions"], ["Fit everything in view", "fit"],
+  ]);
+  assert.deepEqual(menu.filter((c) => c.head).map((c) => c.label), ["add", ""], "one heading, and a rule before what is not adding");
 }
 
 // --- several nodes picked out on the map, copied and put in again together ----------------------------------------

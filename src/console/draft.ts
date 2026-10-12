@@ -576,6 +576,53 @@ export const EVERYONE = "*";
 export const callersIn = (doc: Doc): string[] =>
   [EVERYONE, "local", ...(Array.isArray(doc.apiKeys) ? doc.apiKeys : []).map((k) => text(obj(k).label)).filter(Boolean)];
 
+/** A row of one of the topology's menus: what it says, what choosing it means, and how it is drawn. */
+export type CallerChoice = { label: string; value?: string; aside?: string; icon?: "plus" | "rotate" | "bin"; head?: boolean; on?: boolean; danger?: boolean; mono?: boolean };
+
+/**
+ * The menu for a right-click among the callers. On one of them: which router its requests go by,
+ * with the one in force marked, and for a key what can be done with the key. On none (`null`),
+ * the frame they stand in: only what adds one. A heading with no label is a rule between groups.
+ */
+export function callerChoices(doc: Doc | null, id: string | null): CallerChoice[] {
+  const key = id !== null && id !== EVERYONE && id !== "local";
+  const at = doc && id !== null ? routerFor(doc, id) : null;
+  return [
+    ...(at && id !== null ? [
+      { label: `${id === EVERYONE ? "everyone else" : id} goes by`, head: true },
+      { label: "The default router", value: "to:", on: at.own && at.router === null },
+      ...Object.keys(obj(doc!.routers)).map((r) => ({ label: r, value: `to:${r}`, mono: true, on: at.own && at.router === r })),
+      // Everyone else is who the others follow, so it cannot follow.
+      ...(id === EVERYONE ? [] : [{ label: "Wherever everyone else goes", value: "follow", on: !at.own, aside: "moves with them" }]),
+      { label: "A new router…", value: "new-router", icon: "plus" as const },
+      { label: "", head: true },
+    ] : []),
+    ...(key ? [
+      { label: "its key", head: true },
+      { label: "Rotate…", value: "rotate", icon: "rotate" as const, aside: "a new secret, shown once" },
+      { label: "Revoke", value: "revoke", icon: "bin" as const, danger: true, aside: "stops working at once" },
+      { label: "", head: true },
+    ] : []),
+    ...(id === null ? [{ label: "callers", head: true }] : []),
+    { label: "New key…", value: "mint", icon: "plus" as const },
+  ];
+}
+
+/**
+ * The menu for a right-click on the empty part of the topology: everything the strip over the picture
+ * adds, by the section it joins (`add:<section>`), a provider, the published versions, and the view.
+ */
+export function paneChoices(kinds: { section: string; noun: string }[]): CallerChoice[] {
+  return [
+    { label: "add", head: true },
+    ...kinds.map((k) => ({ label: `New ${k.noun}…`, value: `add:${k.section}`, icon: "plus" as const })),
+    { label: "New provider…", value: "provider", icon: "plus" as const, aside: "an API on the internet" },
+    { label: "", head: true },
+    { label: "Versions…", value: "versions", aside: "published, and the way back" },
+    { label: "Fit everything in view", value: "fit" },
+  ];
+}
+
 /** The router a caller goes by, null for the default one. `own` is false where it only goes where everyone else does. */
 export function routerFor(doc: Doc, caller: string): { router: string | null; own: boolean } {
   const given = text(obj(doc.callers)[caller]);
