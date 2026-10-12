@@ -668,6 +668,8 @@ export interface CanaryOptions {
   log: Logger;
   /** Every model opted in, recomputed each tick: a llama-swap catalog moves. */
   targets: () => ProbeTarget[];
+  /** The backend id a model goes out as right now, for `onlyAs`. Absent: every entry always applies. */
+  wireOf?: (model: string) => string;
   /** A state change to announce. Must not throw; a slow hook is the hook's problem. */
   notify?: (event: CanaryEvent) => void;
   now?: () => number;
@@ -720,14 +722,22 @@ export class Canary {
     return backend !== undefined && this.cfg.backends[backend] !== undefined;
   }
 
-  /** Is this (model, backend) pair one the canary watches? Pointless work is skipped on this. */
+  /** Is this (model, backend) pair one the canary watches right now? Pointless work is skipped on this. */
   watches(model: string, backend: string): boolean {
-    return this.has(model, backend);
+    return this.has(model, backend) && this.applies(model, backend);
   }
 
-  /** The fast refusal for a degraded model, or null. */
+  /** Is this id going out as the model its entry is for? Always, without `onlyAs`. */
+  private applies(model: string, backend: string): boolean {
+    const only = this.probeFor(model, backend).onlyAs;
+    return only === null || this.deps.wireOf === undefined || this.deps.wireOf(model) === only;
+  }
+
+  /** The fast refusal for a degraded model, or null. A verdict earned as one model is not held against another. */
   refuse(model: string): DegradedInfo | null {
-    return this.states.get(model)?.degraded ?? null;
+    const st = this.states.get(model);
+    if (st === undefined || st.degraded === null) return null;
+    return this.applies(model, st.backend) ? st.degraded : null;
   }
 
   stateOf(model: string): ModelHealth | null {
@@ -786,7 +796,7 @@ export class Canary {
    */
   observePassive(model: string, backend: string, verdict: Verdict): void {
     if (!this.cfg.passive) return;
-    if (this.has(model, backend) === false) return;
+    if (!this.watches(model, backend)) return;
     if (verdict.reason === "thinking") return;
     const st = this.state({ model, backend });
     if (st.degraded !== null) return;
@@ -818,6 +828,8 @@ export class Canary {
     const now = this.now();
     const work: Promise<void>[] = [];
     for (const t of this.deps.targets()) {
+      // Going out as some other model than the one this entry is for: not ours to ask, or to drop.
+      if (!this.applies(t.model, t.backend)) continue;
       const st = this.state(t);
       const probe = this.probeFor(t.model, t.backend);
       // Recovery first, and if it acted, this tick is not also a probe: the drop
@@ -1133,7 +1145,8 @@ export function createCanary(cfg: HearthConfig, pool: BackendPool, log: Logger):
       // Nothing running and nothing waiting: the seat is free to be nudged.
       idle: back.running === 0 && waiting === 0,
       ready: mine.free > 0 && waiting === 0,
-      loadedCount: slot.state.loaded().length,
+      // An app holding the card counts as a model on it: a recovery reload must not swap it out.
+      loadedCount: slot.state.loaded().length + (pool.appHolds(slot.cfg) ? 1 : 0),
       probe: (spec, signal, load) => queued(slot, id, spec, signal, load),
       unload: () => unloadOne(slot, wire),
     };
@@ -1180,6 +1193,7 @@ export function createCanary(cfg: HearthConfig, pool: BackendPool, log: Logger):
     cfg: conf,
     log,
     ...(conf.notify ? { notify: webhook(conf.notify, cfg.name, log) } : {}),
+    wireOf: (id) => pool.outboundId(id),
     /** Every model opted in, on the backend that would serve it. Recomputed each tick. */
     targets: () => {
       const out: ProbeTarget[] = [];
