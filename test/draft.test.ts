@@ -249,6 +249,8 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   // Renamed, it keeps the place its node was given.
   const named = renamed(placed(made, "routing/inorder:chat-then", { x: 3, y: 4 }), "flows", "chat-then", "talk")!;
   assert.deepEqual([steps(named)[1]!.to, named.layout], [{ flow: "talk" }, { "routing/inorder:talk": { x: 3, y: 4 } }]);
+}
+
 // --- several nodes picked out on the map, copied and put in again together ----------------------------------------
 {
   // Only a node that is a rule or an action in its own right is copied or deleted; the rest are moved and nothing more.
