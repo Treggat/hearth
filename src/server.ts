@@ -3,6 +3,7 @@
  * protocol. Bodies stream through untouched; only the model id and stream flag are read.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { pipeline as pipeline_ } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -11,7 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { actionDecls, runAction, type Action, type ActionFacts } from "./actions.js";
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import { createCanary, degradedError, type RelayWatch } from "./canary.js";
-import { ANY, ConfigError, flowsFor, peersMapping, WARM_LANE, type BackendConfig, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
+import { ANY, backendBase, ConfigError, flowsFor, resolveSecret, peersMapping, WARM_LANE, type BackendConfig, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
 import { Controls } from "./controls.js";
 import { emulatedRequest, relayEmulated, streamErrorFrame } from "./emulate.js";
 import { ConfigFile, ConfigRefusal, deepFreeze, link, setNote, setShare, unlink, writeFileAtomic } from "./configfile.js";
@@ -22,13 +23,14 @@ import { BackendPool, type BackendSlot } from "./pool.js";
 import { decide, mayLeave, resolve, variantsOf, type LocalLoad, type World } from "./route.js";
 import { QueueFullError } from "./scheduler.js";
 import { DAY_MS, History } from "./history.js";
-import { KEEP_DAYS, meter, Usage, type Meter } from "./usage.js";
+import { KEEP_DAYS, meter, Usage, withoutUsage, type Meter } from "./usage.js";
 import { Answers } from "./answers.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
 import { CONSOLE_HTML } from "./ui.js";
 import { createViews, type CallerUse, type KeyInfo } from "./views.js";
 import { multipartField, replaceMultipartField } from "./multipart.js";
-import { send, type UpstreamResponse } from "./upstream.js";
+import { troubleSays } from "./backend.js";
+import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
 
 /** Constant-time compare over sha256 digests, so neither length nor content leaks. */
 function secretEq(a: string, b: string): boolean {
@@ -105,6 +107,13 @@ const HOP_BY_HOP = new Set([
   "content-length",
   "host",
 ]);
+
+/** Said to a caller whose own key was fine: a 401 passed on from the backend would read as this node refusing them. */
+const KEY_REFUSED = "the backend refused the key this node sends it; the key you sent this node was accepted";
+const refusedKey = (status: number): boolean => status === 401 || status === 403;
+
+/** A backend's own key as the header it is sent in; `name` matches the case of the headers it joins. */
+const keyed = (key: string, name = "Authorization"): Record<string, string> => ({ [name]: `Bearer ${key}` });
 
 function forwardable(
   headers: IncomingMessage["headers"] | UpstreamResponse["headers"],
@@ -445,11 +454,20 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   }
 
   /** Sends a chat completion to a local backend, emulating another server's answers if the route asks. */
-  async function sendLocal(url: string, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
+  async function sendLocal(url: string, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; headers?: Record<string, string>; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
     const emulate = cfg.models[model]?.emulate ?? null;
-    const body = pool.outboundBody(model, payload);
+    const { count, ...reach } = opts;
+    const sent = pool.outboundBody(model, payload);
+    const options = typeof sent.stream_options === "object" && sent.stream_options !== null ? sent.stream_options as Record<string, unknown> : {};
+    // A provider says what a stream cost only when asked. Asked here for the count, the report is kept from a caller who did not ask for it.
+    const ask = count !== undefined && sent.stream === true && options.include_usage !== true;
+    const body = ask ? { ...sent, stream_options: { ...options, include_usage: true } } : sent;
     const sentAt = Date.now();
-    const up = await send(`${url}/v1/chat/completions`, { json: emulate ? emulatedRequest(body) : body, ...opts });
+    const got = await send(`${url}/v1/chat/completions`, { json: emulate ? emulatedRequest(body) : body, ...reach });
+    // Errors on either side end both, so the relay below sees a failed stream as it would the backend's own.
+    const up = ask && got.status < 400 ? { ...got, body: pipeline_(got.body, withoutUsage(count!), () => {}) } : got;
+    // The key refused was this node's, not the caller's: said as such, and the request may move on.
+    if (opts.headers && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
     // With somewhere else to run it, a backend's own failure is not relayed: the request moves on.
     if (spare && up.status >= 500 && !res.headersSent) throw new BackendFailed(up.status, (await up.text()).slice(0, 200));
     if (emulate) return relayEmulated(up, res, relayable(up), sentAt);
@@ -823,7 +841,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       ranOn = local.name;
       await local.state.ensureFresh();
     // Our id and the route's params on the way to the backend; untouched when neither is set.
-      localStatus = await sendLocal(local.cfg.url, model, payload, res, { signal, ...backendDeadline(local.cfg) }, spare);
+      localStatus = await sendLocal(local.cfg.url, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.key ? { headers: keyed(local.cfg.key) } : {}), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}) }, spare);
     };
 
     const t: Timing = { enqueuedAt: Date.now(), startedAt: 0, meter: meter(res), need: Math.max(0, (need?.tokens ?? 0) - (need?.output ?? 0)) };
@@ -1147,6 +1165,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Mint and revoke write the config file, and the node follows it at once.
     { path: ["/keys/mint", "/keys/revoke"], methods: ["POST"], auth: "local", handler: routeKeys },
     { path: "/usage", methods: ["GET"], auth: "local", handler: routeUsage },
+    { path: "/backends/probe", methods: ["POST"], auth: "local", handler: routeProbe },
 
     // The OpenAI surface: a peer may send us work here, and so may we.
     { path: "/v1/warm", methods: ["POST"], auth: "either", envelope: "openai", handler: routeWarm },
@@ -1622,6 +1641,28 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       json(c.res, 200, { model, backend: slot.name, evicted: true, via });
     } catch (e) {
       fail(c.res, e);
+    }
+  }
+
+  // Asks a server what it serves before it is a backend, with the key it would be sent: the answer is its
+  // model ids, or in a few words why there are none. Nothing is kept.
+  async function routeProbe(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      if (typeof body.url !== "string") throw new Refusal(400, "url is required");
+      const key = typeof body.key === "string" && body.key.trim() !== "" ? resolveSecret(body.key.trim(), "key") : null;
+      let url: string;
+      try { url = backendBase(body.url.trim(), "url"); } catch (e) { throw new Refusal(400, e instanceof Error ? e.message : String(e)); }
+      try {
+        const got = await getJson<{ data?: { id?: unknown }[] }>(`${url}/v1/models`, { headers: key ? keyed(key) : {}, headersTimeoutMs: 5_000 });
+        const models = (got.data ?? []).map((m) => m.id).filter((m): m is string => typeof m === "string" && m !== "").sort();
+        json(c.res, 200, { ok: true, url, models });
+      } catch (e) {
+        json(c.res, 200, { ok: false, url, problem: troubleSays(e instanceof UpstreamError && e.status !== undefined ? e.status : 0) });
+      }
+    } catch (e) {
+      // A key written as env:NAME with no such variable is the asker's mistake.
+      fail(c.res, e instanceof ConfigError ? new Refusal(400, e.message) : e);
     }
   }
 
@@ -2263,11 +2304,16 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         method: req.method ?? "GET",
         ...(sendBody && sendBody.length > 0 ? { raw: sendBody } : {}),
         // Client headers minus hop-by-hop, and minus our own key if that is what it carries.
-        headers: stripOurKey(req) as Record<string, string>,
+        // A backend with a key of its own is sent that, whatever the client carried.
+        headers: { ...stripOurKey(req), ...(to.cfg.key ? keyed(to.cfg.key, "authorization") : {}) } as Record<string, string>,
         signal: ctrl.signal,
         ...backendDeadline(to.cfg),
       });
       log.debug("passthrough", { path, status: up.status });
+      if (to.cfg.key && refusedKey(up.status)) {
+        up.body.resume();
+        throw new Refusal(502, KEY_REFUSED, "server_error");
+      }
       if (orFail && up.status >= 500) {
         up.body.resume();
         throw new Error(`${to.name} answered ${up.status}`);

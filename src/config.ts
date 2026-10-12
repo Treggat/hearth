@@ -121,6 +121,13 @@ export interface BackendConfig {
   resident: ResidentDecl | null;
   /** Keeps named lanes off its `resources` while its app is in use; see HoldDecl. null holds nothing. */
   hold: HoldDecl | null;
+  /** Sent to this backend as `Authorization: Bearer` on every call, in place of anything the client sent. null sends none. */
+  key: string | null;
+  /**
+   * Someone else's server, reached over the internet: it has no hardware here and no warm state,
+   * and serves only what `serves` names. A request sent to it leaves this machine and this network.
+   */
+  cloud: boolean;
 }
 
 /**
@@ -887,7 +894,8 @@ const WARM_SOURCES = Object.keys(KINDS) as WarmSource[];
 
 /** A backend's `kind`, defaulting to llama-swap. */
 function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
-  const kind = str(entry.kind, `${where}.kind`, "llama-swap");
+  // A provider's servers are not ours to ask what is loaded.
+  const kind = str(entry.kind, `${where}.kind`, entry.cloud === true ? "none" : "llama-swap");
   if (!WARM_SOURCES.includes(kind as WarmSource)) {
     throw bad(`${where}.kind`, `is "${kind}" — expected ${WARM_SOURCES.join(", ")}`);
   }
@@ -1110,11 +1118,14 @@ function trimUrl(u: string, where: string): string {
   return u.replace(/\/+$/, "");
 }
 
+/** A backend's base url as given, without the `/v1` every call adds: a provider's is usually copied with it. */
+export const backendBase = (url: string, where: string): string => trimUrl(url, where).replace(/\/v1$/, "");
+
 /** A backend's address: its own `url`, else `http://<its server's host>:<port>`. */
 function backendUrl(entry: Record<string, unknown>, at: string, host: string | null): string {
   if (entry.url !== undefined) {
     if (entry.port !== undefined) throw bad(`${at}.port`, "is set beside url — keep one: url already carries a port");
-    return trimUrl(str(entry.url, `${at}.url`), `${at}.url`);
+    return backendBase(str(entry.url, `${at}.url`), `${at}.url`);
   }
   if (entry.port === undefined) throw bad(`${at}.url`, "is required, or set server and port");
   if (host === null) throw bad(`${at}.port`, "needs server: a port alone says nothing about which machine");
@@ -1310,8 +1321,17 @@ export function parseConfig(raw: unknown): HearthConfig {
     if (server !== null && servers[server] === undefined) {
       throw bad(`${at}.server`, `names "${server}", which is not in servers`);
     }
+    const cloud = bool(entry.cloud, `${at}.cloud`, false);
+    if (cloud) {
+      if (str(entry.kind, `${at}.kind`, "none") !== "none") throw bad(`${at}.kind`, "must be none (or left out) on a cloud backend: its provider does not say what is loaded");
+      if (strList(entry.resources, `${at}.resources`).length > 0) throw bad(`${at}.resources`, "names hardware, which a cloud backend does not use here");
+      if (server !== null) throw bad(`${at}.server`, "is a machine on your network; a cloud backend takes a url");
+      if (strList(entry.serves, `${at}.serves`).length === 0) throw bad(`${at}.serves`, "is required on a cloud backend: name the models to offer from it, as its provider names them or as `models.<id>.as` maps them");
+    }
     backends.push({
       name,
+      key: entry.key === undefined ? null : resolveSecret(str(entry.key, `${at}.key`), `${at}.key`),
+      cloud,
       url: backendUrl(entry, at, server === null ? null : servers[server]!.host),
       server,
       kind: warmSource(entry, at),
