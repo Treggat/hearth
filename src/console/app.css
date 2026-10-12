@@ -80,6 +80,11 @@ body {
   --xy-controls-button-color: var(--dim);
   --xy-attribution-background-color: transparent;
 }
+/* What the browser draws itself (scroll bars, the date picker) follows the theme. */
+:root { color-scheme: light; }
+.dark { color-scheme: dark; }
+/* A list inside a menu scrolls on a thin bar in the menu's own colours. */
+.menu-list { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 .react-flow__node { cursor: pointer; }
 .react-flow__handle { opacity: 0; pointer-events: none; }
 /* An outlet of a routing node: drag from it to say where that branch sends work. */
