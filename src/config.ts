@@ -128,6 +128,19 @@ export interface BackendConfig {
    * and serves only what `serves` names. A request sent to it leaves this machine and this network.
    */
   cloud: boolean;
+  /** The API it speaks: OpenAI's chat completions, or Anthropic's Messages, which requests and answers are rewritten for. */
+  format: BackendFormat;
+  /** With `format: anthropic`: mark each request's system prompt, tools and conversation so far for the provider's prompt cache. */
+  promptCache: boolean;
+}
+
+export const BACKEND_FORMATS = ["openai", "anthropic"] as const;
+export type BackendFormat = (typeof BACKEND_FORMATS)[number];
+
+/** What a backend is sent to say who is calling: its key in the header its API reads, and for Messages the version. */
+export function backendAuth(format: BackendFormat, key: string | null): Record<string, string> {
+  if (format === "anthropic") return { "anthropic-version": "2023-06-01", ...(key ? { "x-api-key": key } : {}) };
+  return key ? { authorization: `Bearer ${key}` } : {};
 }
 
 /**
@@ -483,6 +496,8 @@ export interface HearthConfig {
    * Catches a generation that hangs mid-stream, which would otherwise hold its slot and card.
    */
   backendIdleMs: number;
+  /** How long a backend is passed over, where a flow has another line that fits, after three failures in a row. 0 never passes one over. */
+  backendRestMs: number;
   /**
    * How long shutdown waits for in-flight requests, in ms; 0 kills them at once. Keep the
    * service manager's stop timeout above it.
@@ -1341,8 +1356,12 @@ export function parseConfig(raw: unknown): HearthConfig {
       if (server !== null) throw bad(`${at}.server`, "is a machine on your network; a cloud backend takes a url");
       if (strList(entry.serves, `${at}.serves`).length === 0) throw bad(`${at}.serves`, "is required on a cloud backend: name the models to offer from it, as its provider names them or as `models.<id>.as` maps them");
     }
+    const format = str(entry.format, `${at}.format`, "openai");
+    if (!BACKEND_FORMATS.includes(format as BackendFormat)) throw bad(`${at}.format`, `is "${format}" — expected ${BACKEND_FORMATS.join(" or ")}`);
     backends.push({
       name,
+      format: format as BackendFormat,
+      promptCache: bool(entry.promptCache, `${at}.promptCache`, true),
       key: entry.key === undefined ? null : resolveSecret(str(entry.key, `${at}.key`), `${at}.key`),
       cloud,
       url: backendUrl(entry, at, server === null ? null : servers[server]!.host),
@@ -1682,6 +1701,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     peerFirstByteMs: atLeast(borrowing.firstByteMs, "borrowing.firstByteMs", 180_000),
     backendFirstByteMs: atLeast(defaults.firstByteMs, "backendDefaults.firstByteMs", 900_000),
     backendIdleMs: atLeast(defaults.idleMs, "backendDefaults.idleMs", 600_000),
+    backendRestMs: atLeast(defaults.restMs, "backendDefaults.restMs", 30_000),
     coldPenalty: atLeast(borrowing.coldPenalty, "borrowing.coldPenalty", 2),
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.
