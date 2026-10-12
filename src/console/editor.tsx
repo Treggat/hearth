@@ -8,7 +8,7 @@ import { useContext, useEffect, useState } from "react";
 
 import { NewDialog, Refs, refsOf, Review, Value } from "./config.js";
 import { ACTIONS, arranged, callersIn, directTo, EVERYONE, editStep, FACTS, isObj, linesRunning, list, moveStep, nodeOf, obj, problems, put, rawTo, routeId, TEMPLATES, text, tidied, toOf, toText, usersOf, withCaller, withDo, type Doc, type To } from "./draft.js";
-import { addRouter, change, choose, chooseAt, closeMenu, copy, dirty, duplicate, edits, closeRule, editSelect, openRule, type EditSel, facts, focusOn, goBack, loadDraft, paste, pick, redo, remove, removeRouter, rename, revert, review, setAdding, showRouter, startRule, tryRequest, undo, useEdit, versions, wire, type Choice } from "./editStore.js";
+import { addRouter, change, choose, chooseAt, closeMenu, copy, copyMany, dirty, duplicate, edits, closeRule, editSelect, openRule, type EditSel, facts, focusOn, goBack, loadDraft, paste, pick, redo, remove, removeMany, removeRouter, selectMany, rename, revert, review, setAdding, showRouter, startRule, tryRequest, undo, useEdit, versions, wire, type Choice } from "./editStore.js";
 import { HUE } from "./flowNodes.js";
 import { Conds } from "./flowNodes.js";
 import { useStore } from "./store.js";
@@ -173,14 +173,19 @@ export function EditBar() {
       if (el?.closest("input, textarea, select, [contenteditable]") || s.choosing || s.picking || s.adding || s.plan || !s.draft) return;
       const mod = e.metaKey || e.ctrlKey;
       const k = e.key.toLowerCase();
+      // Several nodes picked out together are acted on together, before the one that is open.
+      const several = s.many.length > 1;
       if (k === "/" && !mod) openSearch(innerWidth / 2 - 150, 120);
+      else if ((e.key === "Backspace" || e.key === "Delete") && !mod && several) removeMany();
       else if ((e.key === "Backspace" || e.key === "Delete") && !mod && s.sel) remove(s.sel);
+      else if (mod && k === "d" && several) { if (copyMany()) paste(); }
       else if (mod && k === "d" && s.sel) duplicate(s.sel);
       // Text that is selected on the page is what a copy is for, before any node.
+      else if (mod && k === "c" && several && !String(getSelection() ?? "")) copyMany();
       else if (mod && k === "c" && s.sel && !String(getSelection() ?? "")) copy(s.sel);
       else if (mod && k === "v" && !e.shiftKey) paste();
       else if (mod && k === "z") (e.shiftKey ? redo : undo)();
-      else if (e.key === "Escape" && s.sel) editSelect(null);
+      else if (e.key === "Escape" && (s.sel || several)) { editSelect(null); selectMany([]); }
       else return;
       e.preventDefault();
     };

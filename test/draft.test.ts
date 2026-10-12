@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { applyOps, callerChoices, put, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, paneChoices } from "../src/console/draft.js";
+import { applyOps, callerChoices, put, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, paneChoices, pastedAll, wholes } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -230,6 +230,22 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual(menu.filter((c) => c.head).map((c) => c.label), ["add", ""], "one heading, and a rule before what is not adding");
 }
 
+// --- several nodes picked out on the map, copied and put in again together ----------------------------------------
+{
+  // Only a node that is a rule or an action in its own right is copied or deleted; the rest are moved and nothing more.
+  const many = [{ node: "flow:pick", x: 10, y: 20 }, { node: "refuse:pick:0", x: 0, y: 0 }, { node: "model:chat", x: 5, y: 5 }, { node: "action:note", x: 1, y: 2 }];
+  assert.deepEqual(wholes(many).map((w) => [w.kind, w.id, w.node]), [["flow", "pick", "flow:pick"], ["action", "note", "action:note"]]);
+  // Each copy goes in under a free name, a little down and right of the node it came from.
+  const from = put(doc(), "actions", "note", { log: "hello" });
+  const copied = wholes(many).map((w) => ({ ...w, entry: (from[w.kind === "flow" ? "flows" : "actions"] as Record<string, Doc>)[w.id]! }));
+  const { doc: out, made } = pastedAll(from, copied);
+  assert.deepEqual(made, [{ node: "flow:pick-copy", x: 50, y: 60 }, { node: "action:note-copy", x: 41, y: 42 }]);
+  assert.deepEqual(out.layout, { "routing/flow:pick-copy": { x: 50, y: 60 }, "routing/action:note-copy": { x: 41, y: 42 } });
+  assert.deepEqual([(out.flows as Record<string, Doc>)["pick-copy"]!.inputs, (out.actions as Record<string, Doc>)["note-copy"]], [[], { log: "hello" }], "a copied rule takes no names");
+  assert.doesNotThrow(() => parseConfig(out));
+  assert.deepEqual(pastedAll(from, []), { doc: from, made: [] });
+}
+
 // --- what a person can fix is said before the file refuses it -----------------------------------------------------
 {
   assert.deepEqual(problems(withRest(doc(), "asked")), [], "a file that is in order has nothing to say");
@@ -330,6 +346,9 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
     { id: "c", x: 500, y: 30, w: 100, h: 50 }, { id: "d", x: 60, y: 90, w: 100, h: 20 },
   ], new Map([["b", ["b-side"]]]), 10);
   assert.deepEqual(Object.fromEntries(ys), { a: 0, b: 60, "b-side": 70, c: 30, d: 120 });
+  // Boxes set against each other are left alone: only one that lies on another is moved, and then to just below it.
+  const flush = spread([{ id: "a", x: 0, y: 0, w: 100, h: 50 }, { id: "under", x: 0, y: 50, w: 100, h: 50 }, { id: "beside", x: 100, y: 0, w: 100, h: 50 }, { id: "on", x: 150, y: 40, w: 100, h: 50 }]);
+  assert.deepEqual(Object.fromEntries(flush), { a: 0, under: 50, beside: 0, on: 50 });
   // Ends sit level with the lines that reach them, in that order, never closer than a step; one no line reaches goes last.
   const from: Record<string, number[]> = { low: [300, 340], high: [20], mid: [40], none: [] };
   assert.deepEqual(Object.fromEntries(beside(["low", "high", "mid", "none"], (id) => from[id]!, 50)), { high: 0, mid: 50, low: 295, none: 345 });

@@ -5,7 +5,7 @@
 import { create } from "zustand";
 
 import type { Err, File, Plan } from "./config.js";
-import { added, followed, RANK, routeTyped, summary, factsOf, isObj, nodeOf, obj, opsOf, placed, problems, put, rebase, refusal, removed, renamed, retyped, routeId, scoped, TEMPLATES, unscoped, type Doc, type Facts, type Landing } from "./draft.js";
+import { added, followed, pastedAll, RANK, routeTyped, summary, factsOf, isObj, nodeOf, obj, opsOf, placed, problems, put, rebase, refusal, removed, renamed, retyped, routeId, scoped, TEMPLATES, unscoped, wholes, type Copied, type Doc, type Facts, type Landing, type Picked } from "./draft.js";
 import { request, RequestError, toast, useStore } from "./store.js";
 
 /** A whole draft and the router it was shown by, to go back to. */
@@ -37,6 +37,8 @@ interface EditState {
   pending: string[];
   /** The line under the pointer, by the start of its id, so it can be told from the ones it crosses. */
   hover: string | null;
+  /** The nodes picked out together on the map, by id, each with where it stands: what a drag box or a ctrl-click selects. */
+  many: Picked[];
   /** Drafts to go back to, oldest first. */
   past: Snap[];
   /** Drafts undone, to go forward to again; a new change lets them go. */
@@ -54,7 +56,7 @@ interface EditState {
 }
 
 export const useEdit = create<EditState>(() => ({
-  file: null, draft: null, sel: null, opened: null, err: null, plan: null, trial: null, tried: null, picking: null, choosing: null, pending: [], hover: null, past: [], future: [], unread: null, adding: null, focus: null, router: null, rest: null,
+  file: null, draft: null, sel: null, opened: null, err: null, plan: null, trial: null, tried: null, picking: null, choosing: null, pending: [], hover: null, many: [], past: [], future: [], unread: null, adding: null, focus: null, router: null, rest: null,
 }));
 const set = useEdit.setState;
 const said = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -233,6 +235,39 @@ export function dropName(id: string): void {
   toast("ok", `${id} removed — undo brings it back`);
 }
 
+/** Say which nodes are picked out together; the same ones again changes nothing. */
+export function selectMany(many: Picked[]): void {
+  const was = useEdit.getState().many;
+  if (was.length !== many.length || many.some((m, i) => m.node !== was[i]!.node || m.x !== was[i]!.x || m.y !== was[i]!.y)) set({ many });
+}
+/** Take out every rule and action picked out, as one change. */
+export function removeMany(): void {
+  const gone = wholes(useEdit.getState().many);
+  if (!gone.length) return;
+  change((d) => gone.reduce<Doc>((doc, g) => removed(doc, SECTION[g.kind], g.id), d));
+  set({ sel: null, many: [] });
+  toast("ok", `${gone.length} deleted — undo brings them back`);
+}
+// What was last copied from several nodes at once: each as it stood, with the node it was drawn as and where.
+let copiedMany: Copied[] = [];
+/** Remember every rule and action picked out; false when none of them is one. */
+export function copyMany(): boolean {
+  const { draft, many } = useEdit.getState();
+  const got = wholes(many).flatMap((g) => { const entry = obj(draft?.[SECTION[g.kind]])[g.id]; return isObj(entry) ? [{ ...g, entry }] : []; });
+  if (!got.length) return false;
+  copiedMany = got;
+  copiedOne = null;
+  return true;
+}
+/** Put in everything last copied together, and pick the copies out so they can be moved as one. */
+function pasteMany(): void {
+  const { draft } = useEdit.getState();
+  if (!draft) return;
+  const { doc, made } = pastedAll(draft, copiedMany);
+  set({ draft: doc, err: null, sel: null, many: made, focus: { node: made[0]!.node } });
+  toast("ok", `${made.length} added`);
+}
+
 // What was last copied: a rule or an action as it stood, so it can be put in again after it has changed or gone.
 let copiedOne: { kind: "flow" | "action"; id: string; entry: Doc } | null = null;
 /** Remember a rule or an action to paste; false when there is none by that name. */
@@ -240,11 +275,13 @@ export function copy(sel: EditSel): boolean {
   const entry = sel && obj(useEdit.getState().draft?.[SECTION[sel.kind]])[sel.id];
   if (!sel || !isObj(entry)) return false;
   copiedOne = { ...sel, entry };
+  copiedMany = [];
   return true;
 }
 /** Put in what was last copied, under a free name, and open it. */
 export function paste(): void {
   const { draft } = useEdit.getState();
+  if (copiedMany.length) { pasteMany(); return; }
   if (!draft || !copiedOne) return;
   const { kind } = copiedOne;
   const { doc, name } = added(draft, SECTION[kind], copiedOne.id, copiedOne.entry);
