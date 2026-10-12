@@ -676,6 +676,11 @@ Five pages, and ⌘K jumps to anything on them:
   click opens that page. With callers wired to routers of their own, the node
   is a frame holding its callers, boxed by the router each goes by, and every
   router's line meets at one point that the peers and hardware hang off.
+  **Right-click a caller** to say which router its requests go by, or to make
+  a new router for it; that joins the routing draft. For a key the same menu
+  rotates or revokes it, and a right-click anywhere in the frame mints a new
+  one from a label. Those three are written at once, as on the Keys page, and
+  a new key is shown once over the page.
 - **Routing**: every model name, the rules some pass through, and where each
   ends up, as a map you edit. See [Editing on the graph](#editing-on-the-graph).
 - **Models**: every model on one row: which nodes hold it, whether it is loaded
@@ -683,7 +688,7 @@ Five pages, and ⌘K jumps to anything on them:
   view; this is all of them at once. A model served here can be warmed or
   evicted from its row.
 - **Keys**: every api key by label, what it may run, its limits and expiry,
-  what it used today and over 31 days, and when it last spoke to this node. Mint one (shown once) or revoke one by its label.
+  what it used today and over 31 days, and when it last spoke to this node. Mint one (shown once), revoke one by its label, or rotate one: a new key for the same label, shown once, with the old one refused from then on.
 - **Queue**: jobs in flight, and finished requests per model with how long they
   waited and ran, over the last ten minutes or the last day; a row opens to
   its individual calls. The day view adds
