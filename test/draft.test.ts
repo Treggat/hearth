@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { addPlace, applyOps, dropPlace, orderOf, put, raisePlace, thenTry, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, pastedAll, wholes, callerChoices } from "../src/console/draft.js";
+import { addPlace, applyOps, dropPlace, orderOf, put, raisePlace, thenTry, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, pastedAll, wholes, callerChoices, paneChoices } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -281,6 +281,17 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual(said(null), ["# callers", "mint"]);
   assert.deepEqual(callerChoices(null, "app").map((c) => c.value).filter(Boolean), ["rotate", "revoke", "mint"]);
   assert.equal(callerChoices(d, "app").find((c) => c.value === "revoke")!.danger, true);
+}
+
+// --- the menu for a right-click on the empty part of the topology ------------------------------------------------
+{
+  // Everything the strip over the picture adds, by the section it joins, then a provider, the versions and the view.
+  const menu = paneChoices([{ section: "backends", noun: "backend" }, { section: "resources", noun: "hardware" }, { section: "servers", noun: "machine" }]);
+  assert.deepEqual(menu.filter((c) => !c.head).map((c) => [c.label, c.value]), [
+    ["New backend…", "add:backends"], ["New hardware…", "add:resources"], ["New machine…", "add:servers"], ["New provider…", "provider"],
+    ["Versions…", "versions"], ["Fit everything in view", "fit"],
+  ]);
+  assert.deepEqual(menu.filter((c) => c.head).map((c) => c.label), ["add", ""], "one heading, and a rule before what is not adding");
 }
 
 // --- what a person can fix is said before the file refuses it -----------------------------------------------------

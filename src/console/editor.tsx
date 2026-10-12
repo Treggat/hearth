@@ -134,17 +134,22 @@ export function VersionsHere() {
 /** A caller as the console names it: everyone not sent somewhere else is "default". */
 const said = (caller: string) => (caller === EVERYONE ? "default" : caller);
 
+/** List the published versions at a point on the page; choosing one shows what going back to it changes. */
+export function openVersions(x: number, y: number): void {
+  void versions().then((all) => chooseAt(x, y, all.length === 0 ? [{ label: "nothing has been published from here yet", off: true }] : [
+    { label: "go back to", head: true },
+    // Newest first; the one that is the file as it stands is marked, and is nowhere to go back to.
+    ...all.map((v) => ({ label: v.name || "unnamed", value: v.hash, hint: `${new Date(v.at).toLocaleString()}${v.hash === useEdit.getState().file?.hash ? " · the file now" : ""}`, off: v.hash === useEdit.getState().file?.hash })).reverse(),
+  ], (hash) => { const v = all.findLast((x) => x.hash === hash); if (v) void goBack(v); }, all.length > 8));
+}
+
 /** The versions that have been published, to see what one changed and go back to it. */
 export function VersionsButton() {
   return (
     <button type="button" aria-label="published versions" title="the versions that have been published: see what one changed, and go back to it" className="flex h-8 items-center gap-1.5 rounded-lg border border-line bg-panel px-2.5 text-[12px] text-dim hover:bg-muted hover:text-fg"
                 onClick={(e) => {
                   const r = e.currentTarget.getBoundingClientRect();
-                  void versions().then((all) => chooseAt(r.left, r.bottom + 4, all.length === 0 ? [{ label: "nothing has been published from here yet", off: true }] : [
-                    { label: "go back to", head: true },
-                    // Newest first; the one that is the file as it stands is marked, and is nowhere to go back to.
-                    ...all.map((v) => ({ label: v.name || "unnamed", value: v.hash, hint: `${new Date(v.at).toLocaleString()}${v.hash === useEdit.getState().file?.hash ? " · the file now" : ""}`, off: v.hash === useEdit.getState().file?.hash })).reverse(),
-                  ], (hash) => { const v = all.findLast((x) => x.hash === hash); if (v) void goBack(v); }, all.length > 8));
+                  openVersions(r.left, r.bottom + 4);
                 }}>
           <History size={13} />versions
     </button>

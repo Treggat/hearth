@@ -564,7 +564,7 @@ export const EVERYONE = "*";
 export const callersIn = (doc: Doc): string[] =>
   [EVERYONE, "local", ...(Array.isArray(doc.apiKeys) ? doc.apiKeys : []).map((k) => text(obj(k).label)).filter(Boolean)];
 
-/** A row of the callers' menu: what it says, what choosing it means, and how it is drawn. */
+/** A row of one of the topology's menus: what it says, what choosing it means, and how it is drawn. */
 export type CallerChoice = { label: string; value?: string; aside?: string; icon?: "plus" | "rotate" | "bin"; head?: boolean; on?: boolean; danger?: boolean; mono?: boolean };
 
 /**
@@ -593,6 +593,21 @@ export function callerChoices(doc: Doc | null, id: string | null): CallerChoice[
     ] : []),
     ...(id === null ? [{ label: "callers", head: true }] : []),
     { label: "New key…", value: "mint", icon: "plus" as const },
+  ];
+}
+
+/**
+ * The menu for a right-click on the empty part of the topology: everything the strip over the picture
+ * adds, by the section it joins (`add:<section>`), a provider, the published versions, and the view.
+ */
+export function paneChoices(kinds: { section: string; noun: string }[]): CallerChoice[] {
+  return [
+    { label: "add", head: true },
+    ...kinds.map((k) => ({ label: `New ${k.noun}…`, value: `add:${k.section}`, icon: "plus" as const })),
+    { label: "New provider…", value: "provider", icon: "plus" as const, aside: "an API on the internet" },
+    { label: "", head: true },
+    { label: "Versions…", value: "versions", aside: "published, and the way back" },
+    { label: "Fit everything in view", value: "fit" },
   ];
 }
 

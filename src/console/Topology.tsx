@@ -13,9 +13,9 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type React
 
 import type { Backend, Node as NetNode, Resource, UiData } from "./types.js";
 import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
-import { callerChoices, callersIn, draftView, EVERYONE, list, obj, put, routerFor, usersOf, withCaller } from "./draft.js";
+import { callerChoices, callersIn, draftView, EVERYONE, list, obj, put, routerFor, usersOf, withCaller, paneChoices } from "./draft.js";
 import { addRouter, askAt, change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit } from "./editStore.js";
-import { Menu, VersionsButton } from "./editor.js";
+import { Menu, VersionsButton, openVersions } from "./editor.js";
 import { control, go, mintKey, request, restartNode, revokeKey, rotateKey, select, toast, useStore } from "./store.js";
 import { Button, cx, Dialog, Dot, type Tone } from "./ui.js";
 
@@ -854,6 +854,18 @@ export function Topology() {
         else if (kind === "machine" && id) select({ kind, id });
       }}
       onPaneClick={() => select(null)}
+      // A right-click on the empty part of the picture offers what the strip over it does, where the pointer is.
+      onPaneContextMenu={(e) => {
+        e.preventDefault();
+        if (!draft) return;
+        const [x, y] = [e.clientX, e.clientY];
+        chooseAt(x, y, paneChoices((["backends", "resources", "servers"] as const).map((section) => ({ section, noun: NEW[section]!.noun }))), (v) => {
+          if (v === "provider") setProviding(true);
+          else if (v === "versions") openVersions(x, y);
+          else if (v === "fit") void flow.current?.fitView({ padding: 0.08, duration: 300, maxZoom: 1 });
+          else if (v.startsWith("add:")) setAdding(v.slice(4));
+        });
+      }}
     >
       <Background gap={20} size={1} color="var(--border)" />
       <Controls showInteractive={false} position="bottom-left" />
