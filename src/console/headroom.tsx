@@ -78,40 +78,39 @@ export function Headroom() {
       </Card>
 
       <Card className="overflow-hidden">
-        <div className="flex items-baseline gap-3 border-b border-line px-4 py-2.5">
+        <div className="flex flex-wrap items-baseline gap-x-3 border-b border-line px-4 py-2.5">
           <div className="font-medium">Backends</div>
           <div className="text-[11px] text-dim">Whose conversations are compressed. A switch takes effect at once, with no restart.</div>
           {saved > 0 && <div className="ml-auto text-[11px] text-dim">{saved.toLocaleString()} tokens saved since this node started</div>}
         </div>
         {rows.length === 0 ? <Empty>No backends are configured.</Empty> : (
-          <table className="w-full text-left">
-            <tbody>
+          <div>
               {rows.map((b) => {
                 const on = h.backends.includes(b.name);
                 return (
-                  <tr key={b.name} className="border-b border-line last:border-0">
-                    <td className="w-12 py-2.5 pl-4">
+                  <div key={b.name} className="flex items-center border-b border-line last:border-0">
+                    <div className="shrink-0 py-2.5 pl-4">
                       {/* Off can always be had; on only when there is something to compress with. */}
                       <Switch on={on} disabled={busy || (!on && !ready)} label={`Compress what is sent to ${b.name}`} onChange={(v) => void ask({ action: "backend", name: b.name, on: v })} />
-                    </td>
-                    <td className="px-3 py-2.5">
+                    </div>
+                    <div className="min-w-0 flex-1 px-3 py-2.5">
                       <div className="flex items-center gap-2">
                         {b.cloud ? <Cloud size={14} className="text-cloud" /> : <Server size={14} className="text-dim" />}
                         <span className="font-medium">{b.name}</span>
                         {b.cloud && <span className="rounded border border-cloud/50 px-1 text-[9px] uppercase text-cloud">cloud</span>}
                       </div>
                       <div className="truncate text-[11px] text-dim">{(b.serves ?? []).join(", ") || b.url}</div>
-                    </td>
-                    <td className="px-4 py-2.5 text-right text-[12px]">
+                    </div>
+                    <div className="max-w-[45%] shrink-0 px-4 py-2.5 text-right text-[12px]">
                       {!on ? <span className="text-dim">sent as it comes</span>
                         : b.headroom?.trouble ? <span className="text-bad">sent whole: Headroom {b.headroom.trouble}</span>
                         : <span className="text-ok">compressed{(b.headroom?.saved ?? 0) > 0 ? ` · ${b.headroom!.saved.toLocaleString()} tokens saved` : ""}</span>}
-                    </td>
-                  </tr>
+                    </div>
+                  </div>
                 );
               })}
-            </tbody>
-          </table>
+
+          </div>
         )}
         {!ready && <div className="border-t border-line px-4 py-2 text-[11px] text-dim">Install Headroom to switch a backend on.</div>}
       </Card>
