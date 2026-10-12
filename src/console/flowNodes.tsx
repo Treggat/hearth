@@ -250,6 +250,8 @@ export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<
   // Sending a name to the model of the same name is leaving it alone: the default, said as such.
   const own = (to: ReturnType<typeof toOf>) => to.kind === "asked" || (to.kind === "model" && (data.inputs ?? []).includes(to.model));
   const groups = groupsOf(data.steps);
+  // One line's conditions are open to change where they stand at a time; the rest read as a sentence, so a long rule stays short.
+  const [open, setOpen] = useState<number | null>(null);
   /** The colour a line wears: what it is plugged into, and for a model, whether that is a provider's. */
   const worn = (to: ReturnType<typeof toOf>) => hue(to.kind === "asked" ? "model" : to.kind === "model" && (data.cloud ?? []).includes(to.model) ? "cloud" : to.kind);
   return (
@@ -295,14 +297,16 @@ export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<
             {/* Every line is the same three columns, so the where-it-goes and the counts read in line:
                 the word, the conditions, and the fixed-width place the line ends at. */}
             <span className="w-4 shrink-0 text-right text-[10px] tabular text-dim/70" title={`line ${i + 1}`}>{i + 1}</span>
-            <span className={cx("w-14 shrink-0 font-medium", i === last && "truncate", group && "ml-4")}>{word}</span>
+            {/* The word closes a line that is open. */}
+            <span className={cx("w-14 shrink-0 font-medium", i === last && "truncate", group && "ml-4", open === i && "cursor-pointer")} title={open === i ? "done with this line's conditions" : undefined} onClick={() => { if (open === i) setOpen(null); }}>{word}</span>
             {i === last ? (
               <span className="min-w-0 flex-1" />
-            ) : data.editable && Object.keys(when).length === 0 && to.kind !== "peer" ? (
+            ) : data.editable && (open === i || (Object.keys(when).length === 0 && to.kind !== "peer")) ? (
+              // Its conditions are changed where they stand: the dialog, from the pencil or the line's menu, is for the rest of the line.
               // A peer can be down, so only a line that sends to one may stand with no condition of its own.
-              <span className="min-w-0 flex-1"><button type="button" className={cx(CHIP, "border-warn text-warn")} onClick={() => openRule(data.name, i)}>choose a condition</button></span>
+              <Conds when={when} models={data.models} optional={to.kind === "peer"} onChange={(w) => edit(i, (r) => ({ ...r, when: w }))} />
             ) : data.editable ? (
-              <button type="button" className="nodrag nopan min-h-6 min-w-0 flex-1 rounded-md px-1 py-1 text-left leading-snug hover:bg-muted" title="click to edit this line" onClick={() => openRule(data.name, i)}>{sentence(group ? mine : when) || (group?.to === i ? "" : "it can take it")}</button>
+              <button type="button" className="nodrag nopan min-h-6 min-w-0 flex-1 rounded-md px-1 py-1 text-left leading-snug hover:bg-muted" title="click to change this line's conditions" onClick={() => setOpen(i)}>{sentence(group ? mine : when) || (group?.to === i ? "" : "it can take it")}</button>
             ) : (
               <span className="min-w-0 flex-1 truncate">{sentence(group ? mine : when) || (group?.to === i ? "" : "it can take it")}</span>
             )}
