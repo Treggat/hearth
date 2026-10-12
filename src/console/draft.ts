@@ -494,8 +494,10 @@ export type Box = { id: string; x: number; y: number; w: number; h: number };
 /**
  * Where each box sits once none overlaps another: taken top to bottom, a box that would lie on one
  * above it moves down past it. `carry` names the boxes drawn beside another, which move with it.
+ * `gap` is how near two may come before they count as overlapping: none, so boxes that only
+ * touch stay where they were put.
  */
-export function spread(boxes: Box[], carry: Map<string, string[]> = new Map(), gap = 12): Map<string, number> {
+export function spread(boxes: Box[], carry: Map<string, string[]> = new Map(), gap = 0): Map<string, number> {
   const ys = new Map(boxes.map((b) => [b.id, b.y]));
   const settled: Box[] = [];
   for (const b of [...boxes].sort((p, q) => p.y - q.y)) {
