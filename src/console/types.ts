@@ -36,6 +36,8 @@ export interface Backend {
   cloud?: boolean;
   /** Why a provider's server could not be read, in a few words; absent when it could. */
   trouble?: string;
+  /** Its conversations are compressed before they are sent: the tokens that has saved, and why the last one went out whole, if it did. */
+  headroom?: { saved: number; trouble?: string };
   loaded?: string[];
   /** Models being read off the disk right now; drawn only when the backend reports it. */
   loading?: string[];
@@ -275,6 +277,19 @@ export interface UiData {
   /** How to authenticate a write here: "open" on a keyless node, else a key or a session. */
   control: "open" | "key";
   controls: Controls;
+  /** The Headroom this node can install: how it is, and which backends it compresses for. */
+  headroom?: {
+    state: "absent" | "installing" | "starting" | "running" | "failed" | "removing";
+    version?: string;
+    problem?: string;
+    lines: string[];
+    /** Whether there is a place to install it. */
+    can: boolean;
+    /** A server the config names, used in place of the installed one. */
+    own?: string;
+    backends: string[];
+    timeoutMs: number;
+  };
   /** What is going out right now. */
   share: string[];
   /** What hearth.yaml lends, whether or not lending is paused. */

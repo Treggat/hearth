@@ -401,11 +401,13 @@ function backendTone(b: Backend): Tone {
 
 /** What a backend's status dot is saying. */
 function backendTip(b: Backend, run: number): string {
-  if (run > 0) return "working on a request";
-  if (b.answering === false) return "not answering";
-  if ((b.loaded ?? []).length) return "a model is loaded and ready";
-  if ((b.loading ?? []).length) return "loading a model";
-  return b.knowsWarm === false ? "up; it does not report what is loaded" : "up, with nothing loaded";
+  const says = run > 0 ? "working on a request"
+    : b.answering === false ? "not answering"
+    : (b.loaded ?? []).length ? "a model is loaded and ready"
+    : (b.loading ?? []).length ? "loading a model"
+    : b.knowsWarm === false ? "up; it does not report what is loaded" : "up, with nothing loaded";
+  if (!b.headroom) return says;
+  return `${says}. ${b.headroom.trouble ? `Sent uncompressed: Headroom ${b.headroom.trouble}` : `Compressed by Headroom${b.headroom.saved > 0 ? `: ${b.headroom.saved.toLocaleString()} tokens saved since the start` : ""}`}`;
 }
 
 function backendSub(b: Backend, run: number): string {

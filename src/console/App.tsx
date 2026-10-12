@@ -1,5 +1,5 @@
 /** hearth console 2.0: a sidebar of pages over one live store, the topology first. */
-import { AlertTriangle, Boxes, CheckCircle2, FileCog, Flame, KeyRound, ListOrdered, LogOut, Moon, Network, ScrollText, Split, Sun, XCircle } from "lucide-react";
+import { AlertTriangle, Boxes, CheckCircle2, FileCog, Flame, KeyRound, ListOrdered, LogOut, Minimize2, Moon, Network, ScrollText, Split, Sun, XCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Config } from "./config.js";
@@ -12,6 +12,7 @@ import { EditBar, EditRail, Menu, Picker, TryStrip, VersionsHere } from "./edito
 import { changed, useEdit } from "./editStore.js";
 import { Routing } from "./Routing.js";
 import { Topology } from "./Topology.js";
+import { Headroom } from "./headroom.js";
 import { Button, Card, cx, Dialog, Pill } from "./ui.js";
 
 const PAGES: { id: Page; label: string; icon: typeof Network }[] = [
@@ -22,6 +23,7 @@ const PAGES: { id: Page; label: string; icon: typeof Network }[] = [
   { id: "queue", label: "Queue", icon: ListOrdered },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "config", label: "Config", icon: FileCog },
+  { id: "headroom", label: "Headroom", icon: Minimize2 },
 ];
 
 function useTheme(): [boolean, () => void] {
@@ -361,6 +363,7 @@ export default function App() {
           <div className="min-h-0 flex-1 overflow-auto p-5">
             {page === "models" && <Models />}
             {page === "keys" && <Keys />}
+            {page === "headroom" && <Headroom />}
             {page === "queue" && <><Queue /><History /></>}
             {/* What has been published, and the way back to it, wherever the file is edited. */}
             {page === "config" && <><div className="mb-2 flex justify-end"><VersionsHere /></div><Config /></>}

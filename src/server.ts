@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { actionDecls, runAction, type Action, type ActionFacts } from "./actions.js";
 import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
@@ -31,6 +32,7 @@ import { createViews, type CallerUse, type KeyInfo, type Spent } from "./views.j
 import { multipartField, replaceMultipartField } from "./multipart.js";
 import { relayAnthropic, toAnthropic } from "./anthropic.js";
 import { troubleSays } from "./backend.js";
+import { compress, HeadroomHost } from "./headroom.js";
 import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
 
 /** Constant-time compare over sha256 digests, so neither length nor content leaks. */
@@ -465,13 +467,35 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     });
   }
 
+  /** The Headroom this node installs and runs, kept beside the config file; with no file there is nowhere to keep one. */
+  const headroomHost = new HeadroomHost(cfg.configPath ? join(dirname(cfg.configPath), "headroom") : null, log);
+  /** Backends whose last compression did not happen, and why: said once when it starts and once when it ends. */
+  const uncompressed = new Map<string, string>();
+  /** What a backend's requests have been made smaller by, in tokens as Headroom counts them. */
+  const savedBy = new Map<string, number>();
+  /** `body` as it goes to `to`: compressed where the backend asks for it, and as it came where that fails. */
+  async function squeezed(to: BackendConfig, body: Record<string, unknown>, who: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+    // One the operator runs is used where the file names it; else the one this node installed.
+    const url = cfg.headroom.url ?? headroomHost.url();
+    const got = url === null
+      ? { body, saved: 0, problem: headroomHost.why() }
+      : await compress(body, { url, token: cfg.headroom.url === null ? null : cfg.headroom.token, timeoutMs: cfg.headroom.timeoutMs }, `${to.name}\n${who}`, cfg.maxBodyBytes, signal);
+    if (got.problem !== undefined && !signal.aborted) {
+      if (!uncompressed.has(to.name)) log.warn("headroom.failed", { backend: to.name, error: got.problem });
+      uncompressed.set(to.name, got.problem);
+    } else if (got.problem === undefined && uncompressed.delete(to.name)) log.info("headroom.recovered", { backend: to.name });
+    if (got.saved > 0) savedBy.set(to.name, (savedBy.get(to.name) ?? 0) + got.saved);
+    return got.body;
+  }
+
   /** Sends a chat completion to a local backend, emulating another server's answers if the route asks. */
-  async function sendLocal(to: BackendConfig, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
+  async function sendLocal(to: BackendConfig, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter; /** Who asked, which tells one conversation from another's where the backend's are compressed. */ who?: string } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
     const emulate = cfg.models[model]?.emulate ?? null;
-    const { count, ...deadline } = opts;
+    const { count, who, ...deadline } = opts;
     const url = to.url;
     const reach = { ...deadline, headers: backendAuth(to.format, to.key) };
-    const sent = pool.outboundBody(model, payload);
+    const whole = pool.outboundBody(model, payload);
+    const sent = cfg.headroom.backends.includes(to.name) ? await squeezed(to, whole, who ?? "", opts.signal) : whole;
     if (to.format === "anthropic") {
       const up = await send(`${url}/v1/messages`, { json: toAnthropic(sent, to.promptCache, to.promptCacheTtl), ...reach });
       if (to.key && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
@@ -862,7 +886,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       ranOn = local.name;
       await local.state.ensureFresh();
     // Our id and the route's params on the way to the backend; untouched when neither is set.
-      localStatus = await sendLocal(local.cfg, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}) }, spare);
+      localStatus = await sendLocal(local.cfg, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}), who: caller }, spare);
     };
 
     const t: Timing = { enqueuedAt: Date.now(), startedAt: 0, meter: meter(res), need: Math.max(0, (need?.tokens ?? 0) - (need?.output ?? 0)) };
@@ -1204,6 +1228,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     { path: ["/keys/mint", "/keys/revoke", "/keys/rotate"], methods: ["POST"], auth: "local", handler: routeKeys },
     { path: "/usage", methods: ["GET"], auth: "local", handler: routeUsage },
     { path: "/backends/probe", methods: ["POST"], auth: "local", handler: routeProbe },
+    // Installs, starts and removes a program on this machine, so it is the operator's and nobody else's.
+    { path: "/headroom", methods: ["POST"], auth: "local", handler: routeHeadroom },
 
     // The OpenAI surface: a peer may send us work here, and so may we.
     { path: "/v1/warm", methods: ["POST"], auth: "either", envelope: "openai", handler: routeWarm },
@@ -1706,6 +1732,29 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
   }
 
+  // The Headroom page's writes: install it, remove it, and say which backends it compresses for.
+  async function routeHeadroom(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      if (body.action === "install" || body.action === "uninstall") {
+        if (!headroomHost.view().can) throw new Refusal(409, "this node was started without a config file, and Headroom is kept beside one");
+        log.info(`headroom.${body.action}`, { caller: c.caller });
+        if (body.action === "install") headroomHost.install();
+        else headroomHost.uninstall();
+      } else if (body.action === "backend") {
+        const name = typeof body.name === "string" ? body.name : "";
+        if (!cfg.backends.some((b) => b.name === name)) throw new Refusal(404, `no backend named ${name}`);
+        const rest = cfg.headroom.backends.filter((b) => b !== name);
+        config.patch({ ops: [{ path: ["headroom", "backends"], value: body.on === true ? [...rest, name] : rest }] });
+        if (body.on !== true) uncompressed.delete(name);
+        log.info("headroom.backend", { backend: name, on: body.on === true, caller: c.caller });
+      } else throw new Refusal(400, "action must be install, uninstall or backend");
+      json(c.res, 200, { ok: true, ...headroomHost.view() });
+    } catch (e) {
+      failConfig(c.res, e);
+    }
+  }
+
   // The keys page's writes: mint appends one entry, revoke removes one, rotate gives one a new
   // secret and keeps the rest of it. Each lands in the config file through the same patch path
   // every other config change uses, and takes effect at once. A plaintext comes back once, in
@@ -2058,7 +2107,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           t.startedAt = Date.now();
           await serving.state.ensureFresh();
           // A lent request gets the same id rewrite and params as a local one.
-          lentStatus = await sendLocal(serving.cfg, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
+          lentStatus = await sendLocal(serving.cfg, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg), who: `peer:${fromPeer}` });
         },
       );
     } catch (e) {
@@ -2619,6 +2668,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Drawn whether or not it is on, so "not configured" and "configured and
     // quiet" are not the same blank tile.
     canary: () => canary?.page() ?? { enabled: false, passive: false, recovery: false, models: {} },
+    squeezed: (backend) => ({ saved: savedBy.get(backend) ?? 0, ...(uncompressed.has(backend) ? { trouble: uncompressed.get(backend)! } : {}) }),
+    headroom: () => ({ ...headroomHost.view(), ...(cfg.headroom.url !== null ? { own: cfg.headroom.url } : {}), backends: cfg.headroom.backends, timeoutMs: cfg.headroom.timeoutMs }),
     keys: keysView,
     others: othersView,
   });
@@ -2672,11 +2723,13 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         historyTimer.unref?.();
       }
       config.watch();
+      headroomHost.start();
       // Last, so the first probe sees a backend whose warm state has been read.
       canary?.start();
     },
     close: async (graceMs = 0) => {
       canary?.stop();
+      headroomHost.stop();
       if (historyTimer) clearInterval(historyTimer);
       clearInterval(sessionSweep);
       sessions.prune();

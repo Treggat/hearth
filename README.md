@@ -188,6 +188,10 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `callers.<who>` | none | Which rulebook a caller goes by: an api key's label, `local`, or `*` for everyone else, each to a name under `routers:` or `default`. |
 | `layout.<node>` | none | `{ x, y }`: where the console's topology draws a node you placed. Written by [its editor](#editing-on-the-graph); nodes without one are laid out |
 | `modelHeader` | `true` | send `x-hearth-model` on every chat answer: the id the request ran as. See [Flows](#flows) |
+| `headroom.backends` | none | the backends whose conversations are compressed by [Headroom](https://github.com/headroomlabs-ai/headroom) before they are sent. Set from the console's Headroom page; applies at once. See [Compressing what is sent](#compressing-what-is-sent) |
+| `headroom.url` | unset | a Headroom server you run yourself, used in place of the one the console installs |
+| `headroom.token` | unset | that server's proxy token, where it is started with one. `env:NAME` keeps it out of the file |
+| `headroom.timeoutMs` | `10000` | how long one compression may take before the request is sent as it came |
 | `historyFile` | unset | a file that keeps the console's day of history, its recent log lines and the month of usage per caller across restarts, written every minute and at shutdown. Unset keeps them in memory |
 | `stateFile` | unset | a console sidecar from an earlier version. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 
@@ -265,6 +269,7 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/config/draft` | local | the console's unpublished draft, kept beside the file: `GET`, `PUT` a JSON body, `DELETE` |
 | `/config/versions` | local | `GET` the versions written through the node (`at`, `name`, `hash`); `POST { hash, dryRun? }` makes one the file again |
 | `/backends/probe` | local | `POST { url, key?, format? }` asks that server for its model list with that key and answers `{ ok, url, models }` or `{ ok: false, problem }`. Nothing is kept; the console uses it before a provider is added |
+| `/headroom` | local | `POST {action: "install"}` installs and starts Headroom, `{action: "uninstall"}` stops and removes it, `{action: "backend", name, on}` switches compression for one backend. Answers with how the install stands |
 | `/keys/mint`, `/keys/revoke`, `/keys/rotate` | local | `POST { label, models?, expires?, limits? }` writes a new `apiKeys` entry and answers with its key, once; `POST { label }` removes the entry with that label, or for rotate gives it a new key, answered once, and keeps the rest of it (its label, and so its router, scope, limits and usage). An entry that reads its key from `env:NAME` is not rotated here. All take effect at once |
 | `/v1/evict` | local | `POST { model }` drops a resident model off the backend that serves it. `409` while it is answering a request, when it is not resident, or when the backend can only clear everything and holds other models |
 | `/usage` | local | `GET ?days=N` (31 at most): requests, failures and tokens in and out, as day → caller → model, with `prices` for the models that carry one. Days are UTC. Tokens are the backend's own `usage` where its answer carries one; a stream without one is counted by its events, and the request by its estimated size |
@@ -1162,6 +1167,61 @@ backends:
   `reasoning_content`. Other request fields are not sent.
 - The [canary](#canary) probes with a chat completion and so cannot probe a
   model on such a backend.
+
+### Compressing what is sent
+
+A long agent conversation is mostly tool output: logs, file listings, JSON.
+[Headroom](https://github.com/headroomlabs-ai/headroom) is a separate program
+that shortens those before a model reads them. hearth can install one and
+pass the conversations of the backends you choose through it, which is worth
+most where input is paid for by the token.
+
+It does not come with hearth. The console's **Headroom** page has one button
+to install it and one to remove it, and a switch per backend:
+
+- **Install** makes a Python environment in a `headroom` directory beside
+  the config file and puts one pinned release of `headroom-ai` in it, then
+  starts it. It uses Python 3.10 or newer where the machine has one; where
+  it has none, on Linux, it first fetches a pinned release of
+  [uv](https://github.com/astral-sh/uv) into the same directory, checks it
+  against its checksum, and lets that bring a Python. Either way it is
+  several hundred megabytes of disk and takes minutes; the page shows what
+  the install writes as it goes. hearth starts it again with the node and when it
+  stops.
+- It listens on this machine only, on a port chosen as it starts, and is
+  started with its usage reporting and update checks switched off.
+- **Uninstall** stops it and deletes that directory. Nothing else was
+  written anywhere.
+- A switch writes `headroom.backends` in the config file and applies at
+  once:
+
+```yaml
+headroom:
+  backends: [provider]
+```
+
+What it does to a request:
+
+- Only the conversation is sent to it (`POST /v1/compress`), with the model's
+  name. The system prompt and the tools are not, and the backend's key never
+  is. It answers with the same turns, some shorter, and hearth sends those.
+- **It never fails a request.** If it is not installed, not running, slow
+  past `timeoutMs` or answers something that is not the conversation it was
+  sent, the request goes out as it came. The log says so once
+  (`headroom.failed`) and once when it is back (`headroom.recovered`), and
+  the page says which backends are being sent whole and why.
+- A conversation is named by who asked, the model and how it opened, and
+  Headroom returns the turns it has already answered unchanged. So what the
+  provider cached of them is still read, with `format: anthropic` or without.
+  That memory is in its process: after it restarts, the next request of a
+  conversation is compressed afresh and read from no cache, once.
+- **This is lossy.** A model sees a shortened tool result, not the one the
+  tool returned, and cannot ask for the rest. Leave a backend switched off
+  where a request must reach it exactly as it was sent.
+
+To use a Headroom you run yourself instead, set `headroom.url` (and
+`headroom.token` if it has one). Every conversation of the backends that are
+switched on is sent there, so keep it on this machine or a network you trust.
 
 ### Backends that share a card
 

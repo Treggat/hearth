@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
 import { EMULATIONS, type Emulation } from "./emulate.js";
+import type { HeadroomConfig } from "./headroom.js";
 import { KINDS, type KindName } from "./kinds.js";
 import { actionDecls, type Action } from "./actions.js";
 import { FIELDS, nearest, SECTION_KEYS, type Scope } from "./fields.js";
@@ -415,6 +416,8 @@ export interface HearthConfig {
   callers: Record<string, string>;
   /** Whether a chat answer carries `x-hearth-model`, the id it ran as. */
   modelHeader: boolean;
+  /** `headroom:`: which backends have their conversations compressed, and by which Headroom server. */
+  headroom: HeadroomConfig;
   /** `actions:`: what a flow step can set off beside routing, by name. */
   actions: Record<string, Action>;
   /** Where the console draws a topology node the operator has placed, by node id; the rest are laid out. */
@@ -1334,6 +1337,16 @@ export function parseConfig(raw: unknown): HearthConfig {
   const borrowing = asRecord(root.borrowing ?? {}, "borrowing");
   only(borrowing, "borrowing", "borrowing");
   const defaultConcurrency = count(defaults.concurrency, "backendDefaults.concurrency", 1, 1);
+  const h = asRecord(root.headroom ?? {}, "headroom");
+  only(h, "headroom", "headroom");
+  // Left empty, as the editor first adds it, it is unset: the one installed from the console is used.
+  const headroomUrl = str(h.url, "headroom.url", "").replace(/\/+$/, "") || null;
+  if (headroomUrl !== null && !/^https?:\/\//.test(headroomUrl)) throw bad("headroom.url", `is "${headroomUrl}" — expected an http:// or https:// address`);
+  const headroom: HeadroomConfig = {
+    backends: strList(h.backends, "headroom.backends"), url: headroomUrl,
+    token: resolveSecret(str(h.token, "headroom.token", ""), "headroom.token") || null,
+    timeoutMs: atLeast(h.timeoutMs, "headroom.timeoutMs", 10_000, 100),
+  };
 
   /** Declared hardware, validated up front so --check catches a typo. */
   const resourceDecls: Record<string, ResourceDecl> = {};
@@ -1660,6 +1673,9 @@ export function parseConfig(raw: unknown): HearthConfig {
     operator = { user, passHash };
   }
 
+  for (const name of headroom.backends) {
+    if (!backends.some((b) => b.name === name)) throw bad("headroom.backends", `names "${name}", which is not one of your backends (${backends.map((b) => b.name).join(", ")})`);
+  }
   const actions = actionDecls(root.actions);
   // A removed key is refused, not ignored: ignoring it would close the page's port with no word why.
   const routers = routerDecls(root.routers, (raw) => flowDecls(raw, lanes, peers, actions, backends.flatMap((b) => b.routes.map((r) => r.path))));
@@ -1732,6 +1748,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.
     shutdownGraceMs: atLeast(root.shutdownGraceMs, "shutdownGraceMs", 30_000),
+    headroom,
   };
 }
 

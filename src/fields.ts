@@ -22,7 +22,7 @@ export type Field =
 
 export type Scope =
   | "node" | "listen" | "backendDefaults" | "backend" | "activity" | "resource" | "server" | "flow" | "action" | "scheduler" | "lane"
-  | "model" | "stats" | "pool" | "price" | "peer" | "lending" | "borrowing" | "operator";
+  | "model" | "stats" | "pool" | "price" | "peer" | "lending" | "borrowing" | "operator" | "headroom";
 
 const ms = (desc: string, def?: number | string, min?: number): Field =>
   ({ type: "ms", desc, ...(def !== undefined ? { def } : {}), ...(min !== undefined ? { min } : {}) });
@@ -41,6 +41,7 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     maxBodyBytes: { type: "number", min: 1024, desc: "Largest accepted request body, in bytes.", def: 33554432 },
     modelHeader: { type: "bool", desc: "Send `x-hearth-model` on every chat answer: the id the request ran as. Turn off where callers should not see what is behind a name.", def: true },
     shutdownGraceMs: ms("How long a shutdown waits for requests in flight. 0 drops them.", 30000),
+    headroom: { type: "object", scope: "headroom", desc: "Which backends have their conversations compressed by Headroom before they are sent. The console's Headroom page installs it and sets this.", seed: { backends: [] } },
     operator: { type: "raw", desc: "The console login. Written by `hearth set-operator`." },
     historyFile: { type: "text", desc: "A file that keeps the console's day of history, recent logs and the month of usage per caller across restarts. Unset keeps them in memory." },
     routers: { type: "raw", desc: "Rulebooks besides `flows:`: `routers.<name>` has `flows` in the same shape, and `strict` so a request runs on the model its line names or fails: no next line after a failure, no route fallback. `callers:` says who goes by one." },
@@ -173,6 +174,12 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     staleMs: ms("When a background peer reading counts as stale.", 60000, 1000),
     coldPenalty: { type: "number", min: 0, desc: "What a model load is worth to `fastest`, in queued jobs.", def: 2 },
   },
+  headroom: {
+    backends: { type: "refs", ref: "backends", desc: "The backends whose conversations are compressed before they are sent: fewer tokens to pay for, and long tool results reach the model shortened. A request goes out as it came when Headroom does not answer." },
+    url: { type: "text", desc: "A Headroom server you run yourself, used in place of the one the console installs. Keep it on this machine or a network you trust: every conversation of the backends above is sent there." },
+    token: { type: "secret", desc: "Its proxy token, where it is started with one. env:NAME keeps it out of the file." },
+    timeoutMs: ms("How long one compression may take before the request is sent as it came.", 10000, 100),
+  },
   operator: {
     user: { type: "text", desc: "The console login's username." },
     passHash: { type: "raw", desc: "salt:hash from `hearth set-operator`." },
@@ -184,7 +191,7 @@ export function scopeOf(path: (string | number)[]): Scope | null {
   const [a, b, c, d] = path;
   const n = path.length;
   if (n === 0) return "node";
-  if (n === 1 && (a === "listen" || a === "backendDefaults" || a === "scheduler" || a === "lending" || a === "borrowing" || a === "operator")) return a;
+  if (n === 1 && (a === "listen" || a === "backendDefaults" || a === "scheduler" || a === "lending" || a === "borrowing" || a === "operator" || a === "headroom")) return a;
   if (a === "backends" && n === 2) return "backend";
   if (a === "backends" && c === "activity" && n === 3) return "activity";
   if (a === "resources" && n === 2) return "resource";
