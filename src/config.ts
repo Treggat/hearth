@@ -133,8 +133,6 @@ export interface BackendConfig {
   format: BackendFormat;
   /** With `format: anthropic`: mark each request's system prompt, tools and conversation so far for the provider's prompt cache. */
   promptCache: boolean;
-  /** Compress each conversation with the server under `headroom:` before it is sent here. */
-  headroom: boolean;
 }
 
 export const BACKEND_FORMATS = ["openai", "anthropic"] as const;
@@ -413,8 +411,8 @@ export interface HearthConfig {
   callers: Record<string, string>;
   /** Whether a chat answer carries `x-hearth-model`, the id it ran as. */
   modelHeader: boolean;
-  /** `headroom:`: the server that compresses conversations for backends that ask; null when there is none. */
-  headroom: HeadroomConfig | null;
+  /** `headroom:`: which backends have their conversations compressed, and by which Headroom server. */
+  headroom: HeadroomConfig;
   /** `actions:`: what a flow step can set off beside routing, by name. */
   actions: Record<string, Action>;
   /** Where the console draws a topology node the operator has placed, by node id; the rest are laid out. */
@@ -937,13 +935,6 @@ function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
   return kind as WarmSource;
 }
 
-/** `headroom: true`, which needs the server it names to be set. */
-function backendHeadroom(v: unknown, where: string, known: boolean): boolean {
-  const on = bool(v, where, false);
-  if (on && !known) throw bad(where, "is on, and there is no `headroom:` section saying where that server is");
-  return on;
-}
-
 function bool(v: unknown, where: string, fallback: boolean): boolean {
   if (v === undefined) return fallback;
   if (typeof v !== "boolean") throw bad(where, "must be true or false");
@@ -1332,14 +1323,16 @@ export function parseConfig(raw: unknown): HearthConfig {
   const borrowing = asRecord(root.borrowing ?? {}, "borrowing");
   only(borrowing, "borrowing", "borrowing");
   const defaultConcurrency = count(defaults.concurrency, "backendDefaults.concurrency", 1, 1);
-  let headroom: HeadroomConfig | null = null;
-  if (root.headroom !== undefined) {
-    const h = asRecord(root.headroom, "headroom");
-    only(h, "headroom", "headroom");
-    const url = str(h.url, "headroom.url", "http://127.0.0.1:8787").replace(/\/+$/, "");
-    if (!/^https?:\/\//.test(url)) throw bad("headroom.url", `is "${url}" — expected an http:// or https:// address`);
-    headroom = { url, token: h.token === undefined ? null : resolveSecret(str(h.token, "headroom.token"), "headroom.token"), timeoutMs: atLeast(h.timeoutMs, "headroom.timeoutMs", 10_000, 100) };
-  }
+  const h = asRecord(root.headroom ?? {}, "headroom");
+  only(h, "headroom", "headroom");
+  // Left empty, as the editor first adds it, it is unset: the one installed from the console is used.
+  const headroomUrl = str(h.url, "headroom.url", "").replace(/\/+$/, "") || null;
+  if (headroomUrl !== null && !/^https?:\/\//.test(headroomUrl)) throw bad("headroom.url", `is "${headroomUrl}" — expected an http:// or https:// address`);
+  const headroom: HeadroomConfig = {
+    backends: strList(h.backends, "headroom.backends"), url: headroomUrl,
+    token: resolveSecret(str(h.token, "headroom.token", ""), "headroom.token") || null,
+    timeoutMs: atLeast(h.timeoutMs, "headroom.timeoutMs", 10_000, 100),
+  };
 
   /** Declared hardware, validated up front so --check catches a typo. */
   const resourceDecls: Record<string, ResourceDecl> = {};
@@ -1392,7 +1385,6 @@ export function parseConfig(raw: unknown): HearthConfig {
       name,
       format: format as BackendFormat,
       promptCache: bool(entry.promptCache, `${at}.promptCache`, true),
-      headroom: backendHeadroom(entry.headroom, `${at}.headroom`, headroom !== null),
       key: entry.key === undefined ? null : resolveSecret(str(entry.key, `${at}.key`), `${at}.key`),
       cloud,
       url: backendUrl(entry, at, server === null ? null : servers[server]!.host),
@@ -1666,6 +1658,9 @@ export function parseConfig(raw: unknown): HearthConfig {
     operator = { user, passHash };
   }
 
+  for (const name of headroom.backends) {
+    if (!backends.some((b) => b.name === name)) throw bad("headroom.backends", `names "${name}", which is not one of your backends (${backends.map((b) => b.name).join(", ")})`);
+  }
   const actions = actionDecls(root.actions);
   // A removed key is refused, not ignored: ignoring it would close the page's port with no word why.
   const routers = routerDecls(root.routers, (raw) => flowDecls(raw, lanes, peers, actions, backends.flatMap((b) => b.routes.map((r) => r.path))));

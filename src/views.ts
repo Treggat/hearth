@@ -86,9 +86,11 @@ export interface ViewDeps {
   others: () => CallerUse[];
   /** What compressing a backend's requests has saved since the start, and why the last one was not compressed, if it was not. */
   squeezed: (backend: string) => { saved: number; trouble?: string };
+  /** The Headroom page: what is installed and how it is, and which backends it compresses for. */
+  headroom: () => Record<string, unknown>;
 }
 
-export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode, canary, flowHits, keys, others, squeezed }: ViewDeps) {
+export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode, canary, flowHits, keys, others, squeezed, headroom }: ViewDeps) {
   /**
    * Everything the page draws, shared by /ui/data and the event stream. Uses ensureFresh, never probeAll.
    */
@@ -103,6 +105,7 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
       // How this page must authenticate its writes.
       control: writeMode(),
       controls: controls.state(),
+      headroom: headroom(),
       // What the sharing and mapping controls need.
       share: shared(),
       configuredShare: cfg.share,
@@ -209,7 +212,7 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
             kind: b.cfg.kind,
             // A provider's model list is the one thing asked of it between requests, so how that went is its state.
             ...(b.cfg.cloud ? { cloud: true, ...(b.state.catalogTrouble() !== null ? { trouble: troubleSays(b.state.catalogTrouble()!) } : {}) } : {}),
-            ...(b.cfg.headroom ? { headroom: squeezed(b.name) } : {}),
+            ...(cfg.headroom.backends.includes(b.name) ? { headroom: squeezed(b.name) } : {}),
             ...(b.state.restingMs() > 0 ? { restingMs: b.state.restingMs() } : {}),
             // Whether it CAN report warm state. An empty loaded list from a
             // backend that cannot see is not the same claim as one from a

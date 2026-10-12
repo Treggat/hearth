@@ -1,5 +1,5 @@
 /**
- * A backend with `headroom: true`. The failures worth catching:
+ * A backend named under `headroom.backends`. The failures worth catching:
  *
  *   - a request that fails, or waits, because the compressor is down, slow or wrong
  *   - the backend's key, or a backend that did not ask, reaching the compressor
@@ -8,7 +8,7 @@
  *   - an answer that is not the conversation that was sent taken as one
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -61,8 +61,8 @@ const config = (more: string): string => {
   const path = join(dir, "hearth.yaml");
   writeFileSync(path, `name: node-under-test
 ${more}backends:
-  squeezed: {url: "http://127.0.0.1:${pPort}", cloud: true, key: provider-secret, headroom: true, serves: [their-model]}
-  native: {url: "http://127.0.0.1:${pPort}", cloud: true, format: anthropic, key: provider-secret, headroom: true, serves: [their-native]}
+  squeezed: {url: "http://127.0.0.1:${pPort}", cloud: true, key: provider-secret, serves: [their-model]}
+  native: {url: "http://127.0.0.1:${pPort}", cloud: true, format: anthropic, key: provider-secret, serves: [their-native]}
   plain: {url: "http://127.0.0.1:${pPort}", cloud: true, key: provider-secret, serves: [their-plain]}
 models:
   small: {backend: squeezed, as: their-model}
@@ -75,8 +75,9 @@ apiKeys:
 `);
   return path;
 };
-assert.throws(() => loadConfig(config("")), /headroom/, "a backend cannot ask for a compressor nothing says the place of");
-const node = createNode(loadConfig(config(`headroom: {url: "http://127.0.0.1:${hPort}/", token: squeeze-secret, timeoutMs: 300}\n`)), silentLogger);
+assert.throws(() => loadConfig(config("headroom: {backends: [nobody]}\n")), /headroom\.backends/, "a name that is no backend is refused when the file is read");
+assert.deepEqual(loadConfig(config("")).headroom, { backends: [], url: null, token: null, timeoutMs: 10000 }, "unset, nothing is compressed");
+const node = createNode(loadConfig(config(`headroom: {url: "http://127.0.0.1:${hPort}/", token: squeeze-secret, timeoutMs: 300, backends: [squeezed, native]}\n`)), silentLogger);
 node.start();
 const url = `http://127.0.0.1:${await listening(node.server)}`;
 const talk = [
@@ -121,6 +122,16 @@ try {
   }
   mode = "ok";
   assert.equal(toolOf(await chat("small")), "[shortened]", "and compressed again once it answers");
+
+  // Switched on and off from the page, at once and in the file.
+  const flip = (on: boolean) => fetch(`${url}/headroom`, { method: "POST", headers: { Authorization: "Bearer ours-secret", "Content-Type": "application/json" }, body: JSON.stringify({ action: "backend", name: "plain", on }) });
+  assert.equal((await flip(true)).status, 200);
+  assert.equal(toolOf(await chat("plain")), "[shortened]", "a backend switched on is compressed from the next request");
+  assert.match(readFileSync(join(dir, "hearth.yaml"), "utf8"), /backends:.*plain/s, "and the file says so");
+  assert.equal((await flip(false)).status, 200);
+  assert.equal(toolOf(await chat("plain")), "a very long log");
+  assert.equal((await fetch(`${url}/headroom`, { method: "POST", headers: { Authorization: "Bearer ours-secret", "Content-Type": "application/json" }, body: JSON.stringify({ action: "backend", name: "nobody", on: true }) })).status, 404);
+  assert.equal((await fetch(`${url}/headroom`, { method: "POST", headers: { "Content-Type": "application/json", Origin: "http://elsewhere.example" }, body: JSON.stringify({ action: "install" }) })).status >= 400, true, "a page on another site cannot install anything");
 
   const page = (await (await fetch(`${url}/ui/data`, { headers: { Authorization: "Bearer ours-secret" } })).json()) as { net: { nodes: { self?: boolean; backends?: { name: string; headroom?: Doc }[] }[] } };
   const mine = page.net.nodes.find((n) => n.self)!.backends!;

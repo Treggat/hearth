@@ -41,7 +41,7 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     maxBodyBytes: { type: "number", min: 1024, desc: "Largest accepted request body, in bytes.", def: 33554432 },
     modelHeader: { type: "bool", desc: "Send `x-hearth-model` on every chat answer: the id the request ran as. Turn off where callers should not see what is behind a name.", def: true },
     shutdownGraceMs: ms("How long a shutdown waits for requests in flight. 0 drops them.", 30000),
-    headroom: { type: "object", scope: "headroom", desc: "A Headroom server run beside this node, which compresses a conversation before it is sent to a backend that sets `headroom: true`.", seed: { url: "http://127.0.0.1:8787" } },
+    headroom: { type: "object", scope: "headroom", desc: "Which backends have their conversations compressed by Headroom before they are sent. The console's Headroom page installs it and sets this.", seed: { backends: [] } },
     operator: { type: "raw", desc: "The console login. Written by `hearth set-operator`." },
     historyFile: { type: "text", desc: "A file that keeps the console's day of history, recent logs and the month of usage per caller across restarts. Unset keeps them in memory." },
     routers: { type: "raw", desc: "Rulebooks besides `flows:`: `routers.<name>` has `flows` in the same shape, and `strict` so a request runs on the model its line names or fails: no next line after a failure, no route fallback. `callers:` says who goes by one." },
@@ -77,7 +77,6 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     key: { type: "secret", desc: "Sent to this backend as its bearer key on every call. env:NAME keeps it out of the file." },
     format: { type: "enum", options: ["openai", "anthropic"], desc: "The API it speaks. anthropic is the Messages API: requests and answers are rewritten, so callers still see chat completions.", def: "openai" },
     promptCache: { type: "bool", desc: "With format anthropic: mark each request's system prompt, tools and conversation so far for the provider's prompt cache.", def: true },
-    headroom: { type: "bool", desc: "Compress each conversation with the Headroom server under `headroom:` before it is sent here: fewer tokens to pay for, and long tool results reach the model shortened. A request goes out as it came when that server does not answer.", def: false },
     cloud: { type: "bool", desc: "A provider's server on the internet: no hardware here, and only the models under serves. Requests sent to it leave this network.", def: false },
   },
   activity: {
@@ -175,7 +174,8 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     coldPenalty: { type: "number", min: 0, desc: "What a model load is worth to `fastest`, in queued jobs.", def: 2 },
   },
   headroom: {
-    url: { type: "text", desc: "Where its proxy listens. Keep it on this machine or a network you trust: every conversation of a backend that uses it is sent there.", def: "http://127.0.0.1:8787" },
+    backends: { type: "refs", ref: "backends", desc: "The backends whose conversations are compressed before they are sent: fewer tokens to pay for, and long tool results reach the model shortened. A request goes out as it came when Headroom does not answer." },
+    url: { type: "text", desc: "A Headroom server you run yourself, used in place of the one the console installs. Keep it on this machine or a network you trust: every conversation of the backends above is sent there." },
     token: { type: "secret", desc: "Its proxy token, where it is started with one. env:NAME keeps it out of the file." },
     timeoutMs: ms("How long one compression may take before the request is sent as it came.", 10000, 100),
   },
