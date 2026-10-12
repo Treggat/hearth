@@ -778,6 +778,11 @@ line; **route a name** brings one onto the map.
   one (borrow an idle model, send images or long prompts somewhere else, stay
   off a busy model, give one caller its own model) or from a blank. Click a
   rule to edit it line by line in the panel beside the map.
+- **A line's conditions are changed where they stand.** Click the sentence a
+  line reads as, or **choose a condition** on a new one, and its conditions
+  open in the box; the line's first word closes them again. The dialog, from
+  the rule's pencil or **Edit this line…** in a line's menu, is for the rest:
+  its lane, the request fields it sets, and the rule's own settings.
 - **A line that cannot work is not drawn.** Routing decides chat requests, so
   a name whose backend takes its requests on paths of its own (image
   generation and the like) is marked **not chat** and has no dot, and a chat
