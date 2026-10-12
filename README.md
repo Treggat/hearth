@@ -118,6 +118,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `backends.<name>.key` | none | sent to this backend as `Authorization: Bearer` on every call, in place of anything the client sent. `env:NAME` keeps it out of the file |
 | `backends.<name>.format` | `openai` | the API it speaks: `openai` (chat completions) or `anthropic` (Messages). See [Anthropic's API](#anthropics-api) |
 | `backends.<name>.promptCache` | `true` | with `format: anthropic`: mark each request's system prompt, tools and conversation so far for the provider's prompt cache |
+| `backends.<name>.promptCacheTtl` | `5m` | with `promptCache`: how long the provider keeps a prefix after its last use, `5m` or `1h`. `1h` costs more to write; it pays where a conversation's requests come more than five minutes apart |
 | `backends.<name>.cloud` | `false` | a provider's server on the internet: no hardware here, no warm state, and only the models under `serves`. See [A provider's models](#a-providers-models) |
 | `backends.<name>.routes` | none | paths this backend answers besides chat, each with its lane and model. See [Backends that don't speak the OpenAI API](#backends-that-dont-speak-the-openai-api) |
 | `resources.<name>.kind` | `gpu` | `gpu`, `cpu` or `other`. Picks the icon; `gpu` and `other` are exclusive unless shared |
@@ -1119,6 +1120,14 @@ backends:
   same conversation pays for them as a cache read. A cache write costs more
   than plain input, so for one-off requests with long prompts that are never
   repeated, set `promptCache: false`.
+- A prefix is kept for five minutes after its last use. Where the requests of
+  one conversation come further apart than that (a person who thinks before
+  answering, a tool that runs for a while), `promptCacheTtl: 1h` keeps it for
+  an hour, at a higher price for each write.
+- Only the system messages that open a conversation become the system prompt.
+  One sent later stays where it stands, as text in a user turn: moved to the
+  front it would change the start of the cached prefix, and every turn after
+  it would be paid for in full again.
 - `usage.prompt_tokens` counts all input, cached or not, and
   `usage.prompt_tokens_details.cached_tokens` says how much was read from the
   cache. Per-key usage counts the same totals.
