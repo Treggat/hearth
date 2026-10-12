@@ -826,6 +826,12 @@ line; **route a name** brings one onto the map.
   copied rule takes no names until you give it some. Ctrl/⌘+Z undoes and
   Ctrl/⌘+Shift+Z redoes, across routers and both pages; Escape closes the panel. A rule
   and an action also carry a bin of their own.
+- **Several at once**: hold Ctrl/⌘ and drag across the map to draw a box round
+  nodes, or Ctrl/⌘+click to add one or take it out. What is picked out wears a
+  ring and moves as one. Delete, Ctrl/⌘+D and copy and paste then act on every
+  rule and action among them, as one change, and the copies land beside the
+  originals already picked out. A model, a peer or a refusal is moved with the
+  rest and otherwise left alone. Escape or a click on the map lets go.
 - **?** beside the buttons says what each thing on the map means. A rule or an
   action is renamed by clicking its name, on the map or in the panel, and the
   name follows everywhere it is used.

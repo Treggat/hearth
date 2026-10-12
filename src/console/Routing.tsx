@@ -7,7 +7,7 @@ import { applyNodeChanges, Background, Controls, MiniMap, ReactFlow, type Edge, 
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ANY, beside as besideLines, directTo, draftView, factsOf, groupRows, list, nodeOf, ordered, refusal, restOf, spread, toOf, unchecked, type End, type Facts, type To } from "./draft.js";
-import { connect, editSelect, pick, place, useEdit, type EditSel, type Tried } from "./editStore.js";
+import { connect, editSelect, pick, place, selectMany, useEdit, type EditSel, type Tried } from "./editStore.js";
 import { contextMenu } from "./editor.js";
 import { HUE, takesWork, VIEWS, type ActionBox, type Dest, type FastestBox, type Hub, type RefuseBox, type SwitchBox } from "./flowNodes.js";
 import { arrive, edgeTypes, held, type Line } from "./Topology.js";
@@ -140,7 +140,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
   });
 
   /** A line, in the colour of the kind of thing it goes to. */
-  const wire = (id: string, lit: boolean, kind: string, look: Partial<Line> = {}) => ({ id, type: "flow", ...(lit ? { zIndex: 1001 } : {}), data: { jobs: [], pulses: [], wire: true, lit, color: (HUE[kind] ?? HUE.unset!).stroke, ...look } satisfies Line });
+  const wire = (id: string, lit: boolean, kind: string, look: Partial<Line> = {}) => ({ id, type: "flow", selectable: false, ...(lit ? { zIndex: 1001 } : {}), data: { jobs: [], pulses: [], wire: true, lit, color: (HUE[kind] ?? HUE.unset!).stroke, ...look } satisfies Line });
   /** A line from an outlet to the model or the peer it ends at. */
   const to = (line: ReturnType<typeof wire>, source: string, handle: string, end: End): void => {
     edges.push({ ...line, source, sourceHandle: handle, target: end.kind === "peer" ? `peer:${end.peer}` : `model:${end.model}` });
@@ -284,7 +284,13 @@ export function Routing() {
     const ys = spread(laid.nodes.flatMap((n) => (sizes[n.id] ? [{ id: n.id, ...n.position, ...sizes[n.id]! }] : [])), laid.rides);
     return laid.nodes.map((n) => (ys.has(n.id) && ys.get(n.id) !== n.position.y ? { ...n, position: { x: n.position.x, y: ys.get(n.id)! } } : n));
   }, [laid, sizes]);
-  useEffect(() => setNodes((now) => held(fitted, now, dragging.current)), [fitted]);
+  // Nodes picked out together stay picked out through a redraw, and where a drag has them while it lasts.
+  const many = useEdit((s) => s.many);
+  useEffect(() => setNodes((now) => {
+    const was = new Map(now.map((n) => [n.id, n]));
+    const picked = new Set(useEdit.getState().many.map((m) => m.node));
+    return held(fitted, now, dragging.current).map((n) => (picked.has(n.id) ? { ...n, selected: true, ...(dragging.current && was.get(n.id) ? { position: was.get(n.id)!.position } : {}) } : n));
+  }), [fitted, many]);
   // The line under the pointer is drawn as strongly as one a tried request takes, so it can be followed through a
   // crossing. Only the lines are redrawn for it: touching the nodes would cut off a drag that is just starting.
   const edges = useMemo(() => (edit.hover === null ? laid.edges : laid.edges.map((e) => (e.id === edit.hover ? { ...e, zIndex: 1001, data: { ...e.data, lit: true } } : e))), [laid.edges, edit.hover]);
@@ -303,7 +309,10 @@ export function Routing() {
   return (
     <ReactFlow
       nodes={nodes} edges={edges} nodeTypes={VIEWS} edgeTypes={edgeTypes}
-      nodesDraggable={false} nodesConnectable={editing} elementsSelectable={false} zoomOnDoubleClick={false}
+      nodesDraggable={false} nodesConnectable={editing} elementsSelectable={editing} zoomOnDoubleClick={false}
+      // Ctrl and a drag draws a box round nodes to pick them out together; ctrl and a click adds one. They then move as one.
+      selectionKeyCode={["Control", "Meta"]} multiSelectionKeyCode={["Control", "Meta"]} deleteKeyCode={null}
+      onSelectionChange={({ nodes: picked }) => selectMany(picked.map((n) => ({ node: n.id, x: n.position.x, y: n.position.y })))}
       // The strip over the map is two rows tall when it has something to say.
       minZoom={0.3} maxZoom={1.5} onInit={(rf) => { flow.current = rf; arrive(rf, 0); }}
       colorMode={dark ? "dark" : "light"} proOptions={{ hideAttribution: true }}
@@ -315,7 +324,7 @@ export function Routing() {
       }}
       onNodeDragStart={(_, n) => { dragging.current = n.id; }}
       // A box stays where it was let go; its place is kept apart from anything of the same name on the topology.
-      onNodeDragStop={(_, n) => { dragging.current = null; if (editing) place(`routing/${n.id}`, n.position); }}
+      onNodeDragStop={(_, n, moved) => { dragging.current = null; if (editing) for (const m of moved.length ? moved : [n]) place(`routing/${m.id}`, m.position); }}
       // A line let go over a node goes to it, anywhere on it; let go over nothing, it asks where to.
       onConnectEnd={(e, c) => {
         if (!c.fromNode || !editing) return;
