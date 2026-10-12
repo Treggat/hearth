@@ -5,10 +5,10 @@
  * them by node type; how each behaves when a line is drawn is NODES in draft.ts.
  */
 import { Handle, Position, useConnection, type Node, type NodeProps } from "@xyflow/react";
-import { ChevronDown, CircuitBoard, Cloud, Cpu, MoreHorizontal, Pencil, Plus, Split, Trash2, X, Zap } from "lucide-react";
+import { ArrowUp, ChevronDown, CircuitBoard, Cloud, Cpu, MoreHorizontal, Pencil, Plus, Split, Trash2, X, Zap } from "lucide-react";
 import { Fragment, memo, useEffect, useRef, useState } from "react";
 
-import { ACTIONS, ANY, editStep, GROUP, groupsOf, list, movedName, moveStep, NODES, obj, put, rawTo, text, toOf, toText, withDo, withRest, type Doc, type End } from "./draft.js";
+import { ACTIONS, ANY, dropPlace, editStep, GROUP, groupsOf, list, movedName, moveStep, NODES, obj, put, raisePlace, rawTo, text, toOf, toText, withDo, withRest, type Doc, type End } from "./draft.js";
 import { addName, change, choose, dropName, hover, openRule, pick, remove, rename, retype, type Choice } from "./editStore.js";
 import { cx } from "./ui.js";
 
@@ -191,7 +191,7 @@ export const HUE: Record<string, { dot: string; stroke: string; says: string }> 
   peer: { dot: "!bg-peer", stroke: "var(--peer)", says: "a peer" },
   cloud: { dot: "!bg-cloud", stroke: "var(--cloud)", says: "a provider's model: the request leaves this network" },
   flow: { dot: "!bg-info", stroke: "var(--info)", says: "a routing rule" },
-  fastest: { dot: "!bg-pick", stroke: "var(--pick)", says: "the fastest of several" },
+  fastest: { dot: "!bg-pick", stroke: "var(--pick)", says: "the fastest of several, or several in order" },
   refuse: { dot: "!bg-bad", stroke: "var(--bad)", says: "a refusal" },
   action: { dot: "!bg-warn", stroke: "var(--warn)", says: "an action" },
   unset: { dot: "!bg-dim", stroke: "var(--dim)", says: "nowhere yet" },
@@ -240,7 +240,7 @@ const BIN = "nodrag nopan grid h-6 w-6 shrink-0 place-items-center rounded-md te
 /** What is known about a line: `bad` is why it cannot work, `unsure` that its target has not said whether it can take what the line tests. */
 export type Mark = { bad: string } | { unsure: true } | null;
 
-export type SwitchBox = { marks?: Mark[]; /** The names that enter it: a line that sends one of them to itself is "its own model". */ inputs?: string[]; name: string; steps: Doc[]; selected?: boolean; editable?: boolean; lit?: number; models: string[]; lanes: string[]; /** Every action a line could run. */ actions: string[]; /** The models that run on a provider's server. */ cloud?: string[]; /** Switched off: drawn, but it takes nothing. */ off?: boolean; note?: string; /** It keeps a conversation where it started. */ sticky?: boolean; /** Request paths it takes besides chat. */ takes?: string[]; /** How many times each line has decided since the rules last changed. */ hits?: number[]; /** No name enters it and no rule hands work to it. */ orphan?: boolean };
+export type SwitchBox = { /** The orders its lines hand to, by flow name, each as the places in it. */ orders?: Record<string, End[]>; marks?: Mark[]; /** The names that enter it: a line that sends one of them to itself is "its own model". */ inputs?: string[]; name: string; steps: Doc[]; selected?: boolean; editable?: boolean; lit?: number; models: string[]; lanes: string[]; /** Every action a line could run. */ actions: string[]; /** The models that run on a provider's server. */ cloud?: string[]; /** Switched off: drawn, but it takes nothing. */ off?: boolean; note?: string; /** It keeps a conversation where it started. */ sticky?: boolean; /** Request paths it takes besides chat. */ takes?: string[]; /** How many times each line has decided since the rules last changed. */ hits?: number[]; /** No name enters it and no rule hands work to it. */ orphan?: boolean };
 
 export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<SwitchBox>>) {
   const from = useWireFrom();
@@ -275,6 +275,9 @@ export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<
         // Under a heading a line says only what is its own; its dialog shows all it tests.
         const { [group?.key ?? ""]: _shared, ...mine } = when;
         const word = i === last ? "Otherwise" : group ? (Object.keys(mine).length === 0 && i === group.to ? "Else" : i === group.from ? "If" : "Else if") : i === 0 ? "If" : "Else if";
+        // A line that hands to an order reads as the places in it, not as the rule that holds them.
+        const order = to.kind === "flow" ? data.orders?.[to.flow] : undefined;
+        const goes = order ? order.map(toText).join(", then ") : own(to) ? "its own model" : toText(to);
         return (
           <Fragment key={i}>
           {group?.from === i && (
@@ -304,14 +307,14 @@ export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<
               <span className="min-w-0 flex-1 truncate">{sentence(group ? mine : when) || (group?.to === i ? "" : "it can take it")}</span>
             )}
             <span className="flex w-[200px] min-w-0 shrink-0 items-center gap-1.5">
-              <span className={cx("h-1.5 w-1.5 shrink-0 rounded-full", worn(to).dot)} title={worn(to).says} />
+              <span className={cx("h-1.5 w-1.5 shrink-0 rounded-full", (order ? hue("fastest") : worn(to)).dot)} title={(order ? hue("fastest") : worn(to)).says} />
               {to.kind !== "refuse" && <span className="shrink-0 text-dim">send to</span>}
               {data.editable ? (
-                <button type="button" className={cx(CHIP, "min-w-0 flex-1 font-mono", to.kind === "unset" && "border-warn text-warn")} title={to.kind === "unset" ? "choose where this line sends requests" : `${toText(to)} — click to choose where this line sends requests`}
+                <button type="button" className={cx(CHIP, "min-w-0 flex-1 font-mono", to.kind === "unset" && "border-warn text-warn")} title={to.kind === "unset" ? "choose where this line sends requests" : `${goes} — click to choose where this line sends requests`}
                         onClick={(e) => pick({ x: e.clientX, y: e.clientY, from: { node: id, handle: `step-${i}` } })}>
-                  <span className="truncate">{to.kind === "unset" ? "choose where" : own(to) ? "its own model" : toText(to)}</span><ChevronDown size={10} className="shrink-0 text-dim" />
+                  <span className="truncate">{to.kind === "unset" ? "choose where" : goes}</span><ChevronDown size={10} className="shrink-0 text-dim" />
                 </button>
-              ) : <span className="min-w-0 flex-1 truncate font-mono" title={toText(to)}>{own(to) ? "its own model" : toText(to)}</span>}
+              ) : <span className="min-w-0 flex-1 truncate font-mono" title={goes}>{goes}</span>}
             </span>
             {typeof s.max === "number" && <span className="shrink-0 rounded border border-line px-1 text-[10px] text-dim" title={`takes at most ${s.max} at once; the rest go on down the list`}>≤{s.max}</span>}
             {data.hits && <span className="w-7 shrink-0 text-right text-[10px] tabular text-dim" title={`decided ${data.hits[i] ?? 0} ${(data.hits[i] ?? 0) === 1 ? "request" : "requests"} since the rules last changed or the node started`}>{data.hits[i] ?? 0}×</span>}
@@ -321,8 +324,9 @@ export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<
               : <span className="grid h-4 w-4 shrink-0 place-items-center rounded-full border border-dim/60 text-[10px] text-dim" title="Not checked: this model has not said whether it takes what this line is for. It is checked once the model has loaded, or when you describe it under Models.">?</span>)}
             {data.editable && (
               <button type="button" aria-label={`line ${i + 1} options`} title="more for this line" className="nodrag nopan grid h-6 w-6 shrink-0 place-items-center rounded-md text-dim hover:bg-muted hover:text-fg"
-                      onClick={(e) => choose(e, [
+                      onClick={(e) => { const at = { x: e.clientX, y: e.clientY }; choose(e, [
                         ...(i < last ? [{ label: "Move up", value: "up", off: i === 0 }, { label: "Move down", value: "down", off: i >= last - 1 }] : []),
+                        ...(to.kind === "model" || to.kind === "peer" ? [{ label: "if that fails", head: true }, { label: "Then try…", value: "then", hint: "another place to run it when this one fails" }] : []),
                         { label: "queue it in", head: true },
                         { label: "the model's own lane", value: "lane:", on: text(s.lane) === "" },
                         ...data.lanes.map((l) => ({ label: `the ${l} lane`, value: `lane:${l}`, on: text(s.lane) === l })),
@@ -332,17 +336,18 @@ export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<
                         { label: "Edit this line…", value: "more" },
                         ...(i < last ? [{ label: "Delete this line", value: "delete", danger: true }] : []),
                       ], (v) => {
-                        if (v === "up") change((d) => moveStep(d, data.name, i, -1));
+                        if (v === "then") pick({ x: at.x, y: at.y, from: { node: id, handle: `step-${i}-then` } });
+                        else if (v === "up") change((d) => moveStep(d, data.name, i, -1));
                         else if (v === "down") change((d) => moveStep(d, data.name, i, 1));
                         else if (v === "delete") edit(i, () => null);
                         else if (v === "more") openRule(data.name, i);
                         else if (v.startsWith("do:")) change((d) => withDo(d, data.name, i, v.slice(3), !list(s.do).includes(v.slice(3))) ?? d);
                         else if (v.startsWith("lane:")) edit(i, ({ lane: _, ...r }) => (v === "lane:" ? r : { ...r, lane: v.slice(5) }));
-                      })}>
+                      }); }}>
                 <MoreHorizontal size={13} />
               </button>
             )}
-            <Handle type="source" id={`step-${i}`} position={Position.Right} className={cx(PORT, data.lit === i ? "!bg-accent" : to.kind === "asked" ? hue(to.kind).dot : worn(to).dot, !data.editable && "!pointer-events-none")} style={{ right: -6 }} />
+            <Handle type="source" id={`step-${i}`} position={Position.Right} className={cx(PORT, data.lit === i ? "!bg-accent" : order ? hue("fastest").dot : to.kind === "asked" ? hue(to.kind).dot : worn(to).dot, !data.editable && "!pointer-events-none")} style={{ right: -6 }} />
           </div>
           {group?.to === i && group.foot && (
             <div className="relative flex items-center px-3 text-[10px] italic text-dim" style={{ height: GROUP.foot }}>
@@ -389,6 +394,51 @@ export const FastestNode = memo(function FastestNode({ id, data }: NodeProps<Nod
         <button type="button" className="nodrag nopan relative flex h-7 w-full items-center gap-1 rounded-b-xl border-t border-line px-3 text-[11px] text-dim hover:bg-muted hover:text-fg"
                 onClick={(e) => pick({ x: e.clientX, y: e.clientY, from: { node: id, handle: "new" } })}>
           <Plus size={12} />add another place
+        </button>
+      )}
+    </div>
+  );
+});
+
+export type OrderBox = { /** The flow that holds the order. */ flow: string; ends: End[]; editable?: boolean; selected?: boolean; lit?: number; on?: boolean; /** No line hands work to it. */ unused?: boolean; /** Request paths it takes besides chat. */ takes?: string[]; /** The models that run on a provider's server. */ cloud?: string[] };
+
+/** Where a line sends work to several places in turn: the first, and each one after it when the one before fails. */
+export const OrderNode = memo(function OrderNode({ id, data }: NodeProps<Node<OrderBox>>) {
+  const from = useWireFrom();
+  // A line of a rule can be let go on it; a line of its own cannot.
+  const canTake = from !== null && from !== id && from.startsWith("flow:");
+  return (
+    <div className={cx("w-[220px] rounded-xl border bg-panel shadow-sm", data.selected ? "border-accent ring-2 ring-accent/25" : data.on ? "border-accent" : "border-ok/60", canTake && RING)}>
+      <div className="relative border-b border-line px-3 py-1.5">
+        <Handle type="target" position={Position.Left} className={cx(PORT, "target", data.on ? "!bg-accent" : HUE.fastest!.dot)} style={{ left: -6, top: 14 }} />
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-wide text-ok">in order</span>
+          {(data.takes ?? []).length > 0 && <span className="shrink-0 rounded border border-line px-1 text-[9px] uppercase text-dim" title={`not chat: it takes requests on ${data.takes!.join(", ")}`}>not chat</span>}
+          {data.editable && <button type="button" aria-label={`delete order ${data.flow}`} title="delete this order" className={cx(BIN, "ml-auto h-5 w-5")} onClick={(e) => { e.stopPropagation(); remove({ kind: "flow", id: data.flow }); }}><Trash2 size={12} /></button>}
+        </div>
+        <div className={cx("text-[10px]", data.unused ? "text-warn" : "text-dim")}>{data.unused ? "no line sends here yet: drag a line's dot here" : "the next one when one fails"}</div>
+      </div>
+      {data.ends.map((e, k) => {
+        // A request that failed on a model here is only moved to another model here.
+        const dead = e.kind === "peer" && data.ends.slice(0, k).some((p) => p.kind === "model");
+        return (
+          <div key={k} className={cx("relative flex h-7 items-center gap-1.5 px-3 text-[11px]", data.lit === k && "bg-accent/15")}>
+            <Handle type="source" id={`end-${k}-back`} position={Position.Left} className="!opacity-0" style={{ left: -6 }} />
+            <span className="w-3 shrink-0 text-right text-[10px] tabular text-dim/70">{k + 1}</span>
+            {data.editable
+              ? <button type="button" className={cx(CHIP, "min-w-0 flex-1 justify-between font-mono", dead && "border-warn text-warn")} title={dead ? "Not reached: a request that failed on a model here is only moved to another model here. A peer is tried when it comes first." : undefined}
+                        onClick={(ev) => pick({ x: ev.clientX, y: ev.clientY, from: { node: id, handle: `end-${k}` } })}><span className="truncate">{toText(e)}</span><ChevronDown size={10} className="shrink-0 text-dim" /></button>
+              : <span className="min-w-0 flex-1 truncate font-mono">{toText(e)}</span>}
+            {data.editable && k > 0 && <button type="button" aria-label={`try ${toText(e)} sooner`} title="try this one sooner" className="nodrag nopan text-dim hover:text-fg" onClick={() => change((d) => raisePlace(d, data.flow, k))}><ArrowUp size={11} /></button>}
+            {data.editable && <button type="button" aria-label={`remove ${toText(e)}`} title={data.ends.length > 2 ? "take this place out" : "take this place out: the line then goes straight to the other"} className="nodrag nopan text-dim hover:text-bad" onClick={() => change((d) => dropPlace(d, data.flow, k))}><X size={11} /></button>}
+            <Handle type="source" id={`end-${k}`} position={Position.Right} className={cx(PORT, data.lit === k ? "!bg-accent" : hue(e.kind === "model" && (data.cloud ?? []).includes(e.model) ? "cloud" : e.kind).dot, !data.editable && "!pointer-events-none")} style={{ right: -6 }} />
+          </div>
+        );
+      })}
+      {data.editable && (
+        <button type="button" className="nodrag nopan relative flex h-7 w-full items-center gap-1 rounded-b-xl border-t border-line px-3 text-[11px] text-dim hover:bg-muted hover:text-fg"
+                onClick={(e) => pick({ x: e.clientX, y: e.clientY, from: { node: id, handle: "new" } })}>
+          <Plus size={12} />then try another
         </button>
       )}
     </div>
@@ -568,4 +618,4 @@ export const ActionNode = memo(function ActionNode({ data }: NodeProps<Node<Acti
 });
 
 /** Every node the routing map draws, by its React Flow type. */
-export const VIEWS = { hub: HubNode, flow: SwitchNode, fastest: FastestNode, refuse: RefuseNode, dest: DestNode, action: ActionNode };
+export const VIEWS = { hub: HubNode, flow: SwitchNode, fastest: FastestNode, order: OrderNode, refuse: RefuseNode, dest: DestNode, action: ActionNode };

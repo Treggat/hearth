@@ -49,7 +49,9 @@ const heavy = { inputs: ["big"], steps: [{ when: { caller: "app" }, to: { peer: 
   refuse(one([]), /steps must be a list of steps/);
   refuse(one([{ when: { images: true }, to: "eyes" }]), /must end with a step that always applies/);
   refuse(one([{ to: { peer: "friend" } }]), /must end with a step that always applies/);
-  refuse(one([{ to: "small" }, { to: "big" }]), /steps\[0\] has no `when`, so the steps after it can never be reached/);
+  refuse(one([{ to: { refuse: "no" } }, { to: "big" }]), /steps\[0\] has no `when`, so the steps after it can never be reached/);
+  // A model here can fail before it answers, so a line that only names one may stand before the lines it falls back to.
+  parseConfig(base(one([{ to: "small" }, { to: "big" }])));
   refuse(one([{ when: { image: true }, to: "eyes" }, { to: "big" }]), /when\.image is not a setting .* did you mean images/);
   refuse(one([{ to: "big", lane: "nope" }]), /names lane "nope"/);
   refuse(one([{ to: "big", params: { model: "x" } }]), /params\.model cannot be stamped/);
