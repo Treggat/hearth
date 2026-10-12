@@ -1145,7 +1145,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     { path: "/queue/events", methods: ["GET"], auth: "local", handler: routeQueueEvents },
 
     // Mint and revoke write the config file, and the node follows it at once.
-    { path: ["/keys/mint", "/keys/revoke"], methods: ["POST"], auth: "local", handler: routeKeys },
+    { path: ["/keys/mint", "/keys/revoke", "/keys/rotate"], methods: ["POST"], auth: "local", handler: routeKeys },
     { path: "/usage", methods: ["GET"], auth: "local", handler: routeUsage },
 
     // The OpenAI surface: a peer may send us work here, and so may we.
@@ -1625,9 +1625,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
   }
 
-  // The keys page's two writes: mint appends one entry, revoke removes one. Both land in the
-  // config file through the same patch path every other config change uses, and take effect at
-  // once. The plaintext comes back once, in the mint's answer.
+  // The keys page's writes: mint appends one entry, revoke removes one, rotate gives one a new
+  // secret and keeps the rest of it. Each lands in the config file through the same patch path
+  // every other config change uses, and takes effect at once. A plaintext comes back once, in
+  // the answer of the mint or the rotate that made it.
   async function routeKeys(c: Call): Promise<void> {
     try {
       const body = await readJson(c.req);
@@ -1654,6 +1655,17 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       }
       const i = cfg.apiKeyLabels.indexOf(label);
       if (i < 0) throw new Refusal(404, `no key labeled ${label}`);
+      if (c.path === "/keys/rotate") {
+        // Only the secret changes: its label, and so its router, scope, limits and usage, stay.
+        const written = ((config.text().doc as { apiKeys?: unknown[] } | null)?.apiKeys ?? [])[i];
+        const was = typeof written === "object" && written !== null ? (written as { key?: unknown }).key : written;
+        if (typeof was === "string" && was.startsWith("env:")) throw new Refusal(409, `${label} reads its key from the environment (${was}): change it there`);
+        const key = "hkey_" + randomBytes(20).toString("hex");
+        const commit = config.patch({ ops: [{ path: ["apiKeys", i, "key"], value: key }] });
+        log.info("keys.rotated", { label, id: keyId(key), caller: c.caller });
+        json(c.res, 200, { key, label, rotated: true, restartPending: commit.restartPending });
+        return;
+      }
       const commit = config.patch({ ops: [{ path: ["apiKeys", i], delete: true }] });
       keySeen.delete("key:" + label);
       log.info("keys.revoked", { label, caller: c.caller });
