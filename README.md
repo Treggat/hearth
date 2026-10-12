@@ -1439,7 +1439,10 @@ is one step:
 
 A step is also passed over when its target cannot take the request: a peer
 that is down or whose model is too small. So a step that only names a peer
-needs no `when`, and "try my friend, else run it here" is two lines. The last
+needs no `when`, and "try my friend, else run it here" is two lines. A step
+that only names a model here needs none either: the lines after it are where
+the request goes when that model fails before it answers, as described next,
+so "run it on the card, else on the CPU" is two lines too. The last
 step has no `when` and somewhere that can always answer (a model, a flow or
 `refuse`), so every request gets a decision. If a peer fails before sending
 anything back, the flow is asked again without peers, and the request runs
