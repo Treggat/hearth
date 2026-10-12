@@ -681,6 +681,9 @@ Five pages, and ⌘K jumps to anything on them:
   rotates or revokes it, and a right-click anywhere in the frame mints a new
   one from a label. Those three are written at once, as on the Keys page, and
   a new key is shown once over the page.
+  A right-click on the empty part of the picture offers what the strip over it
+  does, where the pointer is: a new backend, hardware, machine or provider, the
+  published versions, and fitting the picture in view.
 - **Routing**: every model name, the rules some pass through, and where each
   ends up, as a map you edit. See [Editing on the graph](#editing-on-the-graph).
 - **Models**: every model on one row: which nodes hold it, whether it is loaded
