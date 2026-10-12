@@ -13,7 +13,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type React
 
 import type { Backend, Node as NetNode, Resource, UiData } from "./types.js";
 import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
-import { callerChoices, callersIn, draftView, EVERYONE, list, obj, put, routerFor, usersOf, withCaller, paneChoices } from "./draft.js";
+import { bayRoom, callerChoices, callersIn, draftView, EVERYONE, list, obj, put, routerFor, usersOf, withCaller, paneChoices } from "./draft.js";
 import { addRouter, askAt, change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit } from "./editStore.js";
 import { Menu, VersionsButton, openVersions } from "./editor.js";
 import { control, go, mintKey, request, restartNode, revokeKey, rotateKey, select, toast, useStore } from "./store.js";
@@ -595,9 +595,8 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
   const bays = (who ? [...ranks.slice().reverse(), null] : []).flatMap((name) => {
     const callers = who!.callers.filter((c) => c.router === name);
     if (callers.length === 0) return [];
-    const cols = Math.min(CALLER.cols, callers.length);
-    const w = Math.max(cols * (CALLER.w + CALLER.gap) - CALLER.gap + BAY.pad * 2, 150);
-    return [{ name, callers, w, h: BAY.head + Math.ceil(callers.length / cols) * (CALLER.h + CALLER.gap) - CALLER.gap + BAY.pad, x: 0 }];
+    // No narrower than the router under it, or two routers under one-caller boxes would lie on each other.
+    return [{ name, callers, ...bayRoom(callers.length, CALLER, BAY, W), x: 0 }];
   });
   let wide = PAD;
   for (const b of bays) { b.x = wide; wide += b.w + GAP; }
@@ -640,7 +639,7 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
       const box = `bay:${name ?? ""}`;
       nodes.push({ id: box, type: "bay", parentId: "self", extent: "parent" as const, position: { x: bay.x, y: HOME }, style: { width: bay.w, height: bay.h }, data: { label: name === null ? "by the default router" : `by ${name}`, own: name !== null } satisfies Bay });
       bay.callers.forEach((c, i) => {
-        nodes.push({ id: `caller:${c.name}`, type: "caller", parentId: box, extent: "parent" as const, position: { x: BAY.pad + (i % CALLER.cols) * (CALLER.w + CALLER.gap), y: BAY.head + Math.floor(i / CALLER.cols) * (CALLER.h + CALLER.gap) }, data: { ...c, busy: mine(c.name).length > 0, editable: true } satisfies Caller });
+        nodes.push({ id: `caller:${c.name}`, type: "caller", parentId: box, extent: "parent" as const, position: { x: bay.inset + (i % CALLER.cols) * (CALLER.w + CALLER.gap), y: BAY.head + Math.floor(i / CALLER.cols) * (CALLER.h + CALLER.gap) }, data: { ...c, busy: mine(c.name).length > 0, editable: true } satisfies Caller });
       });
       edges.push({
         id: `e:${box}`, source: box, sourceHandle: "down", target: id, targetHandle: "up", type: "flow",
