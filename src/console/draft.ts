@@ -451,6 +451,18 @@ export function beside(ends: string[], from: (end: string) => number[], step: nu
 }
 
 /**
+ * The room a box of `callers` chips takes: `cols` across at most, and never narrower than `least`, the
+ * card that stands under its middle, so the cards under boxes set side by side do not lie on each other.
+ * `inset` is where the first chip starts, which keeps a row narrower than the box in its middle.
+ */
+export function bayRoom(callers: number, chip: { w: number; h: number; gap: number; cols: number }, edge: { head: number; pad: number }, least: number): { cols: number; w: number; h: number; inset: number } {
+  const cols = Math.min(chip.cols, callers);
+  const row = cols * (chip.w + chip.gap) - chip.gap;
+  const w = Math.max(row + edge.pad * 2, least);
+  return { cols, w, h: edge.head + Math.ceil(callers / cols) * (chip.h + chip.gap) - chip.gap + edge.pad, inset: (w - row) / 2 };
+}
+
+/**
  * A draft as one router's rulebook: its flows stand as `flows`, and its map has places of its own
  * (kept as `routing@<router>/...`). With `null` the draft is its own view: the rules everyone else goes by.
  */
