@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 
 import { Config } from "./config.js";
 import { Logs } from "./logs.js";
-import { CanaryAlert, History, Inspector, Keys, Models, Queue } from "./pages.js";
+import { CanaryAlert, History, Inspector, KeyOnce, Keys, Models, Queue } from "./pages.js";
 import { Palette } from "./Palette.js";
 import type { UiData } from "./types.js";
 import { go, login, logout, restartNode, select, useStore, type Page } from "./store.js";
@@ -368,6 +368,8 @@ export default function App() {
         )}
       </main>
 
+      {/* A key made from any other page is shown over it, once; the keys page shows it in place. */}
+      {page !== "keys" && <KeyOnce />}
       <Palette />
       <KeyDialog />
       <Toast />

@@ -17,9 +17,9 @@ export type Tried = { target: string; model: string; reason: string; backend?: s
 /** A list of places to send a wire, open at a point on the page. `from` is the outlet it was dragged from. */
 export type Picking = { x: number; y: number; from: { node: string; handle: string | null } | null } | null;
 /** One choice in a menu; `head` is a label between groups, `on` marks the current one. */
-export type Choice = { label: string; value?: string; hint?: string; head?: boolean; on?: boolean; off?: boolean; danger?: boolean; mono?: boolean };
+export type Choice = { label: string; value?: string; hint?: string; /** A few words beside the label, where a line under it would be too much. */ aside?: string; /** What stands before the label, by name. */ icon?: "plus" | "rotate" | "bin" | "split" | "users"; /** A heading; with no label, a rule between two groups. */ head?: boolean; on?: boolean; off?: boolean; danger?: boolean; mono?: boolean };
 /** A list of choices open at a point on the page. */
-export type Choosing = { x: number; y: number; items: Choice[]; onPick: (value: string) => void; /** Always offer the filter, however short the list. */ search?: boolean; /** What typing a name that is not listed makes, and the words for it. */ create?: { says: string; make: (name: string) => void } } | null;
+export type Choosing = { x: number; y: number; items: Choice[]; onPick: (value: string) => void; /** Always offer the filter, however short the list. */ search?: boolean; /** What typing a name that is not listed makes, and the words for it. */ create?: { says: string; make: (name: string) => void }; /** What the field asks for, where the menu is there to take a name. */ ask?: string } | null;
 
 interface EditState {
   file: File | null;
@@ -180,6 +180,8 @@ export function choose(e: { currentTarget: Element }, items: Choice[], onPick: (
 }
 /** Open a menu at a point on the page: where the pointer was right-clicked, say. */
 export const chooseAt = (x: number, y: number, items: Choice[], onPick: (value: string) => void, search = false) => set({ choosing: { x, y, items, onPick, search } });
+/** Ask for a name at a point on the page: a menu with only a field, and `make` is given what is typed. */
+export const askAt = (x: number, y: number, ask: string, says: string, make: (name: string) => void) => set({ choosing: { x, y, items: [], onPick: () => {}, search: true, ask, create: { says, make } } });
 export const closeMenu = () => set({ choosing: null });
 export const setAdding = (adding: string | null) => set({ adding });
 /** Bring a node into view. */

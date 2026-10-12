@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { addPlace, applyOps, dropPlace, orderOf, pastedAll, put, raisePlace, wholes, thenTry, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
+import { addPlace, applyOps, callerChoices, dropPlace, orderOf, pastedAll, put, raisePlace, wholes, thenTry, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, added, retyped, ordered, movedName, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -265,6 +265,22 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual([(out.flows as Record<string, Doc>)["pick-copy"]!.inputs, (out.actions as Record<string, Doc>)["note-copy"]], [[], { log: "hello" }], "a copied rule takes no names");
   assert.doesNotThrow(() => parseConfig(out));
   assert.deepEqual(pastedAll(from, []), { doc: from, made: [] });
+}
+
+// --- the menu for a right-click among the callers -----------------------------------------------------------------
+{
+  const d = { ...doc(), apiKeys: [{ key: "k", label: "app" }], routers: { side: { flows: {} } }, callers: { app: "side" } };
+  const said = (id: string | null) => callerChoices(d, id).map((c) => (c.head ? (c.label === "" ? "--" : `# ${c.label}`) : `${c.value}${c.on ? " ✓" : ""}`));
+  // A key: which router it goes by, with the one in force marked, then what can be done with the key, then a new one.
+  assert.deepEqual(said("app"), ["# app goes by", "to:", "to:side ✓", "follow", "new-router", "--", "# its key", "rotate", "revoke", "--", "mint"]);
+  // This machine with no key is sent by a router too, and has no key to rotate. It follows everyone else until it is sent somewhere.
+  assert.deepEqual(said("local"), ["# local goes by", "to:", "to:side", "follow ✓", "new-router", "--", "mint"]);
+  // Everyone else is who the others follow, so it cannot follow.
+  assert.deepEqual(said("*"), ["# everyone else goes by", "to: ✓", "to:side", "new-router", "--", "mint"]);
+  // The frame the callers stand in: only what adds one. With no draft read, the routers are not offered.
+  assert.deepEqual(said(null), ["# callers", "mint"]);
+  assert.deepEqual(callerChoices(null, "app").map((c) => c.value).filter(Boolean), ["rotate", "revoke", "mint"]);
+  assert.equal(callerChoices(d, "app").find((c) => c.value === "revoke")!.danger, true);
 }
 
 // --- what a person can fix is said before the file refuses it -----------------------------------------------------
