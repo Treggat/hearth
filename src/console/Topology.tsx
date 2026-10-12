@@ -13,10 +13,10 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type React
 
 import type { Backend, Node as NetNode, Resource, UiData } from "./types.js";
 import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
-import { bayRoom, callersIn, draftView, EVERYONE, list, obj, put, routerFor, usersOf, withCaller } from "./draft.js";
-import { change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit } from "./editStore.js";
-import { Menu, VersionsButton } from "./editor.js";
-import { control, go, request, restartNode, select, toast, useStore } from "./store.js";
+import { bayRoom, callersIn, draftView, EVERYONE, list, obj, put, routerFor, usersOf, withCaller, callerChoices, paneChoices } from "./draft.js";
+import { change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit, addRouter, askAt } from "./editStore.js";
+import { Menu, VersionsButton, openVersions } from "./editor.js";
+import { control, go, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
 import { Button, cx, Dialog, Dot, type Tone } from "./ui.js";
 
 /** `tags`: hardware a backend uses besides the group it sits in. `tip`: what the status dot is saying. */
@@ -754,6 +754,27 @@ export function Topology() {
     routers: Object.fromEntries(Object.entries(obj(draft.routers)).map(([name, r]) => [name, { users: usersOf(draft, name), strict: obj(r).strict === true }])),
   } : null), [draft?.routers, draft?.callers, draft?.apiKeys, draft?.servers]);
   const laid = useMemo(() => layout(data, sel, who), [data.net, data.q.jobs, data.flows, sel, who]);
+  /** Send a caller by the router chosen from its menu; a new router is named first, where the menu was. */
+  const sendBy = (id: string, v: string, x: number, y: number): void => {
+    if (v === "follow") follow(id);
+    else if (v === "new-router") askAt(x, y, "a name for the new router", "add router", (name) => {
+      if (name in obj(useEdit.getState().draft?.routers) || name === "default") { toast("bad", `"${name}" is taken`); return; }
+      addRouter(name, false);
+      change((d) => withCaller(d, id, name));
+    });
+    else if (v.startsWith("to:")) change((d) => withCaller(d, id, v.slice(3) || null));
+  };
+  /** The menu for a right-click among the callers: on one of them (`id`), or on the frame they stand in. */
+  const callerMenu = (x: number, y: number, id: string | null): void => {
+    chooseAt(x, y, callerChoices(draft, id), (v) => {
+      // A key is written to the file at once, not to the draft: the draft is read again so the callers drawn are the file's.
+      if (v === "mint") askAt(x, y, "a label for the new key", "mint a key for", (label) => void mintKey(label, null).then(loadDraft));
+      else if (v === "rotate") { if (confirm(`Rotate ${id}? Whatever uses the old key stops working until it is given the new one.`)) void rotateKey(id!); }
+      else if (v === "revoke") { if (confirm(`Revoke ${id}? It stops working straight away.`)) void revokeKey(id!).then(loadDraft); }
+      else if (id !== null) sendBy(id, v, x, y);
+    });
+  };
+
   // The picture is fitted again once, when the draft's part of it (callers, routers, empty frames) first arrives.
   const drafted = who !== null;
   useEffect(() => { if (drafted && flow.current) arrive(flow.current, 0); }, [drafted]);
@@ -827,24 +848,34 @@ export function Topology() {
         if (n.id.startsWith("backend:")) dropBackend(n.id.slice(8), at.clientX, at.clientY);
         setNodes((now) => held(laid.nodes, now, null));
       }}
+      // A right-click among the callers: on one, which router it goes by and what to do with its key; anywhere in the frame, a new key.
+      onNodeContextMenu={(e, n) => {
+        const kind = n.id.split(":")[0];
+        if (kind !== "caller" && kind !== "bay" && n.id !== "self") return;
+        e.preventDefault();
+        callerMenu(e.clientX, e.clientY, kind === "caller" ? n.id.slice(7) : null);
+      }}
       onNodeClick={(_, n) => {
         const [kind, ...rest] = n.id.split(":");
         const id = kind === "self" ? data.net.nodes.find((x) => x.self)!.name : rest.join(":");
-        if (kind === "caller" && draft) {
-          const at = routerFor(draft, id);
-          const box = document.querySelector(`.react-flow__node[data-id="${CSS.escape(n.id)}"]`)?.getBoundingClientRect();
-          chooseAt(box?.right ?? 0, box?.top ?? 0, [
-            { label: `requests from ${id === EVERYONE ? "everyone else" : id} go by`, head: true },
-            { label: "The default router", value: "to:", on: at.own && at.router === null },
-            ...Object.keys(obj(draft.routers)).map((r) => ({ label: r, value: `to:${r}`, mono: true, on: at.own && at.router === r })),
-            ...(id === EVERYONE ? [] : [{ label: "Wherever everyone else goes", value: "follow", on: !at.own, hint: "moves with them" }]),
-          ], (v) => (v === "follow" ? follow(id) : change((d) => withCaller(d, id, v.slice(3) || null))));
-        } else if (kind === "router") { if (useEdit.getState().draft) showRouter(rest.length ? rest.join(":") : null); go("routing"); }
+        if (kind === "router") { if (useEdit.getState().draft) showRouter(rest.length ? rest.join(":") : null); go("routing"); }
         else if (kind === "self" || kind === "peer" || kind === "backend") select({ kind, id });
         else if (kind === "resource") select({ kind, id: id.split("/").pop()! });
         else if (kind === "machine" && id) select({ kind, id });
       }}
       onPaneClick={() => select(null)}
+      // A right-click on the empty part of the picture offers what the strip over it does, where the pointer is.
+      onPaneContextMenu={(e) => {
+        e.preventDefault();
+        if (!draft) return;
+        const [x, y] = [e.clientX, e.clientY];
+        chooseAt(x, y, paneChoices((["backends", "resources", "servers"] as const).map((section) => ({ section, noun: NEW[section]!.noun }))), (v) => {
+          if (v === "provider") setProviding(true);
+          else if (v === "versions") openVersions(x, y);
+          else if (v === "fit") void flow.current?.fitView({ padding: 0.08, duration: 300, maxZoom: 1 });
+          else if (v.startsWith("add:")) setAdding(v.slice(4));
+        });
+      }}
     >
       <Background gap={20} size={1} color="var(--border)" />
       <Controls showInteractive={false} position="bottom-left" />

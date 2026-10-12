@@ -78,6 +78,23 @@ assert.equal((await post("/keys/revoke", "full-secret", { label: "one" })).statu
 assert.equal((await post("/keys/revoke", "full-secret", { label: "three" })).status, 200);
 assert.deepEqual(labels(), ["admin", "narrow", "two"], "each revoke removes the key it named");
 assert.equal((await post("/keys/revoke", "full-secret", { label: "one" })).status, 404);
+
+// A rotated key keeps its label and place; only the secret changes, and the old one stops at once.
+const before = (await (await post("/keys/mint", "full-secret", { label: "turns" })).json()) as { key: string };
+const turned = await post("/keys/rotate", "full-secret", { label: "turns" });
+assert.equal(turned.status, 200);
+const after = (await turned.json()) as { key: string; label: string; rotated: boolean };
+assert.match(after.key, /^hkey_[0-9a-f]{40}$/);
+assert.notEqual(after.key, before.key);
+assert.deepEqual([after.label, after.rotated], ["turns", true]);
+assert.deepEqual(labels(), ["admin", "narrow", "two", "turns"], "it is the same entry, where it was");
+assert.ok(!readFileSync(cfgPath, "utf8").includes(before.key), "the old secret is gone from the file");
+assert.equal((await post("/keys/mint", before.key, { label: "five" })).status, 401, "and is turned away at once");
+assert.equal((await post("/keys/mint", after.key, { label: "five" })).status, 200, "the new one works at once");
+assert.equal((await post("/keys/rotate", "full-secret", { label: "nobody" })).status, 404);
+assert.equal((await post("/keys/rotate", "narrow-secret", { label: "turns" })).status, 403, "a scoped key rotates nothing");
+assert.equal((await post("/keys/revoke", "full-secret", { label: "turns" })).status, 200);
+assert.equal((await post("/keys/revoke", "full-secret", { label: "five" })).status, 200);
 assert.equal((await post("/keys/mint", first.key, { label: "four" })).status, 401, "a revoked key is turned away at once");
 
 // Evict.

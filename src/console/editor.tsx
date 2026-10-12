@@ -3,7 +3,7 @@
  * with a node's full settings, the list of places a line can go, and the row that tries a
  * request against the draft.
  */
-import { ArrowDown, ArrowUp, ChevronDown, CircleHelp, History, Plus, Redo2, Split, RotateCcw, Save, Search, Trash2, Undo2, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, CircleHelp, History, Plus, Redo2, RefreshCw, Split, RotateCcw, Save, Search, Trash2, Undo2, Users, X, Zap } from "lucide-react";
 import { useContext, useEffect, useState } from "react";
 
 import { NewDialog, Refs, refsOf, Review, Value } from "./config.js";
@@ -134,17 +134,22 @@ export function VersionsHere() {
 /** A caller as the console names it: everyone not sent somewhere else is "default". */
 const said = (caller: string) => (caller === EVERYONE ? "default" : caller);
 
+/** List the published versions at a point on the page; choosing one shows what going back to it changes. */
+export function openVersions(x: number, y: number): void {
+  void versions().then((all) => chooseAt(x, y, all.length === 0 ? [{ label: "nothing has been published from here yet", off: true }] : [
+    { label: "go back to", head: true },
+    // Newest first; the one that is the file as it stands is marked, and is nowhere to go back to.
+    ...all.map((v) => ({ label: v.name || "unnamed", value: v.hash, hint: `${new Date(v.at).toLocaleString()}${v.hash === useEdit.getState().file?.hash ? " · the file now" : ""}`, off: v.hash === useEdit.getState().file?.hash })).reverse(),
+  ], (hash) => { const v = all.findLast((x) => x.hash === hash); if (v) void goBack(v); }, all.length > 8));
+}
+
 /** The versions that have been published, to see what one changed and go back to it. */
 export function VersionsButton() {
   return (
     <button type="button" aria-label="published versions" title="the versions that have been published: see what one changed, and go back to it" className="flex h-8 items-center gap-1.5 rounded-lg border border-line bg-panel px-2.5 text-[12px] text-dim hover:bg-muted hover:text-fg"
                 onClick={(e) => {
                   const r = e.currentTarget.getBoundingClientRect();
-                  void versions().then((all) => chooseAt(r.left, r.bottom + 4, all.length === 0 ? [{ label: "nothing has been published from here yet", off: true }] : [
-                    { label: "go back to", head: true },
-                    // Newest first; the one that is the file as it stands is marked, and is nowhere to go back to.
-                    ...all.map((v) => ({ label: v.name || "unnamed", value: v.hash, hint: `${new Date(v.at).toLocaleString()}${v.hash === useEdit.getState().file?.hash ? " · the file now" : ""}`, off: v.hash === useEdit.getState().file?.hash })).reverse(),
-                  ], (hash) => { const v = all.findLast((x) => x.hash === hash); if (v) void goBack(v); }, all.length > 8));
+                  openVersions(r.left, r.bottom + 4);
                 }}>
           <History size={13} />versions
     </button>
@@ -375,6 +380,9 @@ export function Picker() {
 }
 
 /** The one menu the canvas uses: a list of choices under what was clicked, searchable once it is long. */
+/** The icons a choice can stand behind, by the name it asks for one with. */
+const ICONS = { plus: Plus, rotate: RefreshCw, bin: Trash2, split: Split, users: Users };
+
 export function Menu() {
   const m = useEdit((s) => s.choosing);
   const [q, setQ] = useState("");
@@ -383,7 +391,8 @@ export function Menu() {
   const long = m.search === true || m.items.filter((i) => !i.head).length > 8;
   const fits = m.items.filter((i) => i.head || i.label.toLowerCase().includes(q.trim().toLowerCase()));
   // A heading with nothing left under it goes too.
-  const shown = fits.filter((i, k) => !i.head || (fits[k + 1] !== undefined && !fits[k + 1]!.head));
+  // A rule between groups stays while anything follows it.
+  const shown = fits.filter((i, k) => !i.head || (fits[k + 1] !== undefined && (i.label === "" || !fits[k + 1]!.head)));
   // A name typed that is not one of the choices can be made, where the list says how.
   const typed = q.trim();
   const make = m.create && typed !== "" && !m.items.some((i) => !i.head && (i.value ?? i.label) === typed) ? m.create : null;
@@ -391,31 +400,34 @@ export function Menu() {
     <div className="fixed inset-0 z-50" onClick={closeMenu} onKeyDown={(e) => { if (e.key === "Escape") closeMenu(); }}>
       <div role="menu" className="absolute min-w-44 max-w-sm rounded-xl border border-line bg-panel p-1.5 shadow-2xl" onClick={(e) => e.stopPropagation()}
            style={{ left: Math.min(m.x, innerWidth - 300), ...(m.y + 340 > innerHeight ? { bottom: innerHeight - m.y + 34 } : { top: m.y }) }}>
-        {long && <input autoFocus aria-label="filter" placeholder={m.search ? "find a rule, an action, a name or a model…" : "filter…"} value={q} onChange={(e) => setQ(e.target.value)}
+        {long && <input autoFocus aria-label="filter" placeholder={m.ask ?? (m.search ? "find a rule, an action, a name or a model…" : "filter…")} value={q} onChange={(e) => setQ(e.target.value)}
                         onKeyDown={(e) => {
                           const first = shown.find((i) => !i.head && !i.off && i.value?.charCodeAt(0) !== 0);
                           if (e.key !== "Enter") return;
                           // What was typed wins over a near match: a new name is what typing one is for.
                           if (make) { closeMenu(); make.make(typed); } else if (first) { closeMenu(); m.onPick(first.value ?? first.label); }
                         }} className="mb-1 h-8 w-full rounded-md border border-line bg-bg px-2 text-[12px] focus:border-accent focus:outline-none" />}
-        <div className="max-h-72 overflow-auto">
+        <div className="menu-list max-h-[min(26rem,70vh)] overflow-auto">
           {make && (
             <button role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-accent hover:bg-line/60" onClick={() => { closeMenu(); make.make(typed); }}>
               <Plus size={12} />{make.says} <span className={mono}>{typed}</span><span className="ml-auto text-[10px] text-dim">Enter</span>
             </button>
           )}
-          {!make && shown.length === 0 && <div className="px-2 py-1.5 text-[12px] text-dim">nothing by that name</div>}
+          {!make && shown.length === 0 && !m.ask && <div className="px-2 py-1.5 text-[12px] text-dim">nothing by that name</div>}
           {shown.map((i, k) => i.head ? (
-            <div key={k} className="px-2 pb-0.5 pt-2 text-[10px] uppercase tracking-wide text-dim">{i.label}</div>
+            i.label === "" ? <div key={k} className="mx-1 my-1 border-t border-line" />
+              : <div key={k} className="px-2 pb-0.5 pt-2 text-[10px] uppercase tracking-wide text-dim">{i.label}</div>
           ) : (
             <button key={k} role="menuitem" autoFocus={!long && k === m.items.findIndex((x) => !x.head)} disabled={i.off}
                     className={cx("flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] hover:bg-line/60 focus:bg-line/60 focus:outline-none disabled:opacity-40", i.mono && mono, i.danger && "text-bad", i.on && "font-medium")}
                     onClick={() => { closeMenu(); m.onPick(i.value ?? i.label); }}>
+              {i.icon && (() => { const Icon = ICONS[i.icon!]; return <Icon size={13} className={cx("shrink-0", i.danger ? "text-bad" : "text-dim")} />; })()}
               {/* What a choice is comes first and whole; what it means sits under it. */}
               <span className="min-w-0 flex-1">
                 <span className="block truncate">{i.label}</span>
                 {i.hint && <span className="block whitespace-normal font-sans text-[11px] font-normal text-dim">{i.hint}</span>}
               </span>
+              {i.aside && <span className="shrink-0 pl-3 font-sans text-[11px] font-normal text-dim">{i.aside}</span>}
               {i.on && <span className="shrink-0 text-accent">✓</span>}
             </button>
           ))}
