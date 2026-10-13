@@ -15,7 +15,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { parseArgs } from "node:util";
 
-import { ConfigError, loadConfig, parseConfig } from "./config.js";
+import { CONFIG_VERSION, ConfigError, loadConfig, parseConfig } from "./config.js";
 import { mayLeave } from "./route.js";
 import { writeFileAtomic } from "./configfile.js";
 import { LEVELS, createLogger, type Level } from "./log.js";
@@ -51,6 +51,7 @@ function starterConfig(backendUrl: string, found: boolean): string {
 # sends something to it. Nothing leaves this machine by default.
 #
 # Every setting: https://github.com/Vcvzgbzz/hearth/blob/main/docs/configuration.md
+version: ${CONFIG_VERSION}
 name: ${JSON.stringify(hostnameGuess())}
 
 listen:
