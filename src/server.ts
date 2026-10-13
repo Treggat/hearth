@@ -2,15 +2,16 @@
  * The HTTP surface: OpenAI-compatible `/v1/*` (clients change only a base url) and the `/peer/*`
  * protocol. Bodies stream through untouched; only the model id and stream flag are read.
  */
+import { isIP } from "node:net";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { pipeline as pipeline_ } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 
 import { actionDecls, runAction, type Action, type ActionFacts } from "./actions.js";
-import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
+import { admitModel, inScope, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import { createCanary, degradedError, type RelayWatch } from "./canary.js";
 import { ANY, backendAuth, backendBase, ConfigError, flowsFor, resolveSecret, peersMapping, WARM_LANE, type BackendConfig, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
 import { Controls } from "./controls.js";
@@ -26,7 +27,7 @@ import { DAY_MS, History } from "./history.js";
 import { KEEP_DAYS, meter, Usage, withoutUsage, type Meter } from "./usage.js";
 import { Answers } from "./answers.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
-import { CONSOLE_HTML } from "./ui.js";
+import { CONSOLE_CSP, CONSOLE_HTML } from "./ui.js";
 import { createViews, type CallerUse, type KeyInfo, type Spent } from "./views.js";
 import { multipartField, replaceMultipartField } from "./multipart.js";
 import { relayAnthropic, toAnthropic } from "./anthropic.js";
@@ -109,6 +110,11 @@ const HOP_BY_HOP = new Set([
   "host",
 ]);
 
+const NO_OPERATOR = "this node has no operator yet: open the console on the machine itself, or run `hearth set-operator <user> <pass>` there";
+
+/** The shape of the history file this build writes, and the latest it reads. */
+const HISTORY_VERSION = 1;
+
 /** Said to a caller whose own key was fine: a 401 passed on from the backend would read as this node refusing them. */
 const KEY_REFUSED = "the backend refused the key this node sends it; the key you sent this node was accepted";
 const refusedKey = (status: number): boolean => status === 401 || status === 403;
@@ -118,7 +124,9 @@ function forwardable(
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(headers)) {
-    if (v === undefined || HOP_BY_HOP.has(k.toLowerCase())) continue;
+    const name = k.toLowerCase();
+    // Cookies belong to this node's own origin: a backend is neither shown the operator's session nor able to set one.
+    if (v === undefined || HOP_BY_HOP.has(name) || name === "cookie" || name === "set-cookie") continue;
     out[k] = v;
   }
   return out;
@@ -126,7 +134,7 @@ function forwardable(
 
 export interface HearthNode {
   server: Server;
-  /** The local backends and their queues. One entry unless `backends:` is used. */
+  /** The local backends and their queues. One entry unless `backends:` is used. The node's own machinery, as are the next two: not held steady between releases. */
   pool: BackendPool;
   peers: PeerRegistry;
   history: History;
@@ -212,11 +220,16 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   const peerOverLimit = (name: string) => overBudget(peerHits, name, cfg.peerRateLimit);
   const controlOverLimit = (name: string) => overBudget(controlHits, name, CONTROL_LIMIT_PER_HOUR);
 
+  /** Is this a name some flow takes, here or in a router's rulebook? */
+  const isType = (name: string): boolean =>
+    [cfg.flows, ...Object.values(cfg.routers).map((r) => r.flows)].some((flows) => Object.values(flows).some((f) => f.inputs.includes(name)));
+
   /** The gates every model request passes before it is queued; throws the Refusal. */
   function admit(c: Call, model: string): void {
     const refused = admitModel({ model, peer: c.peer, scope: c.models }, {
       name: cfg.name,
       shared,
+      type: isType,
       // A peer may map an id nothing here serves.
       unknown: (m) => pool.certainlyUnknown(m) && peersMapping(m, [], cfg.peers).length === 0
         ? pool.catalog().join(", ") || "nothing"
@@ -237,7 +250,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     let cost = 0;
     for (const [model, row] of Object.entries(usage.byModel(caller, days))) {
       const p = cfg.models[model]?.price;
-      if (p) cost += (row.in * p.in + row.out * p.out) / 1_000_000;
+      const cached = Math.min(row.cached ?? 0, row.in);
+      if (p) cost += ((row.in - cached) * p.in + cached * (p.cached ?? p.in) + row.out * p.out) / 1_000_000;
     }
     return { ...usage.total(caller, days), cost };
   }
@@ -310,11 +324,14 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
   async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readBody(req, cfg.maxBodyBytes);
+    let body: unknown;
     try {
-      return JSON.parse(raw.toString()) as Record<string, unknown>;
+      body = JSON.parse(raw.toString());
     } catch (e) {
       throw new Refusal(400, `body was not JSON: ${String(e)}`);
     }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Refusal(400, "body must be a JSON object");
+    return body as Record<string, unknown>;
   }
 
   /** Answer any failure with its status, or end a response already under way. */
@@ -456,7 +473,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     log.info("request", {
       ...(asking.getStore() ? { id: asking.getStore()!.id } : {}),
       ...fields,
-      ...(used ? { tokensIn: used.in, tokensOut: used.out, ...(used.est ? { tokensEstimated: true } : {}) } : {}),
+      ...(used ? { tokensIn: used.in, tokensOut: used.out, ...(used.cached ? { tokensCached: used.cached } : {}), ...(used.est ? { tokensEstimated: true } : {}) } : {}),
       ...(headers ? { headers } : {}),
       waitedMs: started - t.enqueuedAt,
       runMs: Date.now() - started,
@@ -1064,18 +1081,36 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   /**
    * Refuse a write carrying a foreign `Origin`: any web page can POST to loopback, and loopback is
-   * trusted. curl, peers and apps send no Origin and are unaffected.
+   * trusted. curl, peers and apps send no Origin and are unaffected. `null` is what a sandboxed
+   * frame or a redirected form sends, and is as foreign as any other.
    */
   function crossOriginWrite(req: IncomingMessage): boolean {
     if (req.method === "GET" || req.method === "HEAD") return false;
     const origin = req.headers.origin;
-    if (origin === undefined || origin === "null") return false;
+    if (origin === undefined) return false;
     try {
       return new URL(origin).host !== req.headers.host;
     } catch {
       // An Origin we cannot parse is not one we can vouch for.
       return true;
     }
+  }
+
+  /**
+   * A loopback caller that asked for this node by a name: a page elsewhere whose name was
+   * re-pointed at 127.0.0.1, which the address gate would take for this machine. An address
+   * cannot be re-pointed, and `localhost` never leaves the machine.
+   */
+  function reboundHost(req: IncomingMessage): boolean {
+    const host = req.headers.host;
+    if (host === undefined || !isLoopback(req)) return false;
+    let name: string;
+    try {
+      name = new URL(`http://${host}`).hostname;
+    } catch {
+      return true;
+    }
+    return !(name.startsWith("[") || isIP(name) !== 0 || name === "localhost" || name.endsWith(".localhost"));
   }
 
   /** Forwardable headers, minus an Authorization that is our own api key. */
@@ -1201,7 +1236,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     { path: "/queue/events", methods: ["GET"], auth: "local", handler: routeQueueEvents },
 
     // Mint and revoke write the config file, and the node follows it at once.
-    { path: ["/keys/mint", "/keys/revoke"], methods: ["POST"], auth: "local", handler: routeKeys },
+    { path: ["/keys/mint", "/keys/revoke", "/keys/rotate"], methods: ["POST"], auth: "local", handler: routeKeys },
     { path: "/usage", methods: ["GET"], auth: "local", handler: routeUsage },
     { path: "/backends/probe", methods: ["POST"], auth: "local", handler: routeProbe },
 
@@ -1216,7 +1251,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Login and logout take no credential by definition; cross-origin POSTs are refused above.
     { path: "/login", methods: ["POST"], auth: "open", handler: routeLogin },
     { path: "/logout", methods: ["POST"], auth: "open", handler: routeLogout },
-    // First run: whoever reaches the console before an operator exists creates one. Closed after.
+    // First run: the console creates the first operator, from this machine or with a full key. Closed after.
     { path: "/setup", methods: ["GET", "POST"], auth: "open", handler: routeSetup },
 
     // A bare address typed into a browser lands on the console instead of a 401.
@@ -1254,6 +1289,12 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Before anything is routed, because it is a fact about the REQUEST rather
     // than about any one path: a browser on some other site's page must not be
     // able to POST here just because loopback is trusted.
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (reboundHost(req)) {
+      log.warn("request.rebound_host", { path, method: req.method, host: req.headers.host });
+      apiError(res, 403, "on this machine, this node answers at localhost or an IP address, not at a name", "permission_error");
+      return;
+    }
     if (crossOriginWrite(req)) {
       log.warn("request.cross_origin", { path, method: req.method, origin: req.headers.origin });
       apiError(res, 403, "cross-origin writes are refused", "permission_error");
@@ -1385,6 +1426,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       apiError(res, 400, `body was not JSON: ${String(e)}`);
       return;
     }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      apiError(res, 400, "body must be a JSON object");
+      return;
+    }
     // Strict booleans. A missing field means "leave it", so accepting a
     // truthy string here would make `{"lending":"false"}` turn lending ON —
     // the exact opposite of what someone typing that in a hurry wants.
@@ -1405,6 +1450,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       for (const [model, want] of Object.entries(body.share as Record<string, unknown>)) {
         if (want !== true && want !== false && want !== null) {
           apiError(res, 400, `share.${model} must be true, false or null`);
+          return;
+        }
+        if (want === true && catalog.includes(model) && pool.for(model).cfg.cloud) {
+          apiError(res, 400, `cannot lend "${model}": it runs on a cloud backend, and a peer's requests would spend that provider's key`);
           return;
         }
         if (want === true && !catalog.includes(model)) {
@@ -1706,9 +1755,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
   }
 
-  // The keys page's two writes: mint appends one entry, revoke removes one. Both land in the
-  // config file through the same patch path every other config change uses, and take effect at
-  // once. The plaintext comes back once, in the mint's answer.
+  // The keys page's writes: mint appends one entry, revoke removes one, rotate gives one a new
+  // secret and keeps the rest of it. Each lands in the config file through the same patch path
+  // every other config change uses, and takes effect at once. A plaintext comes back once, in
+  // the answer of the mint or the rotate that made it.
   async function routeKeys(c: Call): Promise<void> {
     try {
       const body = await readJson(c.req);
@@ -1735,6 +1785,17 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       }
       const i = cfg.apiKeyLabels.indexOf(label);
       if (i < 0) throw new Refusal(404, `no key labeled ${label}`);
+      if (c.path === "/keys/rotate") {
+        // Only the secret changes: its label, and so its router, scope, limits and usage, stay.
+        const written = ((config.text().doc as { apiKeys?: unknown[] } | null)?.apiKeys ?? [])[i];
+        const was = typeof written === "object" && written !== null ? (written as { key?: unknown }).key : written;
+        if (typeof was === "string" && was.startsWith("env:")) throw new Refusal(409, `${label} reads its key from the environment (${was}): change it there`);
+        const key = "hkey_" + randomBytes(20).toString("hex");
+        const commit = config.patch({ ops: [{ path: ["apiKeys", i, "key"], value: key }] });
+        log.info("keys.rotated", { label, id: keyId(key), caller: c.caller });
+        json(c.res, 200, { key, label, rotated: true, restartPending: commit.restartPending });
+        return;
+      }
       const commit = config.patch({ ops: [{ path: ["apiKeys", i], delete: true }] });
       keySeen.delete("key:" + label);
       log.info("keys.revoked", { label, caller: c.caller });
@@ -1887,6 +1948,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return;
   }
 
+  /** A model as the OpenAI API lists one: clients that check an answer's shape look for `object`. */
+  const asModel = <T extends { id: string }>(m: T) => ({ object: "model" as const, owned_by: cfg.name, ...m });
+
   async function routeModels(c: Call): Promise<void> {
     const { res } = c;
     const modelsPeer = c.peer;
@@ -1960,7 +2024,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       }
       // Same for a scoped key: its picker shows what it may pick.
       if (c.models !== null) {
-        upstream.data = (upstream.data ?? []).filter((m) => c.models!.includes(m.id));
+        upstream.data = (upstream.data ?? []).filter((m) => inScope(c.models!, m.id, isType));
       }
       // /v1/models/<id>: one entry from the same list, so a peer model answers
       // here too instead of falling through to the passthrough and asking a
@@ -1972,10 +2036,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           apiError(res, 404, `no model "${want}"`, "invalid_request_error");
           return;
         }
-        json(res, 200, one);
+        json(res, 200, asModel(one));
         return;
       }
-      json(res, 200, upstream);
+      json(res, 200, { object: "list", data: upstream.data!.map(asModel) });
     } catch (e) {
       apiError(res, 502, `backend unreachable: ${String(e)}`, "server_error");
     }
@@ -2067,7 +2131,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** The operator login: verify against the config's hash, mint a session, set the cookie. */
   async function routeLogin(c: Call): Promise<void> {
     if (!cfg.operator) {
-      json(c.res, 404, { error: "no operator login is configured on this node" });
+      json(c.res, 404, { error: NO_OPERATOR });
       return;
     }
     let body: Record<string, unknown>;
@@ -2113,12 +2177,18 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   /** GET says whether the node still needs its first operator; POST creates it and signs it in. */
   async function routeSetup(c: Call): Promise<void> {
+    // Creating the operator is taking the node: only a caller who already holds all of it may.
+    const may = isLoopback(c.req) || localCaller(c.req)?.models === null;
     if (c.req.method === "GET") {
-      json(c.res, 200, { needed: cfg.operator === null });
+      json(c.res, 200, { needed: cfg.operator === null && may });
       return;
     }
     if (cfg.operator) {
       json(c.res, 409, { error: "this node already has an operator — log in instead" });
+      return;
+    }
+    if (!may) {
+      json(c.res, 403, { error: NO_OPERATOR });
       return;
     }
     let body: unknown;
@@ -2160,7 +2230,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     json(c.res, 200, { ok: true });
   }
 
-  /** A caller id like `operator:jadeyn` is the login the page can show and sign out of. */
+  /** A caller id like `operator:admin` is the login the page can show and sign out of. */
   const opOf = (caller: string): string | null => (caller.startsWith("operator:") ? caller.slice(9) : null);
 
   async function routeUi(c: Call): Promise<void> {
@@ -2594,6 +2664,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       "Content-Length": Buffer.byteLength(html),
       // It is a live status page; a cached copy is a lie.
       "Cache-Control": "no-store",
+      "Content-Security-Policy": CONSOLE_CSP,
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
     });
     res.end(html);
   }
@@ -2612,14 +2685,20 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   });
 
   /** Expired sessions, swept like any other in-memory state; unref'd so it never holds the process. */
-  const sessionSweep = setInterval(() => { sessions.prune(); }, 30 * 60_000);
+  const sessionSweep = setInterval(() => { sessions.prune(); loginThrottle.prune(); }, 30 * 60_000);
   sessionSweep.unref?.();
 
   /** The day of history and recent logs, read once at start and written every minute and at close. */
   function loadHistory(): void {
     if (!cfg.historyFile || !existsSync(cfg.historyFile)) return;
     try {
-      const saved = JSON.parse(readFileSync(cfg.historyFile, "utf8")) as { history?: unknown; logs?: unknown; lastUse?: unknown; usage?: unknown };
+      const saved = JSON.parse(readFileSync(cfg.historyFile, "utf8")) as { v?: unknown; history?: unknown; logs?: unknown; lastUse?: unknown; usage?: unknown };
+      // A later hearth's file is set aside whole rather than half-read and then written over.
+      if (typeof saved.v === "number" && saved.v > HISTORY_VERSION) {
+        renameSync(cfg.historyFile, `${cfg.historyFile}.v${saved.v}`);
+        log.warn("history.newer", { path: cfg.historyFile, version: saved.v, reads: HISTORY_VERSION, keptAs: `${cfg.historyFile}.v${saved.v}` });
+        return;
+      }
       history.restore(saved.history);
       usage.restore(saved.usage);
       logs.restore(saved.logs);
@@ -2633,7 +2712,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   function saveHistory(): void {
     if (!cfg.historyFile) return;
     try {
-      writeFileAtomic(cfg.historyFile, JSON.stringify({ v: 1, history: history.snapshot(), logs: logs.all(), lastUse: Object.fromEntries(lastUse), usage: usage.snapshot() }));
+      writeFileAtomic(cfg.historyFile, JSON.stringify({ v: HISTORY_VERSION, history: history.snapshot(), logs: logs.all(), lastUse: Object.fromEntries(lastUse), usage: usage.snapshot() }));
       historyWarned = false;
     } catch (e) {
       // Once per failure streak: a read-only path must not fill the journal every minute.

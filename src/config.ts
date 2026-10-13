@@ -307,7 +307,7 @@ export interface ModelRoute {
   /** Tokens the model's running requests share (vLLM's KV cache, llama.cpp `--kv-unified`); `output` caps each request's counted `max_tokens`, null counts it whole. */
   pool: { tokens: number; output: number | null } | null;
   /** What a million tokens in and out cost, in dollars, where using this model is paid for. null is not priced. */
-  price: { in: number; out: number } | null;
+  price: { in: number; out: number; cached?: number } | null;
   /** A turn shares the backend with this model's running turns only once each has run this long; unset never waits. */
   shareAfterMs?: number;
   /** How long an answer is kept for an identical request; unset or 0 keeps none. */
@@ -831,7 +831,9 @@ function flowDecls(
       if (last && (when !== null || skippable(to))) {
         throw bad(`${at}.steps`, "must end with a step that always applies: no `when`, and somewhere that can always answer (a model, a flow or refuse)");
       }
-      if (!last && when === null && max === undefined && !skippable(to)) throw bad(here, "has no `when`, so the steps after it can never be reached");
+      // A model here can fail before it answers, and the next line is where the request goes then.
+      const mayFail = "model" in to && !("peer" in to);
+      if (!last && when === null && max === undefined && !skippable(to) && !mayFail) throw bad(here, "has no `when`, so the steps after it can never be reached");
       for (const end of "fastest" in to ? to.fastest : "peer" in to ? [to] : []) {
         if (!("peer" in end)) continue;
         const peer = peers.find((x) => x.name === end.peer);
@@ -893,12 +895,15 @@ function modelConcurrency(entry: Record<string, unknown>, id: string): number | 
   return count(entry.concurrency, `models.${id}.concurrency`, 1, 1);
 }
 
-/** `price: { in: 3, out: 15 }`: dollars per million tokens. */
+/** `price: { in: 3, out: 15, cached: 0.3 }`: dollars per million tokens; `cached` is for input read from the provider's prompt cache. */
 function modelPrice(v: unknown, id: string): ModelRoute["price"] {
   if (v === undefined || v === null) return null;
   const p = asRecord(v, `models.${id}.price`);
   only(p, "price", `models.${id}.price`);
-  return { in: atLeast(p.in, `models.${id}.price.in`, 0), out: atLeast(p.out, `models.${id}.price.out`, 0) };
+  return {
+    in: atLeast(p.in, `models.${id}.price.in`, 0), out: atLeast(p.out, `models.${id}.price.out`, 0),
+    ...(p.cached !== undefined ? { cached: atLeast(p.cached, `models.${id}.price.cached`, 0) } : {}),
+  };
 }
 
 /** `pool: 144000`, or `pool: { tokens: 144000, output: 8192 }`. */
@@ -955,6 +960,17 @@ export interface KeyRule {
   dollarsPerDay: number;
 }
 const NO_RULE: KeyRule = { expires: null, requestsPerMinute: 0, tokensPerDay: 0, dollarsPerDay: 0 };
+
+/** Every name a flow takes, in `flows:` and in each router's: what a client may ask for besides a model. Read off the file as written. */
+function typeNames(root: Record<string, unknown>): string[] {
+  const inputsOf = (flows: unknown): string[] =>
+    Object.values(typeof flows === "object" && flows !== null ? flows : {}).flatMap((f) => {
+      const inputs = (f as { inputs?: unknown } | null)?.inputs;
+      return Array.isArray(inputs) ? inputs.filter((n): n is string => typeof n === "string" && n !== ANY) : [];
+    });
+  const routers = typeof root.routers === "object" && root.routers !== null ? Object.values(root.routers) : [];
+  return [...inputsOf(root.flows), ...routers.flatMap((r) => inputsOf((r as { flows?: unknown } | null)?.flows))];
+}
 
 /** `apiKeys:` entries: a bare secret, or `{ key, label }`. Labels are shown wherever caller ids are. */
 function apiKeyList(
@@ -1017,7 +1033,7 @@ function apiKeyList(
       if (scope.length === 0) throw bad(`${at}.models`, "must name at least one model");
       for (const id of scope) {
         if (!routeIds.has(id)) {
-          throw bad(`${at}.models`, `names "${id}", which is not a route in models:`);
+          throw bad(`${at}.models`, `names "${id}", which is not a route in models: or a name a flow takes`);
         }
       }
     }
@@ -1297,8 +1313,18 @@ function canaryDecl(v: unknown, backends: readonly BackendConfig[]): CanaryConfi
   };
 }
 
+/** The layout of hearth.yaml this build reads and writes. A file that names a later one is refused, never half-read. */
+export const CONFIG_VERSION = 3;
+
 export function parseConfig(raw: unknown): HearthConfig {
   const root = asRecord(raw, "config");
+  if (root.version !== undefined) {
+    const version = count(root.version, "version", CONFIG_VERSION, 1);
+    if (version > CONFIG_VERSION) {
+      throw bad("version", `is ${version}, a layout newer than this hearth reads (${CONFIG_VERSION}) — upgrade hearth, or restore the file an older one wrote`);
+    }
+    if (version < CONFIG_VERSION) throw bad("version", `is ${version}, an older layout — run \`hearth migrate\` to rewrite it; the original is kept beside it`);
+  }
   const v1 = v1Marker(root);
   if (v1 !== null) {
     throw new ConfigError(null, `this hearth.yaml is in the v1 layout (it has ${v1}) — run \`hearth migrate\` to rewrite it; the original is kept beside it`);
@@ -1620,8 +1646,25 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
   }
 
+  // A provider answers for its own models, and every probe of one would be billed.
+  const canary = canaryDecl(root.canary, backends);
+  for (const name of Object.keys(canary?.backends ?? {})) {
+    if (backends.find((b) => b.name === name)?.cloud) throw bad(`canary.backends.${name}`, "is a cloud backend: the canary does not probe a provider's models");
+  }
+  for (const id of Object.keys(canary?.models ?? {})) {
+    const on = backends.find((b) => b.name === models[id]?.backend) ?? backends.find((b) => b.serves.includes(id));
+    if (on?.cloud) throw bad(`canary.models.${id}`, `runs on the cloud backend "${on.name}": the canary does not probe a provider's models`);
+  }
+
+  // A provider's model is not ours to lend: a peer's requests would be paid for with this node's key.
+  const lent = strList(lending.models, "lending.models");
+  for (const id of lent) {
+    const on = backends.find((b) => b.name === models[id]?.backend) ?? backends.find((b) => b.serves.includes(id));
+    if (on?.cloud) throw bad("lending.models", `names "${id}", which runs on the cloud backend "${on.name}": lending it would spend that provider's key on a peer's requests`);
+  }
+
   const { keys: apiKeys, labels: apiKeyLabels, models: apiKeyModels, rules: apiKeyRules } =
-    apiKeyList(root.apiKeys, "apiKeys", new Set(Object.keys(models)));
+    apiKeyList(root.apiKeys, "apiKeys", new Set([...Object.keys(models), ...typeNames(root)]));
 
   const mainListen = {
     // Loopback by default. Anyone who wants it on the network says so, and
@@ -1679,7 +1722,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     apiKeyRules,
     peerTokens,
     operator,
-    share: strList(lending.models, "lending.models"),
+    share: lent,
     notes,
     peerRateLimit: count(lending.rateLimit, "lending.rateLimit", 600, 1),
     peerLane: (() => {
@@ -1701,7 +1744,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     maxBodyBytes: count(root.maxBodyBytes, "maxBodyBytes", 32 * 1024 * 1024, 1024),
     peers,
     models,
-    canary: canaryDecl(root.canary, backends),
+    canary,
     peerFreshMs: count(borrowing.freshMs, "borrowing.freshMs", 4_000, 100),
     peerDownMs: count(borrowing.downMs, "borrowing.downMs", 30_000, 1000),
     // Slower than it used to be, since on-demand probing does the real work.

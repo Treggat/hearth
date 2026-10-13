@@ -176,6 +176,68 @@ export function directTo(name: string, flow: { inputs: string[]; steps: { when?:
 }
 
 /**
+ * A flow that is only an order to try places in: no name enters it and no line of it tests
+ * anything, so each line is where the request goes when the one above fails. The canvas draws it
+ * as a node beside the first line that hands to it, not as a rule.
+ */
+export function orderOf(flow: { inputs: string[]; off?: boolean; sticky?: number; steps: { when?: unknown; to?: unknown; lane?: unknown; params?: unknown; do?: unknown; max?: unknown }[] }): End[] | null {
+  if (flow.inputs.length !== 0 || flow.steps.length < 2 || flow.off === true || flow.sticky !== undefined) return null;
+  const ends: End[] = [];
+  for (const s of flow.steps) {
+    const to = toOf(s.to);
+    const bare = (!isObj(s.when) || Object.keys(s.when).length === 0) && !s.lane && !isObj(s.params) && list(s.do).length === 0 && s.max === undefined;
+    if (!bare || (to.kind !== "model" && to.kind !== "peer")) return null;
+    ends.push(to);
+  }
+  return ends;
+}
+
+/**
+ * Give step `i` of a flow somewhere to go when the place it sends work fails: the line hands to an
+ * order of its own, the place it named first and `to` after it. Null when the line names no one place.
+ */
+export function thenTry(doc: Doc, flow: string, i: number, to: To): Doc | null {
+  const steps = stepsOf(doc, flow);
+  const first = steps?.[i] ? toOf(steps[i]!.to) : null;
+  if (!steps || !first || (first.kind !== "model" && first.kind !== "peer") || (to.kind !== "model" && to.kind !== "peer")) return null;
+  if (JSON.stringify(rawTo(first)) === JSON.stringify(rawTo(to))) return null;
+  const base = `${first.kind === "model" ? first.model : first.model ?? first.peer}-then`;
+  let name = base;
+  for (let n = 2; isObj(obj(doc.flows)[name]); n++) name = `${base}-${n}`;
+  // An order answers the same requests as the rule that hands to it.
+  const takes = list(obj(obj(doc.flows)[flow]).takes);
+  const made = put(doc, "flows", name, { inputs: [], ...(takes.length ? { takes } : {}), steps: [{ to: rawTo(first) }, { to: rawTo(to) }] });
+  return withSteps(made, flow, steps.map((s, k) => (k === i ? { ...s, to: { flow: name } } : s)));
+}
+
+/** Add a place to the end of an order. */
+export function addPlace(doc: Doc, order: string, to: To): Doc | null {
+  const steps = stepsOf(doc, order);
+  return steps && (to.kind === "model" || to.kind === "peer") ? withSteps(doc, order, [...steps, { to: rawTo(to) }]) : null;
+}
+
+/** Try place `k` of an order one place sooner. */
+export function raisePlace(doc: Doc, order: string, k: number): Doc {
+  const steps = stepsOf(doc, order);
+  if (!steps || k < 1 || !steps[k]) return doc;
+  return withSteps(doc, order, steps.map((s, n) => (n === k - 1 ? steps[k]! : n === k ? steps[k - 1]! : s)));
+}
+
+/**
+ * Take place `k` out of an order. With one place left there is nothing to fall back to, so the
+ * order goes too and every line that handed to it names that place again.
+ */
+export function dropPlace(doc: Doc, order: string, k: number): Doc {
+  const steps = stepsOf(doc, order);
+  if (!steps || !steps[k]) return doc;
+  const left = steps.filter((_, n) => n !== k);
+  if (left.length > 1) return withSteps(doc, order, left);
+  const flows = Object.fromEntries(Object.entries(obj(doc.flows)).filter(([name]) => name !== order).map(([name, f]) => [name, Array.isArray(obj(f).steps)
+    ? { ...obj(f), steps: (obj(f).steps as unknown[]).map((s) => (isObj(obj(s).to) && (obj(s).to as Doc).flow === order ? { ...obj(s), to: left[0]!.to } : s)) } : f]));
+  return { ...doc, flows };
+}
+
+/**
  * What becomes of a name no flow takes: every one runs as itself (`asked`), every one is turned
  * away (`refuse`), a flow with lines of its own decides (`rule`), or the draft has yet to say (`none`).
  */
@@ -237,6 +299,9 @@ export const TEMPLATES: { label: string; hint: string; name: string; steps: Doc[
 
 /** A rule or an action taken out of the draft. An action goes from every line that ran it too, so the file still loads. */
 export function removed(doc: Doc, section: "flows" | "actions", id: string): Doc {
+  // An order taken out leaves its first place behind: every line that handed to it goes straight there.
+  const steps = section === "flows" ? stepsOf(doc, id) : null;
+  if (steps && orderOf({ ...obj(obj(doc.flows)[id]), inputs: list(obj(obj(doc.flows)[id]).inputs), steps })) return steps.slice(1).reduce<Doc>((d) => dropPlace(d, id, 1), doc);
   const gone = put(doc, section, id, undefined);
   if (section !== "actions") return gone;
   return linesRunning(gone, id).reduce<Doc>((d, [rule, i]) => withDo(d, rule, i, id, false) ?? d, gone);
@@ -262,7 +327,9 @@ export function renamed(doc: Doc, section: "flows" | "actions", from: string, to
   const flows = Object.fromEntries(Object.entries(section === "flows" ? Object.fromEntries(Object.entries(all).map(([n, f]) => [n === from ? to : n, f])) : obj(doc.flows))
     .map(([n, f]) => [n, Array.isArray(obj(f).steps) ? { ...obj(f), steps: (obj(f).steps as unknown[]).map((s) => step(obj(s))) } : f]));
   const kind = section === "flows" ? "flow" : "action";
-  const layout = Object.fromEntries(Object.entries(obj(doc.layout)).map(([id, at]) => [id === `routing/${kind}:${from}` ? `routing/${kind}:${to}` : id, at]));
+  // A rule drawn as an order was placed under that node's id, and keeps its place the same way.
+  const moved = (id: string) => (id === `routing/${kind}:${from}` ? `routing/${kind}:${to}` : section === "flows" && id === `routing/inorder:${from}` ? `routing/inorder:${to}` : id);
+  const layout = Object.fromEntries(Object.entries(obj(doc.layout)).map(([id, at]) => [moved(id), at]));
   return {
     ...doc, flows,
     ...(section === "actions" ? { actions: Object.fromEntries(Object.entries(all).map(([n, a]) => [n === from ? to : n, a])) } : {}),
@@ -386,6 +453,8 @@ export const NODES: Record<string, NodeKind> = {
     outlet: (doc, id, handle) => {
       const i = Number(/^step-(\d+)/.exec(handle ?? "")?.[1] ?? NaN);
       const step = stepsOf(doc, id)?.[i];
+      // `step-<n>-then`: not where the line goes, but where it goes next when that fails.
+      if (step && /^step-\d+-then$/.test(handle ?? "")) return { when: obj(step.when), endsOnly: true, paths: list(obj(obj(doc.flows)[id]).takes).length > 0, send: (to) => thenTry(doc, id, i, to) };
       return step ? { when: obj(step.when), rule: id, paths: list(obj(obj(doc.flows)[id]).takes).length > 0, send: (to) => pointStep(doc, id, i, to), also: (a) => withDo(doc, id, i, a, true) } : null;
     },
   },
@@ -397,6 +466,16 @@ export const NODES: Record<string, NodeKind> = {
       const line = stepsOf(doc, flow)?.[step];
       const k = /^end-(\d+)/.exec(handle ?? "");
       return line ? { when: obj(line.when), endsOnly: true, paths: list(obj(obj(doc.flows)[flow]).takes).length > 0, send: (to) => pointEnd(doc, flow, step, k ? Number(k[1]) : null, to) } : null;
+    },
+  },
+  // An order to try places in: an outlet per place, `end-<k>`, and any other handle adds a place after the last.
+  // Its id is not `order:`, which is where the layout keeps the order of the types (RANK).
+  inorder: {
+    lands: (id) => ({ kind: "flow", flow: id }),
+    opens: (id) => ({ kind: "flow", id }),
+    outlet: (doc, id, handle) => {
+      const k = /^end-(\d+)/.exec(handle ?? "");
+      return stepsOf(doc, id) ? { when: null, endsOnly: true, paths: list(obj(obj(doc.flows)[id]).takes).length > 0, send: (to) => (to.kind !== "model" && to.kind !== "peer" ? null : k ? pointStep(doc, id, Number(k[1]), to) : addPlace(doc, id, to)) } : null;
     },
   },
   refuse: { opens: (id) => ({ kind: "flow", id: lineOf(id).flow }) },
@@ -451,6 +530,18 @@ export function beside(ends: string[], from: (end: string) => number[], step: nu
 }
 
 /**
+ * The room a box of `callers` chips takes: `cols` across at most, and never narrower than `least`, the
+ * card that stands under its middle, so the cards under boxes set side by side do not lie on each other.
+ * `inset` is where the first chip starts, which keeps a row narrower than the box in its middle.
+ */
+export function bayRoom(callers: number, chip: { w: number; h: number; gap: number; cols: number }, edge: { head: number; pad: number }, least: number): { cols: number; w: number; h: number; inset: number } {
+  const cols = Math.min(chip.cols, callers);
+  const row = cols * (chip.w + chip.gap) - chip.gap;
+  const w = Math.max(row + edge.pad * 2, least);
+  return { cols, w, h: edge.head + Math.ceil(callers / cols) * (chip.h + chip.gap) - chip.gap + edge.pad, inset: (w - row) / 2 };
+}
+
+/**
  * A draft as one router's rulebook: its flows stand as `flows`, and its map has places of its own
  * (kept as `routing@<router>/...`). With `null` the draft is its own view: the rules everyone else goes by.
  */
@@ -484,6 +575,53 @@ export const EVERYONE = "*";
 /** Who can be given a router: everyone else as one, whoever calls from this machine without a key, and each api key by its label. */
 export const callersIn = (doc: Doc): string[] =>
   [EVERYONE, "local", ...(Array.isArray(doc.apiKeys) ? doc.apiKeys : []).map((k) => text(obj(k).label)).filter(Boolean)];
+
+/** A row of one of the topology's menus: what it says, what choosing it means, and how it is drawn. */
+export type CallerChoice = { label: string; value?: string; aside?: string; icon?: "plus" | "rotate" | "bin"; head?: boolean; on?: boolean; danger?: boolean; mono?: boolean };
+
+/**
+ * The menu for a right-click among the callers. On one of them: which router its requests go by,
+ * with the one in force marked, and for a key what can be done with the key. On none (`null`),
+ * the frame they stand in: only what adds one. A heading with no label is a rule between groups.
+ */
+export function callerChoices(doc: Doc | null, id: string | null): CallerChoice[] {
+  const key = id !== null && id !== EVERYONE && id !== "local";
+  const at = doc && id !== null ? routerFor(doc, id) : null;
+  return [
+    ...(at && id !== null ? [
+      { label: `${id === EVERYONE ? "everyone else" : id} goes by`, head: true },
+      { label: "The default router", value: "to:", on: at.own && at.router === null },
+      ...Object.keys(obj(doc!.routers)).map((r) => ({ label: r, value: `to:${r}`, mono: true, on: at.own && at.router === r })),
+      // Everyone else is who the others follow, so it cannot follow.
+      ...(id === EVERYONE ? [] : [{ label: "Wherever everyone else goes", value: "follow", on: !at.own, aside: "moves with them" }]),
+      { label: "A new router…", value: "new-router", icon: "plus" as const },
+      { label: "", head: true },
+    ] : []),
+    ...(key ? [
+      { label: "its key", head: true },
+      { label: "Rotate…", value: "rotate", icon: "rotate" as const, aside: "a new secret, shown once" },
+      { label: "Revoke", value: "revoke", icon: "bin" as const, danger: true, aside: "stops working at once" },
+      { label: "", head: true },
+    ] : []),
+    ...(id === null ? [{ label: "callers", head: true }] : []),
+    { label: "New key…", value: "mint", icon: "plus" as const },
+  ];
+}
+
+/**
+ * The menu for a right-click on the empty part of the topology: everything the strip over the picture
+ * adds, by the section it joins (`add:<section>`), a provider, the published versions, and the view.
+ */
+export function paneChoices(kinds: { section: string; noun: string }[]): CallerChoice[] {
+  return [
+    { label: "add", head: true },
+    ...kinds.map((k) => ({ label: `New ${k.noun}…`, value: `add:${k.section}`, icon: "plus" as const })),
+    { label: "New provider…", value: "provider", icon: "plus" as const, aside: "an API on the internet" },
+    { label: "", head: true },
+    { label: "Versions…", value: "versions", aside: "published, and the way back" },
+    { label: "Fit everything in view", value: "fit" },
+  ];
+}
 
 /** The router a caller goes by, null for the default one. `own` is false where it only goes where everyone else does. */
 export function routerFor(doc: Doc, caller: string): { router: string | null; own: boolean } {
@@ -723,7 +861,8 @@ export function problems(doc: Doc, facts?: Facts): string[] {
       if (no) out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: ${no}`);
       for (const k of ["header", "headerNot"]) if ("" in obj(obj(s.when)[k])) out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: say which header it tests, by name.`);
       if (to.kind === "unset") out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: choose where it sends requests.`);
-      else if (!last && to.kind !== "peer" && typeof s.max !== "number" && Object.keys(obj(s.when)).length === 0) out.push(`Rule "${f.name}", line ${i + 1}: choose a condition, or the lines after it are never reached.`);
+      // In an order a line with nothing to test is the point: the next is where the request goes when it fails.
+      else if (!last && to.kind !== "peer" && typeof s.max !== "number" && Object.keys(obj(s.when)).length === 0 && orderOf({ ...obj(obj(doc.flows)[f.name]), inputs: f.inputs, steps: f.steps }) === null) out.push(`Rule "${f.name}", line ${i + 1}: choose a condition, or the lines after it are never reached.`);
       for (const a of list(s.do)) if (!isObj(obj(doc.actions)[a])) out.push(`Rule "${f.name}", ${last ? "the Otherwise line" : `line ${i + 1}`}: it runs the action "${a}", which is gone.`);
     });
   }

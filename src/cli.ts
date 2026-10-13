@@ -15,7 +15,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { parseArgs } from "node:util";
 
-import { ConfigError, loadConfig, parseConfig } from "./config.js";
+import { CONFIG_VERSION, ConfigError, loadConfig, parseConfig } from "./config.js";
 import { mayLeave } from "./route.js";
 import { writeFileAtomic } from "./configfile.js";
 import { LEVELS, createLogger, type Level } from "./log.js";
@@ -47,8 +47,11 @@ async function probeBackend(): Promise<string | null> {
 function starterConfig(backendUrl: string, found: boolean): string {
   return `# hearth: a queue in front of your inference server.
 #
-# Everything runs locally until you add a peer AND point a model at it. Nothing
-# leaves this machine by default.
+# Everything runs locally until you add a peer or a cloud backend AND a flow
+# sends something to it. Nothing leaves this machine by default.
+#
+# Every setting: https://github.com/Vcvzgbzz/hearth/blob/main/docs/configuration.md
+version: ${CONFIG_VERSION}
 name: ${JSON.stringify(hostnameGuess())}
 
 listen:
@@ -64,6 +67,13 @@ backends:
     # llama-swap reports what is loaded, which lets the scheduler prefer it.
     # Use none for a server that cannot say.
     kind: llama-swap
+  # A provider's API can be a backend too. A request sent to it leaves this
+  # machine and this network, so nothing goes there unless a flow says so.
+  # provider:
+  #   url: https://api.example.com/v1
+  #   cloud: true
+  #   key: env:PROVIDER_KEY
+  #   serves: [their-model]
 
 backendDefaults:
   # One GPU fits one model at a time. Only raise this if your backend really
@@ -82,8 +92,8 @@ scheduler:
     chat: { priority: 0 }     # a person is watching this
     batch: { priority: 100 }  # a render nobody is waiting on
 
-# The console is on /ui. Off this machine it asks for a login: the first visit
-# creates one, or set it with \`hearth set-operator <user> <pass>\`.
+# The console is on /ui. Off this machine it asks for a login: create one in the
+# console on this machine, or with \`hearth set-operator <user> <pass>\`.
 #
 # Keep the console's day of history and recent logs across restarts.
 # historyFile: /var/lib/hearth/history.json
@@ -92,6 +102,9 @@ scheduler:
 # reasonable while this is bound to loopback. Setting it means loopback needs a
 # key too, including any local tool you point at this.
 apiKeys: []
+#   - { key: env:APP_KEY, label: app }
+#   # A key can have a last day and limits, and \`models: [name]\` holds it to the names listed.
+#   - { key: env:GUEST_KEY, label: guest, expires: 2030-12-31, limits: { requestsPerMinute: 20, tokensPerDay: 200000 } }
 
 # --- lending and borrowing (both optional) ---------------------------------
 #
@@ -117,6 +130,8 @@ peers: {}
 models: {}
 #   my-big-model:
 #     note: the 70B, for long documents
+#   their-model:
+#     price: { in: 3, out: 15 }   # dollars per million tokens: usage is then shown as spend
 #
 # flows: what can be asked for, and where each request goes. Only a name a flow
 # takes is offered; the flow with "*" says what becomes of every other name.
@@ -136,21 +151,51 @@ flows:
 }
 
 function hostnameGuess(): string {
-  // node:os, not process.env.HOSTNAME. HOSTNAME is a bash shell variable and
-  // isn't exported, so it's missing under systemd, under `sh -c` and in Docker.
-  // This returned "hearth" for basically every install.
+  // node:os, not process.env.HOSTNAME: that is a shell variable and is missing under systemd, `sh -c` and Docker.
   return hostname() || "hearth";
 }
 
+const USAGE = `usage: hearth [command] [--config path]
+
+  serve                        run the node (the default)
+  init                         probe for a local inference server and write hearth.yaml
+  set-operator <user> <pass>   set the console login
+  migrate                      rewrite an older hearth.yaml in the current layout, keeping a backup
+
+  -c, --config <path>          the config file (default: ${DEFAULT_CONFIG})
+      --check                  with serve: load the config, say whether it is valid, and exit
+      --log <level>            debug, info, warn or error
+  -v, --version
+  -h, --help
+`;
+
 async function main(): Promise<void> {
-  const { values, positionals } = parseArgs({
-    allowPositionals: true,
-    options: {
-      config: { type: "string", short: "c" },
-      check: { type: "boolean", default: false },
-      log: { type: "string" },
-    },
-  });
+  let parsed;
+  try {
+    parsed = parseArgs({
+      allowPositionals: true,
+      options: {
+        config: { type: "string", short: "c" },
+        check: { type: "boolean", default: false },
+        log: { type: "string" },
+        help: { type: "boolean", short: "h", default: false },
+        version: { type: "boolean", short: "v", default: false },
+      },
+    });
+  } catch (e) {
+    // A mistyped flag is answered with how to type it, not a stack trace.
+    console.error(`${e instanceof Error ? e.message.split(". ")[0] : String(e)}\n\n${USAGE}`);
+    process.exit(1);
+  }
+  const { values, positionals } = parsed;
+  if (values.help || positionals[0] === "help") {
+    console.log(USAGE);
+    return;
+  }
+  if (values.version) {
+    console.log((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
+    return;
+  }
 
   const command = positionals[0] ?? "serve";
   const configPath = values.config ?? DEFAULT_CONFIG;
@@ -250,6 +295,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  if (!existsSync(configPath)) {
+    console.error(`no ${configPath} here. Run \`hearth init\` to write one, or point at yours with --config.`);
+    process.exit(1);
+  }
   let cfg;
   try {
     cfg = loadConfig(configPath);

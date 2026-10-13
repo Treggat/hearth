@@ -30,7 +30,7 @@ export function Palette() {
     if (!d) return [];
     const self = d.net.nodes.find((n) => n.self)!;
     const page = (p: Page, label: string): Cmd => ({ id: `p:${p}`, label, hint: "page", run: () => go(p) });
-    const out: Cmd[] = [page("topology", "Topology"), page("models", "Models"), page("queue", "Queue"), page("logs", "Logs"), page("config", "Config")];
+    const out: Cmd[] = [page("topology", "Topology"), page("routing", "Routing"), page("models", "Models"), page("keys", "Keys"), page("queue", "Queue"), page("logs", "Logs"), page("config", "Config")];
     for (const b of self.backends ?? []) out.push({ id: `b:${b.name}`, label: b.name, hint: "backend", run: () => { go("topology"); select({ kind: "backend", id: b.name }); } });
     for (const p of d.net.nodes.filter((n) => !n.self)) out.push({ id: `n:${p.name}`, label: p.name, hint: p.up ? "peer" : "peer · down", run: () => { go("topology"); select({ kind: "peer", id: p.name }); } });
     for (const r of d.net.resources ?? []) out.push({ id: `r:${r.name}`, label: r.name, hint: r.holder ? `hardware · ${r.holder}` : "hardware", run: () => { go("topology"); select({ kind: "resource", id: r.name }); } });
@@ -57,7 +57,7 @@ export function Palette() {
         <div onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-2 border-b border-line px-3">
             <Search size={15} className="text-dim" />
-            <input autoFocus value={q} placeholder="Jump to a backend, peer, page — or lend, hold, pause…"
+            <input autoFocus value={q} aria-label="jump to, or do" placeholder="Jump to a backend, peer, page — or lend, hold, pause…"
                    onChange={(e) => { setQ(e.target.value); setAt(0); }}
                    onKeyDown={(e) => {
                      if (e.key === "ArrowDown") { e.preventDefault(); setAt((a) => Math.min(a + 1, hits.length - 1)); }

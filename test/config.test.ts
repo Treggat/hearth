@@ -72,6 +72,10 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
 // --- a v1 file is named as one, with the way out --------------------------
 {
   assert.throws(() => parseConfig({ backend: { url: "http://x:1" } }), /v1 layout \(it has backend\).*hearth migrate/);
+  // A file may say its layout: the current one loads, a later one is refused by name, an earlier one is sent to migrate.
+  assert.doesNotThrow(() => parseConfig({ ...minimal, version: 3 }));
+  assert.throws(() => parseConfig({ ...minimal, version: 4 }), /version is 4, a layout newer than this hearth reads \(3\)/);
+  assert.throws(() => parseConfig({ ...minimal, version: 2 }), /version is 2, an older layout.*hearth migrate/);
   assert.throws(() => parseConfig({ ...minimal, share: [] }), /v1 layout \(it has share\)/);
   assert.throws(() => parseConfig({ backends: [{ name: "a", url: "http://x:1" }] }), /v1 layout \(it has backends as a list\)/);
 }
@@ -232,8 +236,8 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
 {
   // The shape `hearth set-operator` writes: 16-byte salt and 64-byte scrypt, both hex.
   const passHash = `${"a1".repeat(16)}:${"b2".repeat(64)}`;
-  const cfg = parseConfig({ ...minimal, operator: { user: "jadeyn", passHash } });
-  assert.deepEqual(cfg.operator, { user: "jadeyn", passHash }, "a well-formed login loads");
+  const cfg = parseConfig({ ...minimal, operator: { user: "admin", passHash } });
+  assert.deepEqual(cfg.operator, { user: "admin", passHash }, "a well-formed login loads");
 
   assert.equal(parseConfig(minimal).operator, null, "no operator block means no login");
 
@@ -243,12 +247,12 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
     "an empty username is a config error, not a silent no-login",
   );
   assert.throws(
-    () => parseConfig({ ...minimal, operator: { user: "jadeyn", passHash: "not-a-hash" } }),
+    () => parseConfig({ ...minimal, operator: { user: "admin", passHash: "not-a-hash" } }),
     /operator\.passHash/,
     "a raw password in the file must not parse — only the set-operator output does",
   );
   assert.throws(
-    () => parseConfig({ ...minimal, operator: { user: "jadeyn" } }),
+    () => parseConfig({ ...minimal, operator: { user: "admin" } }),
     /operator\.passHash/,
     "and a missing hash too",
   );

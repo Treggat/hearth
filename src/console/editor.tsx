@@ -3,7 +3,7 @@
  * with a node's full settings, the list of places a line can go, and the row that tries a
  * request against the draft.
  */
-import { ArrowDown, ArrowUp, ChevronDown, CircleHelp, History, Plus, Redo2, Split, RotateCcw, Save, Search, Trash2, Undo2, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, CircleHelp, History, Plus, Redo2, RefreshCw, Split, RotateCcw, Save, Search, Trash2, Undo2, Users, X, Zap } from "lucide-react";
 import { useContext, useEffect, useState } from "react";
 
 import { NewDialog, Refs, refsOf, Review, Value } from "./config.js";
@@ -19,15 +19,23 @@ const SECTION = { flow: "flows", action: "actions" } as const;
 /** What each thing on the map means, for the "?" beside the buttons. */
 const LEGEND: [string, string][] = [
   ["Router", "this node deciding where a request runs; the same Router the Topology page draws"],
-  ["A name with a dot", "a model name clients ask for; drag the dot to say where its requests go"],
+  ["Type", "a name clients ask for, drawn with a dot; drag the dot to say where its requests go"],
   ["Routing rule", "lines checked top to bottom; the first that fits decides"],
+  ["In order", "places a line tries in turn: the next one when one fails before it answers"],
   ["\"the target\"", "the model that line sends to"],
   ["Dashed line to an action", "the line also runs that action; it does not change where the request goes"],
   ["3×", "how many requests that line has decided since the rules last changed"],
   ["≤2", "the line takes at most that many at once; the rest go on down the list"],
   ["! and ?", "the line cannot work as drawn, or its model has not said whether it can"],
   ["Lane", "a queue with a priority: chat goes ahead of batch"],
-  ["Dot and line colours", Object.values(HUE).map((h) => h.says).join(" · ") + ", in the order green, violet, blue, teal, red, amber, grey: a dot wears the colour of what it is plugged into"],
+  ["In hearth.yaml", "a rule is a flow, its lines are its steps, a type is one of its inputs, and a machine is a server"],
+];
+/** The legend as the menu draws it: a swatch for each colour a dot or line can wear, then what each thing means. */
+const legend = (): Choice[] => [
+  { label: "a dot wears the colour of what it is plugged into", head: true },
+  ...Object.values(HUE).map((h) => ({ label: h.says, swatch: h.stroke, still: true })),
+  { label: "what is on the map", head: true },
+  ...LEGEND.map(([label, hint]) => ({ label, hint, still: true })),
 ];
 
 /** The choices for adding a rule: the common shapes, then a blank one. */
@@ -52,7 +60,7 @@ export function finding(draft: Doc): Choice[] {
   return [
     ...group("routing rules", rules.map((f) => ({ label: f.name, value: `flow:${f.name}`, mono: true, hint: f.inputs.length ? `takes ${f.inputs.join(", ")}` : "nothing reaches it yet" }))),
     ...group("actions", Object.keys(obj(draft.actions)).map((a) => ({ label: a, value: `action:${a}`, mono: true }))),
-    ...group("names that are routed", names.map((n) => ({ label: n, value: `name:${n}`, mono: true, hint: `goes into ${flows.find((f) => f.inputs.includes(n))!.name}` }))),
+    ...group("types that are routed", names.map((n) => ({ label: n, value: `name:${n}`, mono: true, hint: `goes into ${flows.find((f) => f.inputs.includes(n))!.name}` }))),
     ...group("models a line ends at", models.map((m) => ({ label: m, value: `model:${m}`, mono: true }))),
     ...group("peers a line ends at", peers.map((p) => ({ label: p, value: `peer:${p}`, mono: true }))),
   ];
@@ -133,17 +141,22 @@ export function VersionsHere() {
 /** A caller as the console names it: everyone not sent somewhere else is "default". */
 const said = (caller: string) => (caller === EVERYONE ? "default" : caller);
 
+/** List the published versions at a point on the page; choosing one shows what going back to it changes. */
+export function openVersions(x: number, y: number): void {
+  void versions().then((all) => chooseAt(x, y, all.length === 0 ? [{ label: "nothing has been published from here yet", off: true }] : [
+    { label: "go back to", head: true },
+    // Newest first; the one that is the file as it stands is marked, and is nowhere to go back to.
+    ...all.map((v) => ({ label: v.name || "unnamed", value: v.hash, hint: `${new Date(v.at).toLocaleString()}${v.hash === useEdit.getState().file?.hash ? " · the file now" : ""}`, off: v.hash === useEdit.getState().file?.hash })).reverse(),
+  ], (hash) => { const v = all.findLast((x) => x.hash === hash); if (v) void goBack(v); }, all.length > 8));
+}
+
 /** The versions that have been published, to see what one changed and go back to it. */
 export function VersionsButton() {
   return (
     <button type="button" aria-label="published versions" title="the versions that have been published: see what one changed, and go back to it" className="flex h-8 items-center gap-1.5 rounded-lg border border-line bg-panel px-2.5 text-[12px] text-dim hover:bg-muted hover:text-fg"
                 onClick={(e) => {
                   const r = e.currentTarget.getBoundingClientRect();
-                  void versions().then((all) => chooseAt(r.left, r.bottom + 4, all.length === 0 ? [{ label: "nothing has been published from here yet", off: true }] : [
-                    { label: "go back to", head: true },
-                    // Newest first; the one that is the file as it stands is marked, and is nowhere to go back to.
-                    ...all.map((v) => ({ label: v.name || "unnamed", value: v.hash, hint: `${new Date(v.at).toLocaleString()}${v.hash === useEdit.getState().file?.hash ? " · the file now" : ""}`, off: v.hash === useEdit.getState().file?.hash })).reverse(),
-                  ], (hash) => { const v = all.findLast((x) => x.hash === hash); if (v) void goBack(v); }, all.length > 8));
+                  openVersions(r.left, r.bottom + 4);
                 }}>
           <History size={13} />versions
     </button>
@@ -251,7 +264,7 @@ export function EditBar() {
           <Search size={13} />find<kbd className="rounded border border-line px-1 text-[10px]">/</kbd>
         </button>
         <button type="button" aria-label="what the map shows" title="what the map shows" className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-panel text-dim hover:bg-muted hover:text-fg"
-                onClick={(e) => choose(e, LEGEND.map(([label, hint]) => ({ label, hint })), () => {})}>
+                onClick={(e) => choose(e, legend(), () => {})}>
           <CircleHelp size={14} />
         </button>
         <VersionsButton />
@@ -268,11 +281,13 @@ export function EditBar() {
       </div>
       {adding === "flows" && (
         <NewDialog spec={{ noun: "routing rule", scope: "flow", keys: [] }} taken={Object.keys(obj(draft.flows))} onClose={() => setAdding(null)}
-                   note="The name is only a label for the rule. Next you say which model names it handles, and where each kind of request goes."
+                   note="The name is only a label for the rule. It is drawn on the map: its pencil, or any of its lines, opens it to say which model names it handles and where each kind of request goes."
                    onCreate={(id) => {
-                     // One line that always applies and goes nowhere yet: the rule opens to be filled in.
+                     // One line that always applies and goes nowhere yet. It is left on the map, picked out and in view,
+                     // so where it landed is seen before anything opens over it.
                      change((d) => put(d, "flows", id, { inputs: [], steps: [{ to: "" }] }));
-                     openRule(id);
+                     editSelect({ kind: "flow", id });
+                     focusOn(`flow:${id}`);
                      setAdding(null);
                    }} />
       )}
@@ -372,6 +387,9 @@ export function Picker() {
 }
 
 /** The one menu the canvas uses: a list of choices under what was clicked, searchable once it is long. */
+/** The icons a choice can stand behind, by the name it asks for one with. */
+const ICONS = { plus: Plus, rotate: RefreshCw, bin: Trash2, split: Split, users: Users };
+
 export function Menu() {
   const m = useEdit((s) => s.choosing);
   const [q, setQ] = useState("");
@@ -380,7 +398,8 @@ export function Menu() {
   const long = m.search === true || m.items.filter((i) => !i.head).length > 8;
   const fits = m.items.filter((i) => i.head || i.label.toLowerCase().includes(q.trim().toLowerCase()));
   // A heading with nothing left under it goes too.
-  const shown = fits.filter((i, k) => !i.head || (fits[k + 1] !== undefined && !fits[k + 1]!.head));
+  // A rule between groups stays while anything follows it.
+  const shown = fits.filter((i, k) => !i.head || (fits[k + 1] !== undefined && (i.label === "" || !fits[k + 1]!.head)));
   // A name typed that is not one of the choices can be made, where the list says how.
   const typed = q.trim();
   const make = m.create && typed !== "" && !m.items.some((i) => !i.head && (i.value ?? i.label) === typed) ? m.create : null;
@@ -388,31 +407,43 @@ export function Menu() {
     <div className="fixed inset-0 z-50" onClick={closeMenu} onKeyDown={(e) => { if (e.key === "Escape") closeMenu(); }}>
       <div role="menu" className="absolute min-w-44 max-w-sm rounded-xl border border-line bg-panel p-1.5 shadow-2xl" onClick={(e) => e.stopPropagation()}
            style={{ left: Math.min(m.x, innerWidth - 300), ...(m.y + 340 > innerHeight ? { bottom: innerHeight - m.y + 34 } : { top: m.y }) }}>
-        {long && <input autoFocus aria-label="filter" placeholder={m.search ? "find a rule, an action, a name or a model…" : "filter…"} value={q} onChange={(e) => setQ(e.target.value)}
+        {long && <input autoFocus aria-label="filter" placeholder={m.ask ?? (m.search ? "find a rule, an action, a name or a model…" : "filter…")} value={q} onChange={(e) => setQ(e.target.value)}
                         onKeyDown={(e) => {
                           const first = shown.find((i) => !i.head && !i.off && i.value?.charCodeAt(0) !== 0);
                           if (e.key !== "Enter") return;
                           // What was typed wins over a near match: a new name is what typing one is for.
                           if (make) { closeMenu(); make.make(typed); } else if (first) { closeMenu(); m.onPick(first.value ?? first.label); }
                         }} className="mb-1 h-8 w-full rounded-md border border-line bg-bg px-2 text-[12px] focus:border-accent focus:outline-none" />}
-        <div className="max-h-72 overflow-auto">
+        <div className="menu-list max-h-[min(26rem,70vh)] overflow-auto">
           {make && (
             <button role="menuitem" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-accent hover:bg-line/60" onClick={() => { closeMenu(); make.make(typed); }}>
               <Plus size={12} />{make.says} <span className={mono}>{typed}</span><span className="ml-auto text-[10px] text-dim">Enter</span>
             </button>
           )}
-          {!make && shown.length === 0 && <div className="px-2 py-1.5 text-[12px] text-dim">nothing by that name</div>}
+          {!make && shown.length === 0 && !m.ask && <div className="px-2 py-1.5 text-[12px] text-dim">nothing by that name</div>}
           {shown.map((i, k) => i.head ? (
-            <div key={k} className="px-2 pb-0.5 pt-2 text-[10px] uppercase tracking-wide text-dim">{i.label}</div>
+            i.label === "" ? <div key={k} className="mx-1 my-1 border-t border-line" />
+              : <div key={k} className="px-2 pb-0.5 pt-2 text-[10px] uppercase tracking-wide text-dim">{i.label}</div>
           ) : (
+            i.still ? (
+              <div key={k} className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[12px]">
+                {i.swatch && <span className="size-2.5 shrink-0 rounded-full" style={{ background: i.swatch }} />}
+                <span className="min-w-0 flex-1">
+                  <span className="block">{i.label}</span>
+                  {i.hint && <span className="block whitespace-normal text-[11px] text-dim">{i.hint}</span>}
+                </span>
+              </div>
+            ) :
             <button key={k} role="menuitem" autoFocus={!long && k === m.items.findIndex((x) => !x.head)} disabled={i.off}
                     className={cx("flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] hover:bg-line/60 focus:bg-line/60 focus:outline-none disabled:opacity-40", i.mono && mono, i.danger && "text-bad", i.on && "font-medium")}
                     onClick={() => { closeMenu(); m.onPick(i.value ?? i.label); }}>
+              {i.icon && (() => { const Icon = ICONS[i.icon!]; return <Icon size={13} className={cx("shrink-0", i.danger ? "text-bad" : "text-dim")} />; })()}
               {/* What a choice is comes first and whole; what it means sits under it. */}
               <span className="min-w-0 flex-1">
                 <span className="block truncate">{i.label}</span>
                 {i.hint && <span className="block whitespace-normal font-sans text-[11px] font-normal text-dim">{i.hint}</span>}
               </span>
+              {i.aside && <span className="shrink-0 pl-3 font-sans text-[11px] font-normal text-dim">{i.aside}</span>}
               {i.on && <span className="shrink-0 text-accent">✓</span>}
             </button>
           ))}
@@ -660,7 +691,7 @@ function Names({ flow, names, options }: { flow: string; names: string[]; option
         <button type="button" className={cx(PICK, "h-7 border-dashed text-dim")}
                 onClick={(e) => choose(e, [{ label: "A new name…", value: "\u0000new", hint: "one nothing serves yet, like auto" }, { label: "a name this node already answers to", head: true }, ...options.filter((o) => !names.includes(o)).map((o) => ({ label: o, mono: true }))],
                   (v) => (v === "\u0000new" ? setTyping("") : add(v)), { says: "a new name:", make: add })}>
-          <Plus size={12} />a model name
+          <Plus size={12} />a type
         </button>
       ) : (
         <input autoFocus aria-label="a new model name" placeholder="any name, e.g. auto" value={typing} onChange={(e) => setTyping(e.target.value)}
@@ -746,7 +777,7 @@ export function EditRail() {
               </div>
               <div className="mb-1 text-[12px] font-medium">When a request asks for</div>
               <Names flow={sel.id} names={list(entry.inputs)} options={offered} />
-              {list(entry.inputs).length === 0 && <div className="mt-1 text-[11px] text-warn">Nothing reaches this rule yet. Add a model name here, or drag a name's blue dot from the node onto the rule.</div>}
+              {list(entry.inputs).length === 0 && <div className="mt-1 text-[11px] text-warn">Nothing reaches this rule yet. Add a type here, or drag a type's blue dot from the Router onto the rule.</div>}
               <div className="mb-1 mt-4 text-[12px] font-medium">decide where it goes</div>
               <Lines name={sel.id} flow={entry} at={opened?.line ?? null} />
             </>

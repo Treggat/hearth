@@ -6,8 +6,8 @@ import type { UiData, Used } from "./types.js";
 import { Refs, refsOf, Value } from "./config.js";
 import { draftView, isObj, obj, put } from "./draft.js";
 import { change, useEdit } from "./editStore.js";
-import { control, evict, go, mintKey, revokeKey, select, useStore, warm } from "./store.js";
-import { ago, Card, cx, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
+import { control, doneWithKey, evict, go, mintKey, revokeKey, rotateKey, select, useStore, warm } from "./store.js";
+import { ago, Button, Card, cx, Dialog, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
 
 const selfOf = (d: UiData) => d.net.nodes.find((n) => n.self)!;
 
@@ -214,8 +214,12 @@ export function Models() {
     for (const p of d.net.nodes) if (!p.self && (p.serves ?? []).includes(m)) out.push(`${p.name} (peer)`);
     return out;
   };
+  // A name a flow takes is not a model: a rule decides what answers it. A provider's model is never loaded or unloaded here.
+  const types = new Set(Object.values(d.flows ?? {}).flatMap((f) => f.inputs));
+  const hosted = new Set((self.backends ?? []).filter((b) => b.cloud).flatMap((b) => b.serves ?? []));
   const state = (m: string): [Tone, string] =>
-    d.net.readyNow.includes(m) ? ["ok", "warm"] : (d.net.unknownWarm ?? []).includes(m) ? ["dim", "unknown"] : ["info", "cold"];
+    types.has(m) ? ["accent", "type"] : hosted.has(m) ? ["dim", "hosted"]
+    : d.net.readyNow.includes(m) ? ["ok", "warm"] : (d.net.unknownWarm ?? []).includes(m) ? ["dim", "unknown"] : ["info", "cold"];
   const [busy, setBusy] = useState<string | null>(null);
   const act = (k: string, fn: () => Promise<void>): void => {
     if (busy !== null) return;
@@ -246,7 +250,7 @@ export function Models() {
                 <td className={cx("px-4 py-2", mono)}>{m}</td>
                 <td className="px-2 py-2"><Pill tone={tone}>{word}</Pill></td>
                 <td className="px-2 py-2">
-                  {local.has(m) ? (
+                  {local.has(m) && !types.has(m) && !hosted.has(m) ? (
                     <button disabled={busy !== null}
                             onClick={() => {
                               if (word === "warm" && !confirm(`Evict ${m}? It leaves the card and the next request for it pays the reload.`)) return;
@@ -257,10 +261,10 @@ export function Models() {
                     </button>
                   ) : <span className="text-dim">—</span>}
                 </td>
-                <td className="px-2 py-2 text-dim">{where(m).join(", ")}</td>
+                <td className="px-2 py-2 text-dim">{types.has(m) ? "a routing rule" : where(m).join(", ")}</td>
                 <td className="tabular px-2 py-2 text-dim">{stats?.context ? `${Math.round(stats.context / 1024)}k` : "—"}</td>
                 <td className="px-2 py-2">
-                  {local.has(m)
+                  {local.has(m) && !hosted.has(m)
                     ? <Switch label={`lend ${m}`} on={lent} onChange={(on) => void control({ share: { [m]: on } }, on ? `lending ${m}` : `holding ${m}`)} />
                     : <span className="text-dim">—</span>}
                 </td>
@@ -293,7 +297,7 @@ const money = (n: number): string => `$${n < 10 ? n.toFixed(2) : n < 1000 ? n.to
 function UsedCell({ used }: { used?: Used }) {
   if (!used || used.requests === 0) return <span className="text-dim">—</span>;
   return (
-    <span title={`${used.requests} requests, ${used.failed} failed · ${used.in} tokens in, ${used.out} out`}>
+    <span title={`${used.requests} requests, ${used.failed} failed · ${used.in} tokens in${used.cached ? ` (${used.cached} read from cache)` : ""}, ${used.out} out`}>
       {short(used.requests)} <span className="text-dim">req ·</span> {short(used.in)} <span className="text-dim">in /</span> {short(used.out)} <span className="text-dim">out</span>
       {(used.cost ?? 0) > 0 && <span title="at the prices the models carry now"> <span className="text-dim">·</span> {money(used.cost!)}</span>}
       {used.failed > 0 && <span className="text-bad"> · {short(used.failed)} failed</span>}
@@ -319,6 +323,27 @@ function limitsOf(rule: Rule | null | undefined, today?: Used) {
   return <span className={gone || spent ? "text-bad" : undefined} title={spent ? "today's allowance is used up; it works again at midnight UTC" : undefined}>{parts.join(" · ")}</span>;
 }
 
+/** A key just minted or rotated, shown once over whichever page made it. The keys page shows it in place instead. */
+export function KeyOnce() {
+  const shown = useStore((s) => s.fresh);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => setCopied(false), [shown]);
+  if (shown === null) return null;
+  return (
+    <Dialog firm title={`${shown.rotated ? "New key" : "Key"} for ${shown.label}`} onClose={doneWithKey}>
+      <div className="flex flex-col gap-3 p-4">
+        <p className="text-[12px] text-dim">Shown once: after this it exists only in hearth.yaml.{shown.rotated ? " The old key has stopped working." : ""}</p>
+        <code className={cx("select-all overflow-x-auto whitespace-nowrap rounded-md border border-line bg-bg px-3 py-2", mono)}>{shown.key}</code>
+      </div>
+      <div className="flex justify-end gap-2 border-t border-line px-4 py-3">
+        {/* A page served over plain http off this machine has no clipboard; the text is selectable either way. */}
+        {navigator.clipboard && <Button onClick={() => void navigator.clipboard.writeText(shown.key).then(() => setCopied(true), () => {})}>{copied ? "copied" : "copy"}</Button>}
+        <Button tone="primary" onClick={doneWithKey}>done</Button>
+      </div>
+    </Dialog>
+  );
+}
+
 export function Keys() {
   const keys = useStore((s) => s.data!.keys ?? []);
   const others = useStore((s) => s.data!.others ?? []);
@@ -329,7 +354,7 @@ export function Keys() {
   const [perMinute, setPerMinute] = useState("");
   const [perDay, setPerDay] = useState("");
   const [dollars, setDollars] = useState("");
-  const [shown, setShown] = useState<{ label: string; key: string } | null>(null);
+  const shown = useStore((s) => s.fresh);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const mint = async () => {
@@ -341,7 +366,6 @@ export function Keys() {
     const key = await mintKey(l, models.length > 0 ? models : null, { ...(expires ? { expires } : {}), ...(Object.keys(limits).length ? { limits } : {}) });
     setBusy(false);
     if (key !== null) {
-      setShown({ label: l, key });
       setCopied(false);
       setLabel("");
       setScope("");
@@ -388,6 +412,11 @@ export function Keys() {
               <td className="tabular px-4 py-2"><UsedCell used={k.month} /></td>
               <td className={cx("tabular px-4 py-2 text-right", k.lastSeen === null ? "text-dim" : "text-fg")}>{k.lastSeen === null ? "never" : ago(k.lastSeen)}</td>
               <td className="px-4 py-2 text-right">
+                <button disabled={busy || k.label === ""} title={k.label === "" ? "a key with no label is changed in the config file" : "a new secret for this key, shown once; the old one stops working straight away"}
+                        onClick={() => { if (confirm(`Rotate ${k.label}? Whatever uses the old key stops working until it is given the new one.`)) void rotateKey(k.label); }}
+                        className="mr-3 text-[12px] text-dim hover:text-fg hover:underline disabled:opacity-40">
+                  rotate
+                </button>
                 <button disabled={busy || k.label === ""} title={k.label === "" ? "a key with no label is removed in the config file" : undefined}
                         onClick={() => { if (confirm(`Revoke ${k.label}? It stops working straight away.`)) void revokeKey(k.label); }}
                         className="text-[12px] text-bad hover:underline disabled:opacity-40">
@@ -434,11 +463,11 @@ export function Keys() {
       </div>
       {shown !== null && (
         <div className="border-t border-line bg-muted/40 px-4 py-3">
-          <div className="text-[12px] text-dim">The key for <b className="text-fg">{shown.label}</b> — shown once; after this it exists only in hearth.yaml.</div>
+          <div className="text-[12px] text-dim">The {shown.rotated ? "new key" : "key"} for <b className="text-fg">{shown.label}</b> — shown once; after this it exists only in hearth.yaml.</div>
           <div className="mt-1.5 flex items-center gap-2">
             <code className={cx("flex-1 select-all overflow-x-auto whitespace-nowrap rounded-md border border-line bg-bg px-3 py-2", mono)}>{shown.key}</code>
-            <button onClick={() => void copy(shown.key)} className="h-8 rounded-md border border-line px-3 text-[12px] hover:bg-muted">{copied ? "copied" : "copy"}</button>
-            <button onClick={() => setShown(null)} className="h-8 rounded-md px-2 text-[12px] text-dim hover:text-fg">done</button>
+            {navigator.clipboard && <button onClick={() => void copy(shown.key)} className="h-8 rounded-md border border-line px-3 text-[12px] hover:bg-muted">{copied ? "copied" : "copy"}</button>}
+            <button onClick={doneWithKey} className="h-8 rounded-md px-2 text-[12px] text-dim hover:text-fg">done</button>
           </div>
         </div>
       )}

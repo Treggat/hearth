@@ -4,10 +4,10 @@ import { useEffect, useState } from "react";
 
 import { Config } from "./config.js";
 import { Logs } from "./logs.js";
-import { CanaryAlert, History, Inspector, Keys, Models, Queue } from "./pages.js";
+import { CanaryAlert, History, Inspector, KeyOnce, Keys, Models, Queue } from "./pages.js";
 import { Palette } from "./Palette.js";
 import type { UiData } from "./types.js";
-import { go, login, logout, restartNode, select, useStore, type Page } from "./store.js";
+import { go, login, logout, pageOf, restartNode, select, useStore, type Page } from "./store.js";
 import { EditBar, EditRail, Menu, Picker, TryStrip, VersionsHere } from "./editor.js";
 import { changed, useEdit } from "./editStore.js";
 import { Routing } from "./Routing.js";
@@ -211,14 +211,14 @@ function LoginCard() {
             {setup ? "set up hearth" : "log in to hearth"}
           </div>
           <p className="mt-1 text-dim">{setup
-            ? "This node has no operator yet. Create the login that opens the whole console — dashboard, config, controls — from anywhere on your network."
-            : "This page is loopback-only. A login opens the whole console — dashboard, config, controls — from anywhere on your network."}</p>
-          <input autoFocus value={user} onChange={(e) => setUser(e.target.value)} placeholder="username"
+            ? "This node has no operator yet. Create the login that opens the whole console — status, config, controls — from anywhere on your network."
+            : "From another machine this page needs a login. It opens the whole console — status, config, controls — from anywhere on your network."}</p>
+          <input autoFocus value={user} onChange={(e) => setUser(e.target.value)} placeholder="username" aria-label="username" autoComplete="username"
                  className="mt-3 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
-          <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="password"
+          <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="password" aria-label="password"
                  className="mt-2 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
           {setup && (
-            <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder="password again"
+            <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder="password again" aria-label="password again"
                    className="mt-2 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
           )}
           {err !== null && <div className="mt-2 text-sm text-bad">{err}</div>}
@@ -242,7 +242,7 @@ function KeyDialog() {
     <Dialog title="This node needs a key" size="sm" onClose={() => done(null)}>
         <form className="p-4" onSubmit={(e) => { e.preventDefault(); done(key); }}>
           <p className="text-dim">Reading is open; changing something needs one of the node's apiKeys. It is kept in this browser only.</p>
-          <input autoFocus type="password" value={key} onChange={(e) => setKey(e.target.value)}
+          <input autoFocus type="password" value={key} onChange={(e) => setKey(e.target.value)} aria-label="api key"
                  className="mt-3 h-9 w-full rounded-lg border border-line bg-bg px-3 font-mono focus:border-accent focus:outline-none" />
           <div className="mt-4 flex justify-end gap-2">
             <Button onClick={() => done(null)}>cancel</Button>
@@ -268,12 +268,14 @@ export default function App() {
   const data = useStore((s) => s.data);
   const live = useStore((s) => s.live);
   const dead = useStore((s) => s.dead);
+  const polling = useStore((s) => s.polling);
   const loginRequired = useStore((s) => s.loginRequired);
   const page = useStore((s) => s.page);
   const [dark, toggleTheme] = useTheme();
 
   useEffect(() => {
-    const onHash = () => useStore.setState({ page: (location.hash.slice(1) as Page) || "topology", sel: null });
+    // `go` has already moved the page and may have picked something on it since: only a page change that came from the address clears the selection.
+    const onHash = () => { if (pageOf() !== useStore.getState().page) useStore.setState({ page: pageOf(), sel: null }); };
     addEventListener("hashchange", onHash);
     return () => removeEventListener("hashchange", onHash);
   }, []);
@@ -290,7 +292,7 @@ export default function App() {
           <span className="font-semibold tracking-tight max-md:hidden">hearth</span>
         </div>
         {PAGES.map((p) => (
-          <button key={p.id} onClick={() => go(p.id)} aria-current={page === p.id ? "page" : undefined}
+          <button key={p.id} onClick={() => go(p.id)} aria-current={page === p.id ? "page" : undefined} aria-label={p.label} title={p.label}
                   className={cx("mb-0.5 flex h-8 items-center gap-2.5 rounded-lg px-2 text-left transition-colors",
                     page === p.id ? "bg-muted font-medium text-fg" : "text-dim hover:bg-muted/60 hover:text-fg")}>
             <p.icon size={15} />
@@ -305,7 +307,9 @@ export default function App() {
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-3 border-b border-line px-5">
           <span className="shrink-0 font-semibold">{self?.name ?? "…"}</span>
-          {dead ? <Pill tone="bad">unreachable</Pill> : <Pill tone={live ? "ok" : "warn"} pulse={live}>{live ? "live" : "polling"}</Pill>}
+          {dead
+            ? <span title="This node is not answering. The page shows what it last said, and keeps trying."><Pill tone="bad">unreachable</Pill></span>
+            : <span title={live ? "Updates are pushed as they happen." : polling ? "The live stream is not getting through, so the page asks every few seconds." : "Waiting for the live stream."}><Pill tone={live ? "ok" : "warn"} pulse={live}>{live ? "live" : polling ? "polling" : "reconnecting…"}</Pill></span>}
           {data?.operator && <span className="max-sm:hidden"><Pill tone="ok">signed in as {data.operator}</Pill></span>}
           <div className="ml-2 min-w-0 flex-1 overflow-hidden"><Health /></div>
           <div className="flex shrink-0 items-center gap-3">
@@ -368,6 +372,8 @@ export default function App() {
         )}
       </main>
 
+      {/* A key made from any other page is shown over it, once; the keys page shows it in place. */}
+      {page !== "keys" && <KeyOnce />}
       <Palette />
       <KeyDialog />
       <Toast />
