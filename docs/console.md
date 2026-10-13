@@ -116,8 +116,15 @@ line; **+ type** brings one onto the map.
   sentences, `If … send to …`, ending in `Otherwise …`. Start from a common
   one (borrow an idle model, send images or long prompts somewhere else, stay
   off a busy model, give one caller its own model) or from a blank. A new
-  rule is left on the map, picked out and in view; its pencil, or any of its
-  lines, opens it to be edited line by line.
+  rule is left on the map, picked out and in view; its pencil opens it to be
+  edited line by line.
+- **A line's conditions are changed where they stand.** Click the sentence a
+  line reads as, or **choose a condition** on a new one, and its conditions
+  open in the box; the line's first word closes them again. Under a heading
+  that several lines share, what opens is the line's own conditions, and the
+  shared one stays with the heading. The dialog, from the rule's pencil or
+  **Edit this line…** in a line's menu, is for the rest: its lane, the request
+  fields it sets, and the rule's own settings.
 - **A line that cannot work is not drawn.** Routing decides chat requests, so
   a name whose backend takes its requests on paths of its own (image
   generation and the like) is marked **not chat** and has no dot, and a chat
