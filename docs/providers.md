@@ -86,6 +86,14 @@ backends:
   same conversation pays for them as a cache read. A cache write costs more
   than plain input, so for one-off requests with long prompts that are never
   repeated, set `promptCache: false`.
+- A prefix is kept for five minutes after its last use. Where the requests of
+  one conversation come further apart than that (a person who thinks before
+  answering, a tool that runs for a while), `promptCacheTtl: 1h` keeps it for
+  an hour, at a higher price for each write.
+- Only the system messages that open a conversation become the system prompt.
+  One sent later stays where it stands, as text in a user turn: moved to the
+  front it would change the start of the cached prefix, and every turn after
+  it would be paid for in full again.
 - `usage.prompt_tokens` counts all input, cached or not, and
   `usage.prompt_tokens_details.cached_tokens` says how much was read from the
   cache. Per-key usage counts the same totals.
