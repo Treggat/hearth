@@ -97,6 +97,10 @@ backends:
 - `usage.prompt_tokens` counts all input, cached or not, and
   `usage.prompt_tokens_details.cached_tokens` says how much was read from the
   cache. Per-key usage counts the same totals.
+- A cache write is counted, and priced, as plain input. The provider charges
+  more for one, and more again with `promptCacheTtl: 1h`, so the spend shown
+  for a model with a `price`, and what `limits.dollarsPerDay` counts, is
+  somewhat below the provider's bill.
 - What is carried across: system and developer messages, text and images,
   tools, tool calls and their results, `tool_choice`, `max_tokens`
   (4096 when the request names none: this API requires one), `temperature`,
