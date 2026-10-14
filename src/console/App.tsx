@@ -1,19 +1,26 @@
 /** hearth console 2.0: a sidebar of pages over one live store, the topology first. */
-import { AlertTriangle, Boxes, CheckCircle2, FileCog, Flame, ListOrdered, LogOut, Moon, Network, ScrollText, Sun, XCircle } from "lucide-react";
+import { AlertTriangle, Boxes, CheckCircle2, FileCog, Flame, Handshake, KeyRound, ListOrdered, LogOut, Moon, Network, ScrollText, Split, Sun, XCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Config } from "./config.js";
 import { Logs } from "./logs.js";
-import { CanaryAlert, History, Inspector, Models, Queue } from "./pages.js";
+import { CanaryAlert, History, Inspector, KeyOnce, Keys, Models, Queue } from "./pages.js";
 import { Palette } from "./Palette.js";
 import type { UiData } from "./types.js";
-import { go, login, logout, restartNode, select, useStore, type Page } from "./store.js";
+import { go, login, logout, pageOf, restartNode, select, useStore, type Page } from "./store.js";
+import { EditBar, EditRail, Menu, Picker, TryStrip, VersionsHere } from "./editor.js";
+import { changed, useEdit } from "./editStore.js";
+import { Routing } from "./Routing.js";
+import { Lending } from "./Lending.js";
 import { Topology } from "./Topology.js";
-import { Button, Card, cx, Pill } from "./ui.js";
+import { Button, Card, cx, Dialog, Pill } from "./ui.js";
 
 const PAGES: { id: Page; label: string; icon: typeof Network }[] = [
   { id: "topology", label: "Topology", icon: Network },
+  { id: "routing", label: "Routing", icon: Split },
   { id: "models", label: "Models", icon: Boxes },
+  { id: "lending", label: "Lending", icon: Handshake },
+  { id: "keys", label: "Keys", icon: KeyRound },
   { id: "queue", label: "Queue", icon: ListOrdered },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "config", label: "Config", icon: FileCog },
@@ -31,7 +38,10 @@ function useTheme(): [boolean, () => void] {
 
 function ConfigPill() {
   const c = useStore((s) => s.data?.config);
+  // What is on the Topology page and not yet written counts: "saved" is only true of the file.
+  const unsaved = useEdit(changed);
   if (!c) return null;
+  if (unsaved > 0 && !c.error) return <button onClick={() => go("routing")}><Pill tone="accent">{unsaved} unsaved</Pill></button>;
   const tone = c.error ? "bad" : c.restartPending.length ? "warn" : "ok";
   const text = c.error ? "config does not load" : c.restartPending.length ? `restart to apply ${c.restartPending.length}` : c.path ? "saved" : "in memory";
   return (
@@ -203,14 +213,14 @@ function LoginCard() {
             {setup ? "set up hearth" : "log in to hearth"}
           </div>
           <p className="mt-1 text-dim">{setup
-            ? "This node has no operator yet. Create the login that opens the whole console — dashboard, config, controls — from anywhere on your network."
-            : "This page is loopback-only. A login opens the whole console — dashboard, config, controls — from anywhere on your network."}</p>
-          <input autoFocus value={user} onChange={(e) => setUser(e.target.value)} placeholder="username"
+            ? "This node has no operator yet. Create the login that opens the whole console — status, config, controls — from anywhere on your network."
+            : "From another machine this page needs a login. It opens the whole console — status, config, controls — from anywhere on your network."}</p>
+          <input autoFocus value={user} onChange={(e) => setUser(e.target.value)} placeholder="username" aria-label="username" autoComplete="username"
                  className="mt-3 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
-          <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="password"
+          <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="password" aria-label="password"
                  className="mt-2 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
           {setup && (
-            <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder="password again"
+            <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder="password again" aria-label="password again"
                    className="mt-2 h-9 w-full rounded-lg border border-line bg-bg px-3 text-sm focus:border-accent focus:outline-none" />
           )}
           {err !== null && <div className="mt-2 text-sm text-bad">{err}</div>}
@@ -231,20 +241,17 @@ function KeyDialog() {
   if (!ask) return null;
   const done = (k: string | null) => { ask(k); setKey(""); };
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => done(null)}>
-      <Card className="w-full max-w-sm p-5 shadow-2xl">
-        <form onClick={(e) => e.stopPropagation()} onSubmit={(e) => { e.preventDefault(); done(key); }}>
-          <div className="text-base font-semibold">This node needs a key</div>
-          <p className="mt-1 text-dim">Reading is open; changing something needs one of the node's apiKeys. It is kept in this browser only.</p>
-          <input autoFocus type="password" value={key} onChange={(e) => setKey(e.target.value)}
+    <Dialog title="This node needs a key" size="sm" onClose={() => done(null)}>
+        <form className="p-4" onSubmit={(e) => { e.preventDefault(); done(key); }}>
+          <p className="text-dim">Reading is open; changing something needs one of the node's apiKeys. It is kept in this browser only.</p>
+          <input autoFocus type="password" value={key} onChange={(e) => setKey(e.target.value)} aria-label="api key"
                  className="mt-3 h-9 w-full rounded-lg border border-line bg-bg px-3 font-mono focus:border-accent focus:outline-none" />
           <div className="mt-4 flex justify-end gap-2">
             <Button onClick={() => done(null)}>cancel</Button>
             <Button tone="primary" type="submit">use key</Button>
           </div>
         </form>
-      </Card>
-    </div>
+    </Dialog>
   );
 }
 
@@ -263,12 +270,14 @@ export default function App() {
   const data = useStore((s) => s.data);
   const live = useStore((s) => s.live);
   const dead = useStore((s) => s.dead);
+  const polling = useStore((s) => s.polling);
   const loginRequired = useStore((s) => s.loginRequired);
   const page = useStore((s) => s.page);
   const [dark, toggleTheme] = useTheme();
 
   useEffect(() => {
-    const onHash = () => useStore.setState({ page: (location.hash.slice(1) as Page) || "topology", sel: null });
+    // `go` has already moved the page and may have picked something on it since: only a page change that came from the address clears the selection.
+    const onHash = () => { if (pageOf() !== useStore.getState().page) useStore.setState({ page: pageOf(), sel: null }); };
     addEventListener("hashchange", onHash);
     return () => removeEventListener("hashchange", onHash);
   }, []);
@@ -285,7 +294,7 @@ export default function App() {
           <span className="font-semibold tracking-tight max-md:hidden">hearth</span>
         </div>
         {PAGES.map((p) => (
-          <button key={p.id} onClick={() => go(p.id)} aria-current={page === p.id ? "page" : undefined}
+          <button key={p.id} onClick={() => go(p.id)} aria-current={page === p.id ? "page" : undefined} aria-label={p.label} title={p.label}
                   className={cx("mb-0.5 flex h-8 items-center gap-2.5 rounded-lg px-2 text-left transition-colors",
                     page === p.id ? "bg-muted font-medium text-fg" : "text-dim hover:bg-muted/60 hover:text-fg")}>
             <p.icon size={15} />
@@ -300,7 +309,9 @@ export default function App() {
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-3 border-b border-line px-5">
           <span className="shrink-0 font-semibold">{self?.name ?? "…"}</span>
-          {dead ? <Pill tone="bad">unreachable</Pill> : <Pill tone={live ? "ok" : "warn"} pulse={live}>{live ? "live" : "polling"}</Pill>}
+          {dead
+            ? <span title="This node is not answering. The page shows what it last said, and keeps trying."><Pill tone="bad">unreachable</Pill></span>
+            : <span title={live ? "Updates are pushed as they happen." : polling ? "The live stream is not getting through, so the page asks every few seconds." : "Waiting for the live stream."}><Pill tone={live ? "ok" : "warn"} pulse={live}>{live ? "live" : polling ? "polling" : "reconnecting…"}</Pill></span>}
           {data?.operator && <span className="max-sm:hidden"><Pill tone="ok">signed in as {data.operator}</Pill></span>}
           <div className="ml-2 min-w-0 flex-1 overflow-hidden"><Health /></div>
           <div className="flex shrink-0 items-center gap-3">
@@ -325,9 +336,29 @@ export default function App() {
         ) : page === "topology" ? (
           <div className="flex min-h-0 flex-1 flex-col gap-3 p-5">
             <Activity />
-            <Card className="relative min-h-[420px] flex-1 overflow-hidden">
-              <Topology />
+            <Card className="flex min-h-[420px] flex-1 overflow-hidden">
+              {/* A panel sits beside the picture, never over it: what was clicked stays in view. */}
+              <div className="relative min-w-0 flex-1"><Topology /></div>
               <Inspector />
+            </Card>
+          </div>
+        ) : page === "routing" ? (
+          <div className="flex min-h-0 flex-1 flex-col p-5">
+            <Card className="flex min-h-[420px] flex-1 flex-col overflow-hidden">
+              <div className="flex min-h-0 flex-1">
+                {/* The strip stands over the map, not on it: nothing drawn is ever under it. */}
+                <div className="flex min-w-0 flex-1 flex-col">
+                  <EditBar />
+                  <div className="relative min-h-0 flex-1">
+                    {/* Its own instance: the two pictures share nothing but the node they draw. */}
+                    <Routing />
+                  </div>
+                  <Picker />
+                  <Menu />
+                </div>
+                <EditRail />
+              </div>
+              <TryStrip />
             </Card>
           </div>
         ) : page === "logs" ? (
@@ -335,12 +366,17 @@ export default function App() {
         ) : (
           <div className="min-h-0 flex-1 overflow-auto p-5">
             {page === "models" && <Models />}
+            {page === "lending" && <Lending />}
+            {page === "keys" && <Keys />}
             {page === "queue" && <><Queue /><History /></>}
-            {page === "config" && <Config />}
+            {/* What has been published, and the way back to it, wherever the file is edited. */}
+            {page === "config" && <><div className="mb-2 flex justify-end"><VersionsHere /></div><Config /></>}
           </div>
         )}
       </main>
 
+      {/* A key made from any other page is shown over it, once; the keys page shows it in place. */}
+      {page !== "keys" && <KeyOnce />}
       <Palette />
       <KeyDialog />
       <Toast />

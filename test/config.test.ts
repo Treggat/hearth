@@ -22,6 +22,40 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
   assert.deepEqual(cfg.models, {}, "nothing is routed away by default");
 }
 
+// --- servers: a backend on another machine takes its address from the machine --------------
+{
+  const servers = { box: { host: "10.0.0.5" } };
+  const cfg = parseConfig({ servers, backends: { far: { server: "box", port: 8000 }, near: { url: "http://127.0.0.1:9292" } } });
+  assert.equal(cfg.backends[0]!.url, "http://10.0.0.5:8000", "host and port make the url");
+  assert.equal(cfg.backends[0]!.server, "box");
+  assert.equal(cfg.backends[1]!.server, null, "no server is the machine hearth is on");
+  assert.deepEqual(parseConfig(minimal).servers, {}, "a config that names none is unchanged");
+
+  // A url of its own wins the address; the server is then only where it is drawn.
+  const own = parseConfig({ servers, backends: { far: { server: "box", url: "https://box.lan/llm/" } } });
+  assert.equal(own.backends[0]!.url, "https://box.lan/llm");
+  assert.equal(parseConfig({ servers: { six: { host: "fd00::5" } }, backends: { far: { server: "six", port: 1 } } }).backends[0]!.url,
+    "http://[fd00::5]:1", "a bare IPv6 host is bracketed");
+
+  const refuse = (backends: Record<string, unknown>, re: RegExp, s: Record<string, unknown> = servers) =>
+    assert.throws(() => parseConfig({ servers: s, backends }), re);
+  refuse({ far: { server: "bix", port: 8000 } }, /backends\.far\.server names "bix", which is not in servers/);
+  refuse({ far: { server: "box" } }, /backends\.far\.url is required, or set server and port/);
+  refuse({ far: { port: 8000 } }, /backends\.far\.port needs server/);
+  refuse({ far: { server: "box", port: 8000, url: "http://10.0.0.5:8000" } }, /port is set beside url/);
+  refuse({ far: { server: "box", port: 0 } }, /port must be a whole number >= 1/);
+  refuse({ far: { server: "box", port: 1 } }, /host must be an IP or hostname/, { box: { host: "http://10.0.0.5" } });
+  refuse({ far: { server: "box", port: 1 } }, /servers\.box\.hots is not a setting/, { box: { hots: "10.0.0.5" } });
+
+  // One card is in one machine; a shared resource is arbitrated nowhere, so it may span them.
+  refuse({ far: { server: "box", port: 1, resources: ["gpu0"] }, near: { url: "http://127.0.0.1:2", resources: ["gpu0"] } },
+    /"far" \(server "box"\) and "near" \(this machine\) both use gpu0/);
+  assert.doesNotThrow(() => parseConfig({
+    servers, resources: { cpu: { kind: "cpu", shared: true } },
+    backends: { far: { server: "box", port: 1, resources: ["cpu"] }, near: { url: "http://127.0.0.1:2", resources: ["cpu"] } },
+  }));
+}
+
 // --- a backend is mandatory, and must be a url -----------------------------
 {
   assert.throws(() => parseConfig({}), /backends is required/);
@@ -38,6 +72,10 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
 // --- a v1 file is named as one, with the way out --------------------------
 {
   assert.throws(() => parseConfig({ backend: { url: "http://x:1" } }), /v1 layout \(it has backend\).*hearth migrate/);
+  // A file may say its layout: the current one loads, a later one is refused by name, an earlier one is sent to migrate.
+  assert.doesNotThrow(() => parseConfig({ ...minimal, version: 3 }));
+  assert.throws(() => parseConfig({ ...minimal, version: 4 }), /version is 4, a layout newer than this hearth reads \(3\)/);
+  assert.throws(() => parseConfig({ ...minimal, version: 2 }), /version is 2, an older layout.*hearth migrate/);
   assert.throws(() => parseConfig({ ...minimal, share: [] }), /v1 layout \(it has share\)/);
   assert.throws(() => parseConfig({ backends: [{ name: "a", url: "http://x:1" }] }), /v1 layout \(it has backends as a list\)/);
 }
@@ -80,15 +118,16 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
   const cfg = parseConfig({
     ...minimal,
     peers: { friend: friend({ coder: "their-coder" }) },
-    models: { coder: { as: "qwen3-coder:latest", policy: "fastest" } },
+    models: { coder: { as: "qwen3-coder:latest" } },
+    flows: { coder: { inputs: ["coder"], steps: [{ to: { fastest: ["coder", { peer: "friend" }] } }] } },
   });
   assert.equal(cfg.models.coder!.as, "qwen3-coder:latest");
-  assert.equal(cfg.models.coder!.policy, "fastest");
+  assert.deepEqual(cfg.flows.coder!.steps[0]!.to, { fastest: [{ model: "coder" }, { peer: "friend", model: null }] });
 }
 
 // --- a note describes a model; alone it is not a route ----------------------
 {
-  const cfg = parseConfig({ ...minimal, models: { a: { note: " for long documents " }, b: { policy: "local", note: "x" } } });
+  const cfg = parseConfig({ ...minimal, models: { a: { note: " for long documents " }, b: { concurrency: 1, note: "x" } } });
   assert.deepEqual(cfg.notes, { a: "for long documents", b: "x" });
   assert.deepEqual(Object.keys(cfg.models), ["b"], "a note-only entry routes nothing");
   assert.throws(() => parseConfig({ ...minimal, models: { a: { note: "x".repeat(10_000) } } }), /models\.a\.note is \d+ characters/);
@@ -128,11 +167,11 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
   assert.equal(thrown({ ...minimal, models: { c: { pool: 0 } } }).message, "models.c.pool must be a whole number >= 1 (got 0)", "and the sentence keeps the field for a journal line");
 }
 
-// --- a policy that can never fire is a typo, not a preference --------------
+// --- a flow step that can never fire is a typo, not a preference -----------
 {
   assert.throws(
-    () => parseConfig({ ...minimal, peers: { friend: friend({ a: "a" }) }, models: { b: { policy: "peer" } } }),
-    /no peer maps "b"/,
+    () => parseConfig({ ...minimal, peers: { friend: friend({ a: "a" }) }, flows: { b: { inputs: ["b"], steps: [{ to: { peer: "friend" } }, { to: "b" }] } } }),
+    /sends "b" to friend, which does not map it/,
   );
 }
 
@@ -142,19 +181,21 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
     () => parseConfig({
       ...minimal,
       peers: { friend: friend({ a: "a" }) },
-      models: { a: { policy: "peer", peers: ["freind"] } },
+      flows: { a: { inputs: ["a"], steps: [{ to: { peer: "freind" } }, { to: "a" }] } },
     }),
     /not a peer you borrow from/,
     "a misspelled peer name must be caught, not silently ignored",
   );
 }
 
-// --- an unknown policy is refused with the valid set -----------------------
+// --- routing written on a model is refused, with the command that moves it --
 {
-  assert.throws(
-    () => parseConfig({ ...minimal, peers: { f: friend({ m: "m" }) }, models: { m: { policy: "remote" } } }),
-    /expected local, peer, spillover or fastest/,
-  );
+  for (const key of ["policy", "peers", "spilloverAt", "fallbackLocal", "whenHeld"]) {
+    assert.throws(
+      () => parseConfig({ ...minimal, peers: { f: friend({ m: "m" }) }, models: { m: { [key]: "peer" } } }),
+      new RegExp(`models\\.m\\.${key} is routing, which now lives under flows: — run \`hearth migrate\``),
+    );
+  }
 }
 
 // --- env: indirection ------------------------------------------------------
@@ -195,8 +236,8 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
 {
   // The shape `hearth set-operator` writes: 16-byte salt and 64-byte scrypt, both hex.
   const passHash = `${"a1".repeat(16)}:${"b2".repeat(64)}`;
-  const cfg = parseConfig({ ...minimal, operator: { user: "jadeyn", passHash } });
-  assert.deepEqual(cfg.operator, { user: "jadeyn", passHash }, "a well-formed login loads");
+  const cfg = parseConfig({ ...minimal, operator: { user: "admin", passHash } });
+  assert.deepEqual(cfg.operator, { user: "admin", passHash }, "a well-formed login loads");
 
   assert.equal(parseConfig(minimal).operator, null, "no operator block means no login");
 
@@ -206,12 +247,12 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
     "an empty username is a config error, not a silent no-login",
   );
   assert.throws(
-    () => parseConfig({ ...minimal, operator: { user: "jadeyn", passHash: "not-a-hash" } }),
+    () => parseConfig({ ...minimal, operator: { user: "admin", passHash: "not-a-hash" } }),
     /operator\.passHash/,
     "a raw password in the file must not parse — only the set-operator output does",
   );
   assert.throws(
-    () => parseConfig({ ...minimal, operator: { user: "jadeyn" } }),
+    () => parseConfig({ ...minimal, operator: { user: "admin" } }),
     /operator\.passHash/,
     "and a missing hash too",
   );
@@ -268,7 +309,7 @@ const friend = (models: Record<string, string> = {}) => ({ url: "http://10.0.0.2
 // --- a model's own slot count ----------------------------------------------
 {
   const with_ = (entry: unknown) => parseConfig({ ...minimal, models: { m: entry } }).models.m!.concurrency;
-  assert.equal(with_({ policy: "local" }), null, "undeclared inherits the backend");
+  assert.equal(with_({ lane: "chat" }), null, "undeclared inherits the backend");
   assert.equal(with_({ concurrency: 2 }), 2, "and may be lower than one");
   assert.throws(() => with_({ concurrency: 0 }), /whole number >= 1/);
   assert.throws(() => with_({ batch: 4 }), /models\.m\.batch is not a setting/, "the old name is migrated, not read");

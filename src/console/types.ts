@@ -29,7 +29,13 @@ export interface ModelStats {
 export interface Backend {
   name: string;
   url?: string;
+  /** The declared machine it runs on; null or absent is the one hearth is on. */
+  server?: string | null;
   kind?: string;
+  /** A provider's server on the internet: it uses no hardware here. */
+  cloud?: boolean;
+  /** Why a provider's server could not be read, in a few words; absent when it could. */
+  trouble?: string;
   loaded?: string[];
   /** Models being read off the disk right now; drawn only when the backend reports it. */
   loading?: string[];
@@ -47,6 +53,8 @@ export interface Backend {
     cpuOnly: boolean;
   }[];
   serves?: string[];
+  /** How much longer it is passed over after failing three times in a row; absent when it is not. */
+  restingMs?: number;
   /** Only llama-swap. An ollama backend keeps its set resident, so it cannot thrash. */
   evicts?: boolean;
   /** False when it cannot report warm state at all, which is not the same as cold. */
@@ -188,14 +196,32 @@ export interface ConfigStatus {
 }
 
 /** Where a request for one id may go, and whether it can fall back home if the peer cannot take it. */
+/** One step of a flow, as the file or the node holds it: `to` is a bare id or a map naming a peer, a flow, `fastest` or `refuse`. */
+export interface Step {
+  when?: Record<string, unknown> | null;
+  to?: unknown;
+  lane?: string | null;
+  params?: Record<string, unknown> | null;
+  /** The actions it sets off when it decides, by name. */
+  do?: string[];
+}
+
+/** A flow: the ids whose requests enter it, and the steps that decide where each goes. */
+export interface Flow {
+  inputs: string[];
+  steps: Step[];
+  /** Switched off: its names run as themselves. */
+  off?: boolean;
+  note?: string;
+  /** How long a conversation stays where the flow first sent it, in ms. */
+  sticky?: number;
+  /** Request paths it answers besides chat. */
+  takes?: string[];
+}
+
 export interface Routing {
-  policy: "local" | "peer" | "spillover" | "fastest";
-  /** Who may serve it, in preference order. Empty means anyone that maps it. */
-  peers: string[];
-  /** Fall back to the local backend when no peer can take it. */
-  fallbackLocal: boolean;
-  /** `spillover` only: go remote once this many jobs are queued here. */
-  spilloverAt: number;
+  /** The backend this id resolves to, when it runs here. */
+  backend?: string;
 }
 
 export interface Controls {
@@ -240,7 +266,15 @@ export interface Canary {
   models: Record<string, CanaryModel>;
 }
 
+/** Requests and tokens over some days. */
+export interface Used { requests: number; failed: number; in: number; out: number; /** How much of `in` was read from a prompt cache. */ cached?: number; /** Dollars, at the prices the models carry now. */ cost?: number }
+
+/** What one peer may take: the models it may run and how much of them. */
+export interface LendTerms { models: string[]; tokensPerDay: number; maxConcurrent: number; rateLimit: number; off?: boolean }
+
 export interface UiData {
+  /** Which console the node serves now; the page reloads when it stops being the one it was loaded from. */
+  build?: string;
   /** The operator logged in on this request, or null for loopback and key callers. */
   operator: string | null;
   /** How to authenticate a write here: "open" on a keyless node, else a key or a session. */
@@ -264,6 +298,22 @@ export interface UiData {
   calls?: Call[];
   /** Samples the server's ring holds, so the streamed page trims to the same window. */
   histKeep?: number;
+  /** Every flow in force, by name. */
+  flows?: Record<string, Flow>;
+  /** How many times each step of each flow has decided since the flows last changed. */
+  flowHits?: Record<string, number[]>;
+  /** Every action by name: its kind, and for a draft what it says or calls. */
+  actions?: Record<string, { kind: string; says?: string }>;
+  /** Saved positions by topology node id. */
+  layout?: Record<string, { x: number; y: number }>;
   /** The canary's verdict per model. Absent only on an older server's payload. */
   canary?: Canary;
+  /** Every api key: its label (or hash where unlabeled), its model scope, and the last time it spoke here. */
+  keys?: { label: string; id: string; models: string[] | null; lastSeen: number | null; today?: Used; month?: Used; rule?: { expires: number | null; requestsPerMinute: number; tokensPerDay: number; dollarsPerDay?: number } | null }[];
+  /** Callers that are not keys (this machine with none, peers) and what they used. */
+  others?: { caller: string; today: Used; month: Used }[];
+  /** Each peer's lines in the ledger: tokens it ran here, tokens this node ran there, and why it is turned away now, if it is. */
+  ledger?: { peer: string; lent: { today: Used; month: Used }; borrowed: { today: Used; month: Used }; closed?: string | null; terms?: LendTerms; /** Which of `terms` are its own, not the node's. */ own?: string[] }[];
+  /** The limits a peer is held to unless it has its own. */
+  lendDefaults?: { tokensPerDay: number; maxConcurrent: number; rateLimit: number };
 }

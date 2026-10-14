@@ -3,7 +3,7 @@
  * concurrency, warm state), so an embedder never waits behind a GPU generation. Nothing
  * schedules across backends; shared hardware only makes one wait for another.
  */
-import type { BackendConfig, HearthConfig, ModelRoute, RouteRule } from "./config.js";
+import { ANY, backendAuth, type BackendConfig, type HearthConfig, type ModelRoute, type RouteRule } from "./config.js";
 import { BackendState } from "./backend.js";
 import { KINDS } from "./kinds.js";
 import type { Logger } from "./log.js";
@@ -19,6 +19,12 @@ export const RESIDENT_RESUME_MS = 30_000;
 
 /** The budget for a whole clear-the-card sequence, which may unload several neighbours. */
 const EVICT_BUDGET_MS = 45_000;
+
+/** How often a backend with a `hold` has its activity path read. */
+const HOLD_POLL_MS = 2_000;
+
+/** How long a hold outlasts its seat's load: time for the app to answer its activity path for the first time. */
+const SEAT_READY_GRACE_MS = 15_000;
 
 /** One backend, with the queue that fronts it. */
 export interface BackendSlot {
@@ -66,6 +72,10 @@ export class BackendPool {
   private readonly yielded = new Set<BackendSlot>();
   private resumeTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Reads the activity path of every backend with a `hold`, and what each read last decided. */
+  private holdTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly holdWas = new Map<BackendSlot, boolean>();
+
   /** The last twenty handoffs, so a card changing hands shows on the status page. */
   private readonly evicted: { t: number; backend: string; for: string; resources: string[] }[] = [];
 
@@ -77,7 +87,7 @@ export class BackendPool {
     this.arbiter.onRelease(() => this.scheduleResume());
     for (const b of cfg.backends) {
       const seen = this.mineOn(b);
-      const state = new BackendState(b.url, b.kind, log, seen.mine, seen.scoped);
+      const state = new BackendState(b.url, b.kind, log, seen.mine, backendAuth(b.format, b.key, b.headers), seen.scoped);
       const slot: BackendSlot = {
         name: b.name,
         cfg: b,
@@ -110,6 +120,7 @@ export class BackendPool {
           arbiter: this.arbiter,
           // Ask overlapping backends to unload before we load; weights stay resident after a run.
           evict: !b.resident && this.arbitrated(b.resources).length > 0 ? () => this.evictFor(b) : undefined,
+          heldOff: (lane) => this.heldOff(b, lane),
         }),
       };
       this.slots.push(slot);
@@ -165,6 +176,29 @@ export class BackendPool {
       return { slot: p.slot, rule: { ...p.rule, model } };
     }
     return undefined;
+  }
+
+  /**
+   * A path some backend declares with a `{model}` segment, as the name standing in that segment
+   * and the same path for another name. The name need not be a model anything serves: it may be
+   * one a flow takes, to be turned into a model before the path is matched to a backend.
+   */
+  named(pathname: string): { path: string; name: string; as: (model: string) => string } | undefined {
+    for (const p of this.patterns) {
+      const m = p.re.exec(pathname);
+      if (!m) continue;
+      try {
+        return { path: p.rule.path, name: decodeURIComponent(m[1]!), as: (model) => p.rule.path.replace("{model}", encodeURIComponent(model)) };
+      } catch {
+        continue; // a malformed escape is not a name
+      }
+    }
+    return undefined;
+  }
+
+  /** Every path a backend declares, as written: what a flow may say it takes. */
+  paths(): string[] {
+    return [...this.byPath.keys(), ...this.patterns.map((p) => p.rule.path)];
   }
 
   /** Does this backend serve this id: declared in `serves`, else reported by it? */
@@ -243,6 +277,76 @@ export class BackendPool {
     this.resumeTimer.unref?.();
   }
 
+  /** Is `lane` kept off `b`'s hardware right now by another backend's hold? */
+  heldOff(b: BackendConfig, lane: string): boolean {
+    const mine = this.arbitrated(b.resources);
+    if (mine.length === 0) return false;
+    for (const s of this.slots) {
+      const h = s.cfg.hold;
+      if (h === null || s.name === b.name || !h.lanes.includes(lane)) continue;
+      if (!s.cfg.resources.some((r) => mine.includes(r))) continue;
+      if (this.holdActive(s)) return true;
+    }
+    return false;
+  }
+
+  /** Does another backend's app hold `b`'s hardware right now, whatever the lane? */
+  appHolds(b: BackendConfig): boolean {
+    const mine = this.arbitrated(b.resources);
+    return this.slots.some((s) =>
+      s.cfg.hold !== null && s.name !== b.name && s.cfg.resources.some((r) => mine.includes(r)) && this.holdActive(s));
+  }
+
+  /** Is this backend's hold in force: its app in use, or its seat loading (or only just loaded)? */
+  private holdActive(s: BackendSlot): boolean {
+    const h = s.cfg.hold!;
+    const loader = h.seat === null ? undefined : this.slots.find((o) => o.cfg.serves.includes(h.seat!));
+    if (loader !== undefined) {
+      if (loader.state.sinceLoading(h.seat!) < SEAT_READY_GRACE_MS) return true;
+      // A seat its swapper says is gone holds nothing, whatever the app last reported.
+      if (loader.state.knowsWarm() && !loader.state.isWarm(h.seat!)) return false;
+    }
+    return s.state.holding(h.idleMs);
+  }
+
+  /**
+   * Read a backend's activity path, unless that would start its app: a seat's own path goes
+   * through its swapper, which loads whatever it is asked for.
+   */
+  sampleActivity(s: BackendSlot): Promise<void> {
+    if (s.cfg.activity === null) return Promise.resolve();
+    const seat = s.cfg.hold?.seat ?? null;
+    if (seat !== null && s.cfg.serves.includes(seat) && !s.state.isWarm(seat)) return Promise.resolve();
+    return s.state.sampleActivity(s.cfg.activity);
+  }
+
+  /** Every declared hold and whether it is in force, for status surfaces and clients that plan around it. */
+  holds(): { backend: string; resources: string[]; lanes: string[]; idleMs: number; active: boolean; quietMs: number | null }[] {
+    return this.slots.filter((s) => s.cfg.hold !== null).map((s) => ({
+      backend: s.name,
+      resources: this.arbitrated(s.cfg.resources),
+      lanes: [...s.cfg.hold!.lanes],
+      idleMs: s.cfg.hold!.idleMs,
+      active: this.holdActive(s),
+      quietMs: s.state.quietMs(),
+    }));
+  }
+
+  /** Read each holding backend's activity path, and wake the queues when a hold starts or ends. */
+  private async sampleHolds(): Promise<void> {
+    const holders = this.slots.filter((s) => s.cfg.hold !== null);
+    await Promise.all(holders.map((s) => this.sampleActivity(s)));
+    let changed = false;
+    for (const s of holders) {
+      const now = this.holdActive(s);
+      if (now === (this.holdWas.get(s) ?? false)) continue;
+      this.holdWas.set(s, now);
+      changed = true;
+      this.log.info(now ? "pool.hold" : "pool.hold_end", { backend: s.name, lanes: s.cfg.hold!.lanes, resources: this.arbitrated(s.cfg.resources) });
+    }
+    if (changed) for (const s of this.slots) s.scheduler.kick();
+  }
+
   /** Recent handoffs, oldest first. See `evicted`. */
   evictions(): readonly { t: number; backend: string; for: string; resources: string[] }[] {
     return [...this.evicted];
@@ -318,6 +422,10 @@ export class BackendPool {
     const declared = this.slots.find((s) => s.cfg.serves.includes(wire));
     if (declared) return declared;
 
+    // A path with no name in it is answered by the model its route names, which is that backend's to run.
+    const routed = this.slots.find((s) => s.cfg.routes.some((r) => r.model === wire));
+    if (routed) return routed;
+
     const claiming = this.slots.filter(
       (s) => s.cfg.serves.length === 0 && s.state.catalog().includes(wire),
     );
@@ -348,7 +456,9 @@ export class BackendPool {
 
   /** Is this id this backend's own: pinned to it, declared by it, or in its catalogue? */
   owns(slot: BackendSlot, model: string): boolean {
-    if (this.cfg.models[model]?.backend === slot.name) return true;
+    // A pin decides it: two backends may run the same id, and a name pinned to one is not the other's.
+    const pinned = this.cfg.models[model]?.backend;
+    if (pinned && this.byName.has(pinned)) return pinned === slot.name;
     const wire = this.outboundId(model);
     return slot.cfg.serves.includes(wire) || slot.state.catalog().includes(wire);
   }
@@ -358,6 +468,9 @@ export class BackendPool {
     // Named in `models:` — the operator said this id means something, and
     // `backend`/`as` may point it somewhere this check cannot see.
     if (this.cfg.models[model]) return false;
+    // A name a flow takes, with or without a variant after it, is that flow's to answer.
+    const cut = model.lastIndexOf(":");
+    if (Object.values(this.cfg.flows).some((flow) => flow.inputs.includes(model) || (cut > 0 && flow.inputs.includes(model.slice(0, cut))))) return false;
     const wire = this.outboundId(model);
     for (const s of this.slots) {
       if (s.cfg.serves.length === 0) return false;
@@ -458,6 +571,8 @@ export class BackendPool {
     for (const id of this.followIds()) {
       if (out.has(this.cfg.models[id]!.as!)) out.add(id);
     }
+    // An id a flow takes is advertised whether or not a backend serves it: where it lands is decided per request.
+    for (const flow of Object.values(this.cfg.flows)) for (const id of flow.inputs) if (id !== ANY) out.add(id);
     return [...out];
   }
 
@@ -570,6 +685,11 @@ export class BackendPool {
 
   start(): void {
     for (const s of this.slots) s.state.start();
+    if (this.slots.some((s) => s.cfg.hold !== null)) {
+      this.holdTimer = setInterval(() => void this.sampleHolds(), HOLD_POLL_MS);
+      this.holdTimer.unref?.();
+      void this.sampleHolds();
+    }
   }
 
   private readonly jobListeners = new Set<() => void>();
@@ -582,5 +702,7 @@ export class BackendPool {
 
   stop(): void {
     for (const s of this.slots) s.state.stop();
+    if (this.holdTimer) clearInterval(this.holdTimer);
+    this.holdTimer = null;
   }
 }

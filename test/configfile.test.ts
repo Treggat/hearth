@@ -58,14 +58,20 @@ peers:
       # my id: their id. Also the allowlist.
       borrowed: theirs
 
-models:
+flows:
   borrowed:
-    policy: peer
-    fallbackLocal: true
+    inputs: [borrowed]
+    steps:
+      - to: {peer: friend}
+      - to: borrowed
+  rest: {inputs: ["*"], steps: [{to: {asked: true}}]}
+
+models:
   # Past 80 columns on purpose: the writer's default would fold it across lines.
   long-one: {concurrency: 4, params: {thinking_token_budget: 2048}, pool: {tokens: 144000, output: 8192}, stats: {context: 131072}}
 `;
 
+const FULL = ORIGINAL;
 const comments = (t: string) => t.split("\n").filter((l) => l.includes("#")).map((l) => l.slice(l.indexOf("#"))).join("\n");
 
 type Status = { path: string | null; hash: string; restartPending: string[]; error: string | null };
@@ -112,7 +118,8 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   const back = loadConfig(cfgPath);
   assert.deepEqual(back.share, ["spare"], "no save step: the file already says it");
   assert.equal(back.peers[0]!.models.extra, "their-extra");
-  assert.equal(back.models.extra!.policy, "peer", "a link writes its route, not just the mapping");
+  assert.deepEqual(back.flows.extra!.steps[0]!.to, { peer: "friend", model: null }, "a link writes a flow that sends it there, not just the mapping");
+  assert.match(written, /^    inputs: \[borrowed\]\n    steps:\n      - to: \{peer: friend\}/m, "a flow nobody edited is left exactly as written");
   assert.equal(back.peers[0]!.models.borrowed, "theirs", "untouched entries stay untouched");
   assert.deepEqual(back.notes, { mine: "use for: \"quoted\" things" });
   assert.equal(await a.note("mine"), "use for: \"quoted\" things", "and the running node has it too");
@@ -145,7 +152,7 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   assert.match(both, /^lending:\n  models: \[mine, spare\]/m, "and ours is on top of it");
 
   // With no request at all, the watcher picks a hand edit up and the node runs it.
-  writeFileSync(cfgPath, readFileSync(cfgPath, "utf8").replace("models:\n  borrowed:", "models:\n  mine:\n    note: typed in vim\n  borrowed:"));
+  writeFileSync(cfgPath, readFileSync(cfgPath, "utf8").replace("\nmodels:\n", "\nmodels:\n  mine:\n    note: typed in vim\n"));
   await settle();
   assert.equal(await a.note("mine"), "typed in vim", "a hand edit applies without a restart or a click");
 
@@ -164,6 +171,18 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   await settle();
   assert.equal((await a.file()).error, null, "fixing it clears the error");
   await a.node.close();
+}
+
+{
+  // A hand edit to a restart-only key loads, and the journal says it is waiting on a restart.
+  writeFileSync(cfgPath, ORIGINAL);
+  const warned: Record<string, unknown>[] = [];
+  const node = createNode(loadConfig(cfgPath), { ...silentLogger, warn: (msg, f) => { if (msg === "config.reloaded") warned.push(f ?? {}); } });
+  node.start();
+  writeFileSync(cfgPath, ORIGINAL.replace("serves: [mine, spare]", "serves: [mine]"));
+  await settle();
+  assert.deepEqual(warned.at(-1)?.restartPending, ["backends"], "a serves edit is logged as waiting on a restart");
+  await node.close();
 }
 
 /* ------------------------------------------------------------ PATCH /config */
@@ -253,7 +272,7 @@ const settle = () => new Promise((r) => setTimeout(r, 700));
   const after = loadConfig(cfgPath);
   assert.deepEqual(after.share, ["mine", "spare"], "its share deltas are in the file");
   assert.equal(after.peers[0]!.models.extra, "their-extra");
-  assert.equal(after.models.extra!.fallbackLocal, false);
+  assert.deepEqual(after.flows.extra!.steps.map((s) => Object.keys(s.to)[0]), ["peer", "refuse"], "a route it held becomes the flow it described");
   assert.equal(after.notes?.mine, "from the sidecar");
   assert.ok(!existsSync(statePath) && existsSync(`${statePath}.migrated`), "and the sidecar is retired");
   assert.match(readFileSync(cfgPath, "utf8"), /# my id: their id\. Also the allowlist\./, "comments intact");
@@ -281,6 +300,7 @@ peers:
     token: plain-peer-token
     accept: plain-token-value
     models: {}
+flows: {rest: {inputs: ["*"], steps: [{to: {asked: true}}]}}
 operator:
   user: op
   passHash: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
@@ -334,6 +354,40 @@ operator:
   delete process.env.HEARTH_TEST_SECRET;
 }
 
+/* ------------------------------------ a stand-in goes home, and nowhere else */
+
+{
+  const path = join(mkdtempSync(join(tmpdir(), "hearth-standin-")), "hearth.yaml");
+  const peers = Array.from({ length: 6 }, (_, i) => `  p${i}: { url: "http://127.0.0.1:1", token: token-${i}, accept: accept-${i}, models: {} }`).join("\n");
+  writeFileSync(path, `name: n
+backends:
+  main: { url: "${beUrl}", kind: none, serves: [mine], key: "odd: key #1" }
+peers:
+${peers}
+actions:
+  tell: { call: "http://127.0.0.1:1/hook", headers: { Authorization: "Bearer hook-secret" } }
+canary: { prompt: hi, expect: hi, models: { mine: {} }, notify: { url: "http://127.0.0.1:1/c", headers: { X-Token: canary-secret } } }
+flows: {rest: {inputs: ["*"], steps: [{to: {asked: true}}]}}
+`);
+  const before = readFileSync(path, "utf8");
+  const a = await boot(path);
+  const f = await a.file();
+  for (const secret of ["token-", "accept-", "odd: key", "hook-secret", "canary-secret"]) assert.ok(!f.text.includes(secret), `${secret} is out of the page`);
+
+  // Past nine secrets one stand-in is the start of another; each still comes home as its own.
+  assert.equal((await a.patch({ baseHash: f.hash, text: f.text })).status, 200);
+  assert.equal(readFileSync(path, "utf8"), before, "an untouched save writes the file back as it was");
+
+  // A stand-in typed where the page shows a value would read the secret out.
+  const leak = await a.patch({ baseHash: f.hash, text: f.text.replace("name: n", "name: hearth-secret1") });
+  assert.equal(leak.status, 422);
+  assert.match(((await leak.json()) as { error: { message: string } }).error.message, /^name carries the stand-in/);
+  assert.equal((await a.patch({ baseHash: f.hash, ops: [{ path: ["backends", "main", "url"], value: "http://127.0.0.1:1/hearth-secret1" }] })).status, 422, "by an op as well");
+  assert.equal((await a.patch({ baseHash: f.hash, ops: [{ path: ["backends", "main", "key"], value: "hearth-secret99" }] })).status, 422, "and one this node never handed out is not written as a key");
+  assert.equal(readFileSync(path, "utf8"), before);
+  await a.node.close();
+}
+
 /* ---------------------------------------- a node built in code edits memory */
 
 {
@@ -352,6 +406,8 @@ operator:
 /* ------------------------------------------ a rename changes the key and nothing else */
 
 {
+  // A flow that names the peer would have to be renamed with it; this file has none, so the rename stands alone.
+  const ORIGINAL = FULL.replace(/flows:\n[\s\S]*?\n\nmodels:/, 'flows: {rest: {inputs: ["*"], steps: [{to: {asked: true}}]}}\n\nmodels:');
   writeFileSync(cfgPath, ORIGINAL);
   const a = await boot();
   const r = await a.patch({ ops: [{ path: ["peers", "friend"], rename: "gpu-east" }] });
@@ -367,6 +423,50 @@ operator:
   assert.equal(gone.status, 409, "and so is renaming something that is not there");
   await gone.text();
   await a.node.close();
+}
+
+// --- a draft kept by the node, and versions to go back to ----------------------------------------------
+{
+  const path = join(dir, "versions.yaml");
+  writeFileSync(path, ORIGINAL);
+  const h = await boot(path);
+  const at = (route: string, method = "GET", body?: unknown) =>
+    fetch(`${h.url}${route}`, { method, headers: { "Content-Type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }).then(async (r) => ({ status: r.status, body: (await r.json()) as Record<string, any> }));
+
+  // A draft is kept beside the file and changes nothing about what runs; letting go removes it.
+  const before = await h.file();
+  assert.equal((await at("/config/draft")).body.draft, null);
+  await at("/config/draft", "PUT", { base: {}, draft: { note: "mine" } });
+  assert.deepEqual([(await at("/config/draft")).body.draft, existsSync(`${path}.draft.json`), (await h.file()).hash], [{ base: {}, draft: { note: "mine" } }, true, before.hash]);
+  await at("/config/draft", "DELETE");
+  assert.deepEqual([(await at("/config/draft")).body.draft, existsSync(`${path}.draft.json`)], [null, false]);
+
+  // A write is a version under the name it was given; the file as it stood before the first is one too. A dry run is not.
+  assert.deepEqual((await at("/config/versions")).body.versions, []);
+  await h.patch({ ops: [{ path: ["scheduler", "maxPerLane"], value: 7 }], dryRun: true });
+  await h.patch({ ops: [{ path: ["scheduler", "maxPerLane"], value: 7 }], name: "a deeper queue" });
+  const kept = (await at("/config/versions")).body.versions as { name: string; hash: string }[];
+  assert.deepEqual([kept.map((v) => v.name), kept[0]!.hash, kept[1]!.hash], [["before the first change made here", "a deeper queue"], before.hash, (await h.file()).hash]);
+
+  // Going back shows what it would change first, then makes that version the file again, as a version of its own.
+  const dry = await at("/config/versions", "POST", { hash: before.hash, dryRun: true });
+  assert.deepEqual([dry.status, dry.body.hash, (await h.file()).hash], [200, before.hash, kept[1]!.hash]);
+  assert.equal((await at("/config/versions", "POST", { hash: before.hash })).status, 200);
+  assert.deepEqual([(await h.file()).hash, readFileSync(path, "utf8")], [before.hash, ORIGINAL]);
+  assert.equal(((await at("/config/versions")).body.versions as { name: string }[]).at(-1)!.name, "back to before the first change made here");
+  assert.equal((await at("/config/versions", "POST", { hash: "nope" })).status, 404);
+
+  // The list may come wrapped with its shape's number; one from a later hearth is neither read nor written over.
+  const listFile = `${path}.versions.json`;
+  const bare = JSON.parse(readFileSync(listFile, "utf8")) as unknown[];
+  writeFileSync(listFile, JSON.stringify({ v: 1, versions: bare }));
+  assert.equal(((await at("/config/versions")).body.versions as unknown[]).length, bare.length);
+  const later = JSON.stringify({ v: 2, versions: { later: "shape" } });
+  writeFileSync(listFile, later);
+  assert.deepEqual((await at("/config/versions")).body.versions, []);
+  assert.equal((await at("/config", "PATCH", { ops: [{ path: ["name"], value: "renamed" }] })).status, 200, "a save still lands");
+  assert.equal(readFileSync(listFile, "utf8"), later);
+  await h.node.close();
 }
 
 backend.closeAllConnections();

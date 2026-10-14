@@ -5,7 +5,7 @@
  */
 
 /** Where a setting's choices come from, read off the config being edited. */
-export type Ref = "models" | "lanes" | "resources" | "backends" | "peers";
+export type Ref = "models" | "lanes" | "resources" | "backends" | "peers" | "servers" | "actions";
 
 export type Field =
   | { type: "text" | "secret"; desc: string; def?: string }
@@ -21,41 +21,57 @@ export type Field =
   | { type: "raw"; desc: string };
 
 export type Scope =
-  | "node" | "listen" | "backendDefaults" | "backend" | "activity" | "resource" | "scheduler" | "lane"
-  | "model" | "stats" | "pool" | "peer" | "lending" | "borrowing" | "operator";
+  | "node" | "listen" | "backendDefaults" | "backend" | "activity" | "resource" | "server" | "flow" | "action" | "scheduler" | "lane"
+  | "model" | "stats" | "pool" | "price" | "peer" | "lend" | "lending" | "borrowing" | "operator";
 
 const ms = (desc: string, def?: number | string, min?: number): Field =>
   ({ type: "ms", desc, ...(def !== undefined ? { def } : {}), ...(min !== undefined ? { min } : {}) });
 
 /** The top-level keys that are sections of their own rather than node settings. */
-export const SECTION_KEYS = ["backends", "resources", "models", "scheduler", "peers"] as const;
+export const SECTION_KEYS = ["backends", "resources", "servers", "models", "flows", "actions", "scheduler", "peers"] as const;
+
+/** The lending limits a peer's own `lend:` may restate; `lending:` sets them for everyone else. */
+const TERMS: Record<string, Field> = {
+  models: { type: "refs", ref: "models", desc: "Models peers may run here. Empty lends nothing." },
+  tokensPerDay: { type: "number", min: 0, desc: "Tokens one peer may run here in a UTC day. 0 is no limit.", def: 0 },
+  maxConcurrent: { type: "number", min: 1, desc: "Jobs one peer may have in flight.", def: 2 },
+  rateLimit: { type: "number", min: 1, desc: "Peer inference requests per hour. Capacity polling has its own budget.", def: 600 },
+};
 
 export const FIELDS: Record<Scope, Record<string, Field>> = {
   node: {
+    version: { type: "number", min: 1, desc: "The layout this file is written in. `hearth init` and `hearth migrate` write it; a file newer than the node reading it is refused.", def: 3 },
     name: { type: "text", desc: "How this node identifies itself to peers.", def: "hostname" },
     listen: { type: "object", scope: "listen", desc: "Address and port hearth serves on.", seed: { host: "127.0.0.1", port: 4141 } },
     lending: { type: "object", scope: "lending", desc: "What peers may run here, and how much of it.", seed: { models: [] } },
     borrowing: { type: "object", scope: "borrowing", desc: "How this node reads and waits on its peers.", seed: {} },
     backendDefaults: { type: "object", scope: "backendDefaults", desc: "Defaults every backend takes unless it sets its own.", seed: {} },
-    apiKeys: { type: "list", desc: "Keys allowed on /v1/*. Empty means loopback only; setting it means loopback needs a key too." },
+    apiKeys: { type: "list", desc: "Keys allowed on /v1/*. Empty means loopback only; setting it means loopback needs a key too. An entry may carry a label, the models it may run, a day it expires and limits." },
     maxBodyBytes: { type: "number", min: 1024, desc: "Largest accepted request body, in bytes.", def: 33554432 },
+    modelHeader: { type: "bool", desc: "Send `x-hearth-model` on every chat answer: the id the request ran as. Turn off where callers should not see what is behind a name.", def: true },
     shutdownGraceMs: ms("How long a shutdown waits for requests in flight. 0 drops them.", 30000),
     operator: { type: "raw", desc: "The console login. Written by `hearth set-operator`." },
-    historyFile: { type: "text", desc: "A file that keeps the console's day of history and recent logs across restarts. Unset keeps them in memory." },
+    historyFile: { type: "text", desc: "A file that keeps the console's day of history, recent logs and the month of usage per caller across restarts. Unset keeps them in memory." },
+    routers: { type: "raw", desc: "Rulebooks besides `flows:`: `routers.<name>` has `flows` in the same shape, and `strict` so a request runs on the model its line names or fails: no next line after a failure, no route fallback. `callers:` says who goes by one." },
+    callers: { type: "raw", desc: "Which rulebook a caller goes by: an api key's label, `local`, or `*` for everyone else, each to a name under `routers:` or `default` for `flows:`. Unset, everyone goes by `flows:`." },
+    layout: { type: "raw", desc: "Where the console's topology draws the nodes you have placed. Written by its editor." },
     stateFile: { type: "raw", desc: "A pre-2.0 console sidecar, folded into this file once at startup." },
     canary: { type: "raw", desc: "Ask named models a question with one right answer, on a schedule; a seat that answers 200 with nothing is taken out of rotation. Off unless set; restart-only." },
   },
   listen: {
-    host: { type: "text", desc: "Widening the host is deliberate: see Security in the README.", def: "127.0.0.1" },
+    host: { type: "text", desc: "Widening the host is deliberate: see docs/security.md.", def: "127.0.0.1" },
     port: { type: "number", min: 1, desc: "Port for the API, peers and the console.", def: 4141 },
   },
   backendDefaults: {
     concurrency: { type: "number", min: 1, desc: "Jobs at once on a backend.", def: 1 },
     firstByteMs: ms("How long a backend may take to start answering. 0 waits forever.", 900000),
     idleMs: ms("How long a backend may go silent mid-answer. 0 waits forever.", 600000),
+    restMs: ms("After three failures in a row, how long a backend is passed over where a flow has another line that fits. 0 never passes one over.", 30000),
   },
   backend: {
-    url: { type: "text", desc: "The OpenAI-compatible server hearth fronts." },
+    url: { type: "text", desc: "The OpenAI-compatible server hearth fronts. Or set server and port." },
+    server: { type: "ref", ref: "servers", desc: "The machine this backend runs on. Unset is this one." },
+    port: { type: "number", min: 1, desc: "With server and no url: the backend is http://<server host>:<port>." },
     kind: { type: "enum", options: ["llama-swap", "ollama", "single", "none"], desc: "Where warm state comes from.", def: "llama-swap" },
     resources: { type: "refs", ref: "resources", desc: "Hardware this backend uses. Backends on one exclusive card take turns." },
     serves: { type: "list", desc: "Model ids this backend serves. Declaring replaces discovery and acts as an allowlist; on a URL shared with another backend, only these count as its loaded models." },
@@ -64,7 +80,14 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     idleMs: ms("How long this backend may go silent mid-answer.", "backendDefaults"),
     activity: { type: "object", scope: "activity", desc: "Where this backend reports its own busy state.", seed: { path: "/", running: "" } },
     resident: { type: "bool", desc: "Stays loaded beside the card's swapping model and is asked to yield when it needs the memory.", def: false },
+    hold: { type: "raw", desc: "`{ lanes, idleMs, seat? }`: while this backend's app has work (read off `activity`), keep these lanes off its hardware until it has been idle this long. `seat` is the id a model swapper loads the app under, so the hold starts as the seat loads." },
     routes: { type: "raw", desc: "Paths this backend answers besides chat, each with its lane and model." },
+    key: { type: "secret", desc: "Sent to this backend as its bearer key on every call. env:NAME keeps it out of the file." },
+    headers: { type: "object", desc: "Headers sent to this backend on every call beside its key, for an API that asks for more than one. A value may be env:NAME.", seed: {} },
+    format: { type: "enum", options: ["openai", "anthropic"], desc: "The API it speaks. anthropic is the Messages API: requests and answers are rewritten, so callers still see chat completions.", def: "openai" },
+    promptCache: { type: "bool", desc: "With format anthropic: mark each request's system prompt, tools and conversation so far for the provider's prompt cache.", def: true },
+    promptCacheTtl: { type: "enum", options: ["5m", "1h"], desc: "With promptCache: how long the provider keeps a prefix after its last use. 1h costs more to write and is worth it where a conversation's requests come more than five minutes apart.", def: "5m" },
+    cloud: { type: "bool", desc: "A provider's server on the internet: no hardware here, and only the models under serves. Requests sent to it leave this network.", def: false },
   },
   activity: {
     path: { type: "text", desc: "The backend path to read." },
@@ -74,6 +97,27 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
   resource: {
     kind: { type: "enum", options: ["gpu", "cpu", "other"], desc: "Picks the icon; gpu and other are exclusive unless shared.", def: "gpu" },
     shared: { type: "bool", desc: "Many backends at once, never arbitrated: CPUs, mostly.", def: false },
+  },
+  server: {
+    host: { type: "text", desc: "The machine's address on your network: an IP or a hostname, no scheme or port." },
+  },
+  flow: {
+    note: { type: "text", desc: "What this flow is for." },
+    off: { type: "bool", desc: "Switched off: requests for its inputs run as themselves.", def: false },
+    takes: { type: "list", desc: "Request paths this flow answers besides chat, each as a backend declares it under routes: (image generation and the like). Unset is chat." },
+    sticky: { type: "ms", min: 1000, desc: "How long a conversation stays where this flow first sent it, so later turns keep the same model. Unset decides every turn afresh." },
+    inputs: { type: "refs", ref: "models", desc: "The ids whose requests enter this flow. An id enters at most one." },
+    steps: { type: "raw", desc: "Tried in order, first match wins: `when: {…}`, `to:` a model, `{ peer }`, `{ flow }`, `{ fastest: […] }` or `{ refuse }`, with optional `lane`, `params`, `max` (requests in flight at once) and `do:` (actions to set off). The last has no `when`." },
+  },
+  action: {
+    on: { type: "enum", options: ["decided", "finished", "failed"], desc: "When it runs: as the step decides, once the request has finished (either way), or only when it failed.", def: "decided" },
+    slowerThan: { type: "ms", min: 1000, desc: "Only for a request that took longer than this. It then runs once the request has finished, unless `on` says failed." },
+    every: { type: "ms", min: 1000, desc: "Run at most once in this long, however many requests name it. Unset runs every time." },
+    log: { type: "text", desc: "Write this line to the log. `{asked}`, `{model}`, `{caller}` and the other request facts are filled in." },
+    call: { type: "text", desc: "Send a request to this URL, without waiting on it. env:NAME keeps it out of the file." },
+    method: { type: "enum", options: ["POST", "PUT", "GET"], desc: "call only: how the URL is called.", def: "POST" },
+    headers: { type: "object", desc: "call only: headers to send. A value may be env:NAME.", seed: {} },
+    body: { type: "raw", desc: "call only: the JSON to send, with `{asked}` and the like filled in. Unset sends every request fact." },
   },
   scheduler: {
     lanes: { type: "object", desc: "Named lanes and their base priority. Lower goes first.", seed: { chat: { priority: 0 } } },
@@ -88,20 +132,18 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     maxWaitMs: ms("Fail a queued job once nothing on its backend has started for this long. A guard against a wedged backend.", undefined, 1000),
   },
   model: {
-    policy: { type: "enum", options: ["local", "peer", "spillover", "fastest"], desc: "Where requests for this model run.", def: "local" },
     note: { type: "text", desc: "What the model is for, shown to borrowers and as description on /v1/models." },
     as: { type: "ref", ref: "models", desc: "The id this one goes out as: an alias for another model." },
     backend: { type: "ref", ref: "backends", desc: "Pin to a backend instead of resolving it from the catalogs." },
     follow: { type: "bool", desc: "Go out as whatever the pinned backend has loaded, else as `as`. Needs backend and as.", def: false },
     lane: { type: "ref", ref: "lanes", desc: "Lane this model's requests queue in, over the client's." },
-    peers: { type: "refs", ref: "peers", desc: "Only these peers may run it. Empty is any peer that maps it." },
-    spilloverAt: { type: "number", min: 1, desc: "spillover only: go to a peer once this many jobs are queued here.", def: 1 },
-    fallbackLocal: { type: "bool", desc: "Fall back to running here when no peer can take it.", def: true },
     concurrency: { type: "number", min: 1, desc: "Jobs this model may run at once, above or below its backend's.", def: "backend's" },
     shareAfterMs: ms("A turn joins running turns only once each has run this long. Matters above concurrency 1.", undefined, 0),
+    cacheMs: ms("Keep an answer this long and give it to an identical request without running it. 0 keeps none.", 0, 0),
     videoTokens: { type: "number", min: 1, desc: "What one video costs when checking a request fits the context window.", def: 49152 },
     params: { type: "object", desc: "Request fields stamped on every call: temperature, top_p and the like.", seed: {} },
     stats: { type: "object", scope: "stats", desc: "What the model takes, for one that hasn't loaded or a backend that can't say.", seed: {} },
+    price: { type: "object", scope: "price", desc: "What a million tokens in and out cost, in dollars: usage is then shown as spend, and a key can be capped by it.", seed: { in: 0, out: 0 } },
     pool: { type: "object", scope: "pool", desc: "Token budget shared by this model's running turns.", seed: { tokens: 131072 } },
     emulate: { type: "enum", options: ["llama-server"], desc: "Reshape this backend's answers into another server's format." },
   },
@@ -113,6 +155,11 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     effort: { type: "bool", desc: "Takes a reasoning-effort setting." },
     quant: { type: "text", desc: "Quantization, shown to borrowers." },
   },
+  price: {
+    in: { type: "number", min: 0, desc: "Dollars per million tokens sent to it." },
+    out: { type: "number", min: 0, desc: "Dollars per million tokens it answers with." },
+    cached: { type: "number", min: 0, desc: "Dollars per million input tokens read from the provider's prompt cache. Unset prices them as any input." },
+  },
   pool: {
     tokens: { type: "number", min: 1, desc: "Tokens shared by this model's running turns." },
     output: { type: "number", min: 1, desc: "Tokens reserved for each turn's answer." },
@@ -122,12 +169,15 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     token: { type: "secret", desc: "What you present when borrowing from it. env:NAME keeps it out of the file." },
     accept: { type: "secret", desc: "What it presents when borrowing from you. Without one it cannot borrow." },
     models: { type: "object", desc: "your id: their id, for each model you borrow.", seed: {} },
+    lend: { type: "object", scope: "lend", desc: "This peer's own lending terms. Each one set here replaces the `lending` setting of the same name, for this peer.", seed: {} },
+  },
+  lend: {
+    ...TERMS,
+    off: { type: "bool", desc: "Lend this peer nothing, and keep the rest of its limits for when it is turned back on.", def: false },
   },
   lending: {
-    models: { type: "refs", ref: "models", desc: "Models peers may run here. Empty lends nothing." },
+    ...TERMS,
     lane: { type: "ref", ref: "lanes", desc: "Which lane borrowed work enters.", def: "lowest-priority lane" },
-    maxConcurrent: { type: "number", min: 1, desc: "Jobs one peer may have in flight.", def: 2 },
-    rateLimit: { type: "number", min: 1, desc: "Peer inference requests per hour. Capacity polling has its own budget.", def: 600 },
   },
   borrowing: {
     firstByteMs: ms("How long to wait for a peer to start answering before falling back. 0 waits forever.", 180000),
@@ -152,11 +202,16 @@ export function scopeOf(path: (string | number)[]): Scope | null {
   if (a === "backends" && n === 2) return "backend";
   if (a === "backends" && c === "activity" && n === 3) return "activity";
   if (a === "resources" && n === 2) return "resource";
+  if (a === "servers" && n === 2) return "server";
+  if (a === "flows" && n === 2) return "flow";
+  if (a === "actions" && n === 2) return "action";
   if (a === "scheduler" && b === "lanes" && n === 3) return "lane";
   if (a === "models" && n === 2) return "model";
   if (a === "models" && c === "stats" && d === undefined) return "stats";
   if (a === "models" && c === "pool" && d === undefined) return "pool";
+  if (a === "models" && c === "price" && d === undefined) return "price";
   if (a === "peers" && n === 2) return "peer";
+  if (a === "peers" && c === "lend" && n === 3) return "lend";
   return null;
 }
 

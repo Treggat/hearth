@@ -2,14 +2,18 @@
  * The HTTP surface: OpenAI-compatible `/v1/*` (clients change only a base url) and the `/peer/*`
  * protocol. Bodies stream through untouched; only the model id and stream flag are read.
  */
+import { isIP } from "node:net";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { pipeline as pipeline_ } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { createHash, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 
-import { admitModel, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
+import { actionDecls, runAction, type Action, type ActionFacts } from "./actions.js";
+import { admitModel, inScope, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import { createCanary, degradedError, type RelayWatch } from "./canary.js";
-import { peersMapping, WARM_LANE, type BackendConfig, type HearthConfig, type RoutePolicy } from "./config.js";
+import { ANY, backendAuth, backendBase, ConfigError, flowsFor, resolveSecret, peersMapping, WARM_LANE, type BackendConfig, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
 import { Controls } from "./controls.js";
 import { emulatedRequest, relayEmulated, streamErrorFrame } from "./emulate.js";
 import { ConfigFile, ConfigRefusal, deepFreeze, link, setNote, setShare, unlink, writeFileAtomic } from "./configfile.js";
@@ -17,14 +21,19 @@ import { COOKIE, LoginThrottle, OperatorSessions, SESSION_TTL_MS, cookieToken, h
 import { LogRing, type Logger } from "./log.js";
 import { PeerRegistry, PeerStatusError } from "./peers.js";
 import { BackendPool, type BackendSlot } from "./pool.js";
-import { decide, type LocalLoad } from "./route.js";
+import { decide, mayLeave, resolve, variantsOf, type LocalLoad, type World } from "./route.js";
 import { QueueFullError } from "./scheduler.js";
 import { DAY_MS, History } from "./history.js";
+import { KEEP_DAYS, meter, Usage, withoutUsage, type Meter } from "./usage.js";
+import { closedWhy, termsFor } from "./lending.js";
+import { Answers } from "./answers.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
-import { CONSOLE_HTML } from "./ui.js";
-import { createViews } from "./views.js";
+import { CONSOLE_CSP, CONSOLE_HTML } from "./ui.js";
+import { createViews, type CallerUse, type KeyInfo, type LedgerRow, type Spent } from "./views.js";
 import { multipartField, replaceMultipartField } from "./multipart.js";
-import { send, type UpstreamResponse } from "./upstream.js";
+import { relayAnthropic, toAnthropic } from "./anthropic.js";
+import { troubleSays } from "./backend.js";
+import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
 
 /** Constant-time compare over sha256 digests, so neither length nor content leaks. */
 function secretEq(a: string, b: string): boolean {
@@ -102,12 +111,23 @@ const HOP_BY_HOP = new Set([
   "host",
 ]);
 
+const NO_OPERATOR = "this node has no operator yet: open the console on the machine itself, or run `hearth set-operator <user> <pass>` there";
+
+/** The shape of the history file this build writes, and the latest it reads. */
+const HISTORY_VERSION = 1;
+
+/** Said to a caller whose own key was fine: a 401 passed on from the backend would read as this node refusing them. */
+const KEY_REFUSED = "the backend refused the key this node sends it; the key you sent this node was accepted";
+const refusedKey = (status: number): boolean => status === 401 || status === 403;
+
 function forwardable(
   headers: IncomingMessage["headers"] | UpstreamResponse["headers"],
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(headers)) {
-    if (v === undefined || HOP_BY_HOP.has(k.toLowerCase())) continue;
+    const name = k.toLowerCase();
+    // Cookies belong to this node's own origin: a backend is neither shown the operator's session nor able to set one.
+    if (v === undefined || HOP_BY_HOP.has(name) || name === "cookie" || name === "set-cookie") continue;
     out[k] = v;
   }
   return out;
@@ -115,7 +135,7 @@ function forwardable(
 
 export interface HearthNode {
   server: Server;
-  /** The local backends and their queues. One entry unless `backends:` is used. */
+  /** The local backends and their queues. One entry unless `backends:` is used. The node's own machinery, as are the next two: not held steady between releases. */
   pool: BackendPool;
   peers: PeerRegistry;
   history: History;
@@ -136,7 +156,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   // ConfigFile swaps the live keys in whole and everything reads those per call; the rest changes
   // only with a restart, so an accidental write throws instead of going stale.
   for (const part of [cfg.listen, cfg.backends, cfg.scheduler, cfg.resources,
-                      cfg.apiKeys, cfg.apiKeyLabels, cfg.apiKeyModels, cfg.peerTokens]) deepFreeze(part);
+                      cfg.apiKeys, cfg.apiKeyLabels, cfg.apiKeyModels, cfg.apiKeyRules, cfg.peerTokens]) deepFreeze(part);
   // One state and one queue per backend. Pushed over SSE where the backend
   // supports it, polled where it doesn't.
   const pool = new BackendPool(cfg, log);
@@ -153,9 +173,21 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** The opt-in canary, or null when `canary:` is not configured. */
   const canary = createCanary(cfg, pool, log);
 
-  /** What we lend right now: `share:` while lending is on, nothing while paused. Every share gate reads this. */
-  const shared = (): readonly string[] => controls.share(cfg.share);
+  /** Requests and tokens per caller per model per day. */
+  const usage = new Usage();
+  /** The same, for what this node ran on each peer. */
+  const borrowed = new Usage();
+  /** Why `peer` is turned away right now under its limits, or null. */
+  const closedTo = (peer: string): string | null => closedWhy(termsFor(cfg, peer), usage.total(`peer:${peer}`, 1));
 
+  /**
+   * What we lend right now, to one peer or (unnamed) by the node's own list: nothing while lending
+   * is paused, and nothing to a peer that has reached its limit. Every share gate reads this.
+   */
+  const shared = (peer?: string): readonly string[] =>
+    peer === undefined ? controls.share(cfg.share) : closedTo(peer) !== null ? [] : controls.share(termsFor(cfg, peer).models);
+  /** Answers kept for the models that say so. */
+  const answers = new Answers();
   const history = new History(() => {
     const agg = pool.aggregate();
     return {
@@ -194,20 +226,71 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return false;
   }
 
-  const peerOverLimit = (name: string) => overBudget(peerHits, name, cfg.peerRateLimit);
+  /** Jobs one caller may hold per lane; a peer's is its own limit. */
+  const capFor = (peer: string | null) =>
+    callerCap(peer, { scheduler: cfg.scheduler, peerMaxConcurrent: peer !== null ? termsFor(cfg, peer).maxConcurrent : cfg.peerMaxConcurrent });
+  const peerOverLimit = (name: string) => overBudget(peerHits, name, termsFor(cfg, name).rateLimit);
   const controlOverLimit = (name: string) => overBudget(controlHits, name, CONTROL_LIMIT_PER_HOUR);
+
+  /** Is this a name some flow takes, here or in a router's rulebook? */
+  const isType = (name: string): boolean =>
+    [cfg.flows, ...Object.values(cfg.routers).map((r) => r.flows)].some((flows) => Object.values(flows).some((f) => f.inputs.includes(name)));
 
   /** The gates every model request passes before it is queued; throws the Refusal. */
   function admit(c: Call, model: string): void {
+    // Said in its own words: a peer told only "does not share" cannot tell a spent day from a model it was never lent.
+    const why = c.peer !== null && controls.lendingOn && !termsFor(cfg, c.peer).off ? closedTo(c.peer) : null;
+    if (why !== null) throw new Refusal(429, `${cfg.name} is not lending to you right now: ${why}`, "rate_limit_error");
     const refused = admitModel({ model, peer: c.peer, scope: c.models }, {
       name: cfg.name,
-      shared,
+      shared: () => (c.peer !== null ? shared(c.peer) : shared()),
+      type: isType,
       // A peer may map an id nothing here serves.
       unknown: (m) => pool.certainlyUnknown(m) && peersMapping(m, [], cfg.peers).length === 0
         ? pool.catalog().join(", ") || "nothing"
         : null,
     });
     if (refused) throw refused;
+    withinLimits(c.caller);
+  }
+
+  /** When each limited key last asked, for its requests-a-minute limit. */
+  const asked = new Map<string, number[]>();
+
+  /**
+   * What a caller used over some days, with what it cost. ponytail: priced at what each model
+   * costs now, not on the day; keep dollars in the ledger if prices change often enough to matter.
+   */
+  function spent(caller: string, days: number): Spent {
+    let cost = 0;
+    for (const [model, row] of Object.entries(usage.byModel(caller, days))) {
+      const p = cfg.models[model]?.price;
+      const cached = Math.min(row.cached ?? 0, row.in);
+      if (p) cost += ((row.in - cached) * p.in + cached * (p.cached ?? p.in) + row.out * p.out) / 1_000_000;
+    }
+    return { ...usage.total(caller, days), cost };
+  }
+
+  /** Hold a key to its limits: so many requests a minute, so many tokens a UTC day. Counts the request it lets through. */
+  function withinLimits(caller: string): void {
+    if (!caller.startsWith("key:")) return;
+    const i = cfg.apiKeys.findIndex((k, n) => "key:" + (cfg.apiKeyLabels[n] || keyId(k)) === caller);
+    const rule = cfg.apiKeyRules[i];
+    if (!rule) return;
+    if (rule.tokensPerDay > 0) {
+      const used = usage.total(caller, 1);
+      if (used.in + used.out >= rule.tokensPerDay) throw new Refusal(429, `this key has used its ${rule.tokensPerDay} tokens for today (UTC)`, "rate_limit_error");
+    }
+    if (rule.dollarsPerDay > 0 && spent(caller, 1).cost >= rule.dollarsPerDay) throw new Refusal(429, `this key has spent its $${rule.dollarsPerDay} for today (UTC)`, "rate_limit_error");
+    if (rule.requestsPerMinute > 0) {
+      const now = Date.now();
+      const recent = (asked.get(caller) ?? []).filter((t) => now - t < 60_000);
+      if (recent.length >= rule.requestsPerMinute) {
+        asked.set(caller, recent);
+        throw new Refusal(429, `this key is limited to ${rule.requestsPerMinute} requests a minute`, "rate_limit_error");
+      }
+      asked.set(caller, [...recent, now]);
+    }
   }
 
   /** A peer's hourly budget, spent before its body is even read. */
@@ -256,11 +339,14 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** The JSON body: 413 over maxBodyBytes, 400 when not JSON. */
   async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readBody(req, cfg.maxBodyBytes);
+    let body: unknown;
     try {
-      return JSON.parse(raw.toString()) as Record<string, unknown>;
+      body = JSON.parse(raw.toString());
     } catch (e) {
       throw new Refusal(400, `body was not JSON: ${String(e)}`);
     }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Refusal(400, "body must be a JSON object");
+    return body as Record<string, unknown>;
   }
 
   /** Answer any failure with its status, or end a response already under way. */
@@ -299,6 +385,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** A local identity, and what it may run: null is everything. */
   type Local = { caller: string; models: string[] | null };
 
+  /** When each key last authenticated here — the one per-key fact the config file cannot hold. */
+  const keySeen = new Map<string, number>();
+
   /** A local caller by api key; with no keys configured, loopback and nothing else. */
   function localCaller(req: IncomingMessage): Local | null {
     const given = bearer(req);
@@ -311,7 +400,12 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     let i = 0;
     for (const k of cfg.apiKeys) {
       if (secretEq(given, k)) {
-        return { caller: "key:" + (cfg.apiKeyLabels[i] || keyId(k)), models: cfg.apiKeyModels[i] ?? null };
+        // Past its day, a key is no key.
+        const expires = cfg.apiKeyRules[i]?.expires ?? null;
+        if (expires !== null && Date.now() >= expires) return null;
+        const caller = "key:" + (cfg.apiKeyLabels[i] || keyId(k));
+        keySeen.set(caller, Date.now());
+        return { caller, models: cfg.apiKeyModels[i] ?? null };
       }
       i++;
     }
@@ -335,10 +429,38 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return token ? sessions.check(token) : null;
   }
 
+  /** The request being handled: the id it was answered with, and what it carried. */
+  const asking = new AsyncLocalStorage<{ id: string; req: IncomingMessage }>();
+  /** An upstream's answer headers for relaying: its own request id gives way to the one this node gave the request. */
+  const relayable = (up: UpstreamResponse): Record<string, string | string[]> => {
+    const { "x-request-id": _theirs, ...rest } = forwardable(up.headers);
+    return rest;
+  };
+  /** The headers of this request that some rule tests, as sent: what a routing decision turned on. Credentials are never among them. */
+  function testedHeaders(): Record<string, string> | undefined {
+    const req = asking.getStore()?.req;
+    if (!req) return undefined;
+    const sent = headersOf(req);
+    const out: Record<string, string> = {};
+    for (const flows of [cfg.flows, ...Object.values(cfg.routers).map((r) => r.flows)]) {
+      for (const step of Object.values(flows).flatMap((f) => f.steps)) {
+        for (const name of [...Object.keys(step.when?.header ?? {}), ...Object.keys(step.when?.headerNot ?? {})]) {
+          if (name === "authorization" || name === "cookie" || sent[name] === undefined) continue;
+          out[name] = sent[name]!.slice(0, 200);
+        }
+      }
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   /** Per-request timing for the one-line request log; `waitedMs` shows whether admission queued it. */
   interface Timing {
     enqueuedAt: number;
     startedAt: number;
+    /** Reads what the answer cost as it is written, where the request is one worth counting. */
+    meter?: Meter;
+    /** The size the request was judged to be, for an answer that does not say. */
+    need?: number;
   }
   function logRequest(
     t: Timing,
@@ -356,8 +478,19 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         ms: Date.now() - started, waitedMs: started - t.enqueuedAt, ok,
       });
     }
+    // Whoever asked used it, here or on a peer; an admission refusal used nothing.
+    const used = t.startedAt > 0 ? t.meter?.read(t.need) ?? null : null;
+    if (t.startedAt > 0 && typeof fields.model === "string") {
+      const who = typeof fields.caller === "string" && fields.caller !== "" ? fields.caller : typeof fields.forPeer === "string" ? `peer:${fields.forPeer}` : "local";
+      usage.add(who, fields.model, ok, used);
+      if (fields.target === "peer" && typeof fields.peer === "string") borrowed.add(fields.peer, fields.model, ok, used);
+    }
+    const headers = testedHeaders();
     log.info("request", {
+      ...(asking.getStore() ? { id: asking.getStore()!.id } : {}),
       ...fields,
+      ...(used ? { tokensIn: used.in, tokensOut: used.out, ...(used.cached ? { tokensCached: used.cached } : {}), ...(used.est ? { tokensEstimated: true } : {}) } : {}),
+      ...(headers ? { headers } : {}),
       waitedMs: started - t.enqueuedAt,
       runMs: Date.now() - started,
       ok,
@@ -366,14 +499,39 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   }
 
   /** Sends a chat completion to a local backend, emulating another server's answers if the route asks. */
-  async function sendLocal(url: string, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal } & ReturnType<typeof backendDeadline>): Promise<number> {
+  async function sendLocal(to: BackendConfig, model: string, payload: Record<string, unknown>, res: ServerResponse, opts: { signal: AbortSignal; /** Where a stream's usage is counted, for a backend that reports it only when asked. */ count?: Meter } & ReturnType<typeof backendDeadline>, spare = false): Promise<number> {
     const emulate = cfg.models[model]?.emulate ?? null;
-    const body = pool.outboundBody(model, payload);
+    const { count, ...deadline } = opts;
+    const url = to.url;
+    const reach = { ...deadline, headers: backendAuth(to.format, to.key, to.headers) };
+    const sent = pool.outboundBody(model, payload);
+    if (to.format === "anthropic") {
+      const up = await send(`${url}/v1/messages`, { json: toAnthropic(sent, to.promptCache, to.promptCacheTtl), ...reach });
+      if (to.key && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
+      if (spare && up.status >= 500 && !res.headersSent) throw new BackendFailed(up.status, (await up.text()).slice(0, 200));
+      const asks = typeof sent.stream_options === "object" && sent.stream_options !== null && (sent.stream_options as Record<string, unknown>).include_usage === true;
+      return relayAnthropic(up, res, { model: String(sent.model ?? model), usage: asks, ...(count ? { meter: count } : {}) });
+    }
+    const options = typeof sent.stream_options === "object" && sent.stream_options !== null ? sent.stream_options as Record<string, unknown> : {};
+    // A provider says what a stream cost only when asked. Asked here for the count, the report is kept from a caller who did not ask for it.
+    const ask = count !== undefined && sent.stream === true && options.include_usage !== true;
+    const body = ask ? { ...sent, stream_options: { ...options, include_usage: true } } : sent;
     const sentAt = Date.now();
-    const up = await send(`${url}/v1/chat/completions`, { json: emulate ? emulatedRequest(body) : body, ...opts });
-    if (emulate) return relayEmulated(up, res, forwardable(up.headers), sentAt);
+    const got = await send(`${url}/v1/chat/completions`, { json: emulate ? emulatedRequest(body) : body, ...reach });
+    // Errors on either side end both, so the relay below sees a failed stream as it would the backend's own.
+    const up = ask && got.status < 400 ? { ...got, body: pipeline_(got.body, withoutUsage(count!), () => {}) } : got;
+    // The key refused was this node's, not the caller's: said as such, and the request may move on.
+    if (to.key && refusedKey(up.status) && !res.headersSent) { await up.text(); throw new BackendFailed(502, KEY_REFUSED); }
+    // With somewhere else to run it, a backend's own failure is not relayed: the request moves on.
+    if (spare && up.status >= 500 && !res.headersSent) throw new BackendFailed(up.status, (await up.text()).slice(0, 200));
+    if (emulate) return relayEmulated(up, res, relayable(up), sentAt);
     // Observed as it is relayed, never held back: see RelayWatch.
     return pipeThrough(up, res, canary?.watchRelay(model, pool.for(model).name, up.headers["content-type"]));
+  }
+
+  /** A backend answered 5xx before anything reached the client, while its flow had another place to send the request. */
+  class BackendFailed extends Refusal {
+    constructor(status: number, detail: string) { super(status, detail || `backend answered ${status}`, "server_error"); }
   }
 
   /** The text-completion paths a relayed answer is worth watching on, with or without an `/upstream/<model>` prefix. */
@@ -412,7 +570,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       return up.status;
     }
     res.writeHead(up.status, {
-      ...forwardable(up.headers),
+      ...relayable(up),
+      // Ours, not a peer's own id for it: the name this node knows the model by.
+      ...(res.hasHeader("x-hearth-model") ? { "x-hearth-model": String(res.getHeader("x-hearth-model")) } : {}),
       "Content-Type": up.headers["content-type"] ?? "application/json",
       // Tell any proxy in front not to buffer, or a streamed answer arrives all
       // at once at the end and looks like a hang.
@@ -439,81 +599,394 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     };
   }
 
+  /**
+   * When each model was last in use here, for a flow's `idle`: someone asked for it by one of its
+   * names, here or from a peer. Kept by the id the backend knows it by, so every name for one model
+   * counts as that model. A request a flow sent there is not someone using it, or a rule that
+   * borrows an idle model would end its own idleness.
+   */
+  const lastUse = new Map<string, number>();
+  const bootAt = Date.now();
+  const open = new Map<string, number>();
+  /** Count a request that asked for this model as use of it until `res` closes. */
+  function using(model: string, res: ServerResponse): void {
+    const wire = pool.outboundId(model);
+    open.set(wire, (open.get(wire) ?? 0) + 1);
+    res.once("close", () => {
+      open.set(wire, (open.get(wire) ?? 1) - 1);
+      lastUse.set(wire, Date.now());
+    });
+  }
+
+  /** How many times each step of each flow has decided, since the flows last changed. */
+  const hits = new Map<string, number[]>();
+  let hitsFor = cfg.flows;
+  function countHits(path: readonly { flow: string; step: number }[]): void {
+    if (hitsFor !== cfg.flows) { hits.clear(); hitsFor = cfg.flows; }
+    for (const p of path) {
+      const row = hits.get(p.flow) ?? [];
+      row[p.step] = (row[p.step] ?? 0) + 1;
+      hits.set(p.flow, row);
+    }
+  }
+
+  /**
+   * Where a sticky flow sent each conversation, so its later turns go there too. A conversation
+   * is who is calling, the id they ask for and how it opens: everything up to its first user turn.
+   */
+  const placed = new Map<string, { end: FlowEnd; until: number }>();
+  const PLACED_MAX = 5000;
+  function conversation(caller: string, asked: string, payload: Record<string, unknown>): { key: string; later: boolean } | null {
+    const turns = Array.isArray(payload.messages) ? (payload.messages as { role?: unknown }[]) : [];
+    const first = turns.findIndex((m) => m?.role === "user");
+    if (first < 0) return null;
+    const key = createHash("sha256").update(`${caller}\0${asked}\0${JSON.stringify(turns.slice(0, first + 1))}`).digest("hex");
+    return { key, later: turns.some((m) => m?.role === "assistant") };
+  }
+
+  /** When each action last ran, for one that sets `every`. */
+  const ranAt = new Map<string, number>();
+  function act(name: string, action: Action, facts: ActionFacts): void {
+    const now = Date.now();
+    if (action.every > 0 && now - (ranAt.get(name) ?? -Infinity) < action.every) return;
+    ranAt.set(name, now);
+    runAction(action, facts, log);
+  }
+
+  /** How many requests each step that sets `max` has in flight, by `<flow>\0<step>`. */
+  const stepsBusy = new Map<string, number>();
+
+  /**
+   * Would running this model here need no swap? It is loaded, or nothing else is: not on its own
+   * backend, and not on any backend that shares exclusive hardware with it.
+   */
+  function ready(model: string): boolean {
+    const slot = pool.for(model);
+    const loaded = slot.state.loaded();
+    if (loaded.includes(model) || loaded.includes(pool.outboundId(model))) return true;
+    if (loaded.length > 0) return false;
+    const exclusive = new Set(pool.resources().filter((r) => !r.shared).map((r) => r.name));
+    const mine = slot.cfg.resources.filter((r) => exclusive.has(r));
+    return !pool.all().some((o) => o !== slot && o.cfg.resources.some((r) => mine.includes(r)) && o.state.loaded().length > 0);
+  }
+
+  /** What a flow decided for work that is not chat: counted, and its actions that run as a step decides set off. */
+  function settle(r: ReturnType<typeof resolve>, asked: string, caller: string): void {
+    // ponytail: only `flows:` is counted; a router's lines show no counts until hits are kept per router.
+    if (!routerOf(caller)) countHits(r.path);
+    for (const a of r.actions) {
+      const action = cfg.actions[a.name];
+      if (action?.on !== "decided") continue;
+      act(a.name, action, {
+        action: a.name, node: cfg.name, asked, model: r.model, target: r.target, peer: "", lane: r.lane, caller, tokens: 0, images: false, tools: false,
+        flow: a.flow, line: a.step + 1, reason: r.reason, outcome: "decided", ms: 0, error: "", backend: r.target === "local" ? pool.for(r.model).name : "", id: "", queuedMs: 0, ranMs: 0,
+      });
+    }
+  }
+
+  /** What a flow reads about this node, for a request with these needs. */
+  /** The router a caller goes by, if not `flows:`: the one `callers:` gives it by its key's label or `local`, else the one it gives everyone. */
+  const routerOf = (caller: string) => cfg.routers[cfg.callers[caller.startsWith("key:") ? caller.slice(4) : caller] ?? cfg.callers["*"] ?? ""];
+  /** The config as a caller's requests see it: its router's rulebook in place of `flows:`. */
+  const rulesFor = (caller: string): HearthConfig => { const r = routerOf(caller); return r ? { ...cfg, flows: r.flows } : cfg; };
+
+  /** A request's headers as a flow reads them: one value per lower-case name, the first where a name was sent twice. */
+  const headersOf = (req: IncomingMessage): Record<string, string> =>
+    Object.fromEntries(Object.entries(req.headers).flatMap(([k, v]) => { const one = Array.isArray(v) ? v[0] : v; return typeof one === "string" ? [[k.toLowerCase(), one]] : []; }));
+
+  function worldFor(caller: string, lane: string, need: World["need"], from: HearthConfig = rulesFor(caller), headers: World["headers"] = {}): World {
+    return {
+      cfg: from, peers, caller, lane, need, headers,
+      local: (m) => localLoad(pool.for(m), m),
+      held: (m, l) => pool.heldOff(pool.for(m).cfg, l),
+      ready,
+      inFlight: (flow, step) => stepsBusy.get(`${flow}\0${step}`) ?? 0,
+      // A model nobody has used since startup has been idle since then.
+      idleMs: (m) => ((open.get(pool.outboundId(m)) ?? 0) > 0 ? 0 : Date.now() - (lastUse.get(pool.outboundId(m)) ?? bootAt)),
+    };
+  }
+
+  /**
+   * Where a request would go right now, without sending it: for the console's "try a request".
+   * `flows` and `actions` try unsaved sections in place of the ones in force, and `pretend` names
+   * models to read as idle, used, busy, warm or held, and `now` a time of day. No action is set off and nothing is counted.
+   */
+  async function routeFlowsTry(c: Call): Promise<void> {
+    try {
+      const b = await readJson(c.req);
+      const asked = typeof b.model === "string" ? b.model : "";
+      if (asked === "") throw new Refusal(400, "model is required: the id the request would ask for");
+      const lane = typeof b.lane === "string" && b.lane in cfg.scheduler.lanes ? b.lane : Object.keys(cfg.scheduler.lanes)[0]!;
+      let from: HearthConfig = cfg;
+      if (b.flows !== undefined) {
+        try {
+          const actions = b.actions === undefined ? cfg.actions : actionDecls(b.actions);
+          from = { ...cfg, actions, flows: flowsFor(b.flows, cfg, actions) };
+        } catch (e) {
+          if (e instanceof ConfigError) throw new Refusal(400, e.message);
+          throw e;
+        }
+      }
+      if (mayLeave(from, asked)) await peers.ensureFresh();
+      const need = { tokens: typeof b.tokens === "number" ? b.tokens : 0, images: b.images === true, tools: b.tools === true };
+      // Headers to try it with, as `{ name: value }`; anything that is not text is left out.
+      const tried = Object.fromEntries(Object.entries(typeof b.headers === "object" && b.headers !== null ? b.headers as Record<string, unknown> : {})
+        .flatMap(([k, v]) => (typeof v === "string" ? [[k.toLowerCase(), v]] : [])));
+      const real = worldFor(typeof b.caller === "string" ? b.caller : "local", from.models[asked]?.lane ?? lane, need, from, tried);
+      // `pretend` stands in for state that cannot be arranged on demand: models named as idle, just used, busy, loaded or held.
+      const pretend = (typeof b.pretend === "object" && b.pretend !== null ? b.pretend : {}) as Record<string, unknown>;
+      const said = (k: string): string[] => (Array.isArray(pretend[k]) ? (pretend[k] as unknown[]).filter((x): x is string => typeof x === "string") : []);
+      const r = resolve(asked, {
+        ...real,
+        idleMs: (m) => (said("idle").includes(m) ? Number.MAX_SAFE_INTEGER : said("used").includes(m) ? 0 : real.idleMs!(m)),
+        held: (m, l) => said("held").includes(m) || real.held(m, l),
+        ready: (m) => !said("unready").includes(m) && (said("warm").includes(m) || ready(m)),
+        // `full` names steps to read as at their limit, each `<step>:<flow>`.
+        inFlight: (flow, step) => (said("full").includes(`${step}:${flow}`) ? Number.MAX_SAFE_INTEGER : real.inFlight!(flow, step)),
+        // `now` is a time of day to read the clock as, HH:MM.
+        ...(typeof pretend["now"] === "string" && /^\d\d:\d\d$/.test(pretend["now"]) ? { now: () => { const d = new Date(); d.setHours(Number((pretend["now"] as string).slice(0, 2)), Number((pretend["now"] as string).slice(3)), 0, 0); return d; } } : {}),
+        local: (m) => {
+          const l = real.local(m);
+          return { ...l, ...(said("busy").includes(m) ? { queued: Math.max(l.queued, 99), free: 0 } : {}), loaded: said("warm").includes(m) ? [...l.loaded, m] : l.loaded };
+        },
+      });
+      // What the backend it lands on is known to take, as a real request would be checked before it is queued.
+      const small = r.target === "local" ? unfit(pool.statsFor(r.model), need) : null;
+      json(c.res, 200, {
+        target: r.target, model: r.model, lane: r.lane, reason: r.reason, path: r.path, params: r.params, actions: r.actions.map((a) => a.name), ...(r.unlisted ? { unlisted: true } : {}), ...(small ? { unfit: `${r.model} ${small}` } : {}),
+        ...(r.target === "peer" ? { peer: r.peer } : r.target === "local" ? { backend: pool.for(r.model).name } : {}),
+      });
+    } catch (e) {
+      fail(c.res, e);
+    }
+  }
+
+  /** Route a chat request and run it, then tell the actions that wait for how it ended. */
   async function dispatch(
     payload: Record<string, unknown>,
-    model: string,
-    lane: string,
+    asked: string,
+    askedLane: string,
     caller: string,
     res: ServerResponse,
     signal: AbortSignal,
     onPosition?: (position: number) => void,
     id?: string,
+    headers: World["headers"] = {},
   ): Promise<void> {
-    // Refresh peer state only when a decision needs it, and only for models that may leave.
-    if (cfg.models[model] && cfg.models[model].policy !== "local") {
-      await peers.ensureFresh();
+    const ended: ((error: string | null) => void)[] = [];
+    let error: string | null = null;
+    try {
+      const status = await route(payload, asked, askedLane, caller, res, signal, ended, onPosition, id, headers);
+      if (status >= 400) error = `backend answered ${status}`;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      throw e;
+    } finally {
+      for (const tell of ended) tell(error);
     }
+  }
 
-    // Which of our backends would serve this, and therefore whose queue and
-    // whose numbers the local half of the decision is about. A node with an
-    // idle embedder and a busy GPU has no single answer to "am I busy".
-    const local = pool.for(model);
-    // Per model, like the peer half two lines down. The backend's flat number
-    // says "free" while THIS model's slots are full, which keeps work home to
-    // queue behind itself when a peer could have started it.
-    // What this request asks for, so routing can skip a peer whose model is too
-    // small for it rather than sending the prompt across the network to be
-    // refused there.
+  /** Returns the status a local backend relayed, or 0 when a peer answered. */
+  async function route(
+    payload: Record<string, unknown>,
+    asked: string,
+    askedLane: string,
+    caller: string,
+    res: ServerResponse,
+    signal: AbortSignal,
+    ended: ((error: string | null) => void)[],
+    onPosition?: (position: number) => void,
+    id?: string,
+    headers: World["headers"] = {},
+  ): Promise<number> {
+    // Refresh peer state only when a decision needs it, and only for requests that may leave.
+    if (mayLeave(cfg, asked)) await peers.ensureFresh();
+
+    // The flow reads each model on the backend that would serve it here: a node with an idle
+    // embedder and a busy GPU has no single answer to "am I busy". Per model, like a peer's
+    // numbers, since a backend's flat count says "free" while THIS model's slots are full.
+    // What this request asks for goes with it, so a peer whose model is too small is passed over
+    // rather than sent the prompt across the network to be refused there.
+    const talk = conversation(caller, asked, payload);
+    const world: World = {
+      ...worldFor(caller, askedLane, needsOf(payload, cfg.models[asked]?.videoTokens), rulesFor(caller), headers),
+      // Only a later turn is held to where the conversation started; an opening turn is decided afresh.
+      ...(talk?.later ? { pinned: (flow: string) => { const at = placed.get(`${flow}\0${talk.key}`); return at && at.until > Date.now() ? at.end : undefined; } } : {}),
+    };
+    const startedAt = Date.now();
+    const flowsNow = world.cfg.flows;
+    const decision = resolve(asked, world);
+    // A name this node does not offer is not found, which is a different answer from one it will not run right now.
+    if (decision.unlisted) throw new Refusal(404, decision.reason);
+    // Nor is one that takes paths of its own a chat model.
+    const paths = flowsNow[decision.via[0] ?? ""]?.takes;
+    if (paths) throw new Refusal(404, `"${asked}" is not offered as chat: it takes ${paths.join(", ")}`);
+    // What the flow chose, which a fallback from a failed peer may change again.
+    let model = decision.model;
+    let lane = decision.lane;
+    let local = pool.for(model);
+    const land = (r: { model: string; lane: string; params: Record<string, unknown> }): void => {
+      model = r.model;
+      lane = r.lane;
+      local = pool.for(model);
+      Object.assign(payload, r.params);
+      // Our id for it, so the backend is asked for what the flow chose and not what the client named.
+      if (model !== asked) payload.model = model;
+      // The caller can read off which model answered, since one name may run as several; a node may keep that to itself.
+      if (cfg.modelHeader && !res.headersSent) res.setHeader("x-hearth-model", model);
+    };
+    land(decision);
+    // Each action a deciding step names is set off once per request, however many times it is re-routed:
+    // as the step decides, or once the request has ended for one that waits to hear how.
+    const fired = new Set<string>();
+    const fire = (r: typeof decision): void => {
+      if (flowsNow === cfg.flows) countHits(r.path);
+      // A sticky flow remembers where it put this conversation, for its later turns.
+      const sticky = flowsNow[r.path.at(-1)?.flow ?? ""]?.sticky;
+      if (talk && sticky !== undefined && r.target !== "unavailable") {
+        const key = `${r.path.at(-1)!.flow}\0${talk.key}`;
+        placed.delete(key);
+        placed.set(key, { end: r.target === "peer" ? { peer: r.peer, model: r.model } : { model: r.model }, until: Date.now() + sticky });
+        if (placed.size > PLACED_MAX) placed.delete(placed.keys().next().value!);
+      }
+      // A step with a limit counts this request against it until the response closes.
+      for (const p of r.path) {
+        if (flowsNow[p.flow]?.steps[p.step]?.max === undefined) continue;
+        const key = `${p.flow}\0${p.step}`;
+        stepsBusy.set(key, (stepsBusy.get(key) ?? 0) + 1);
+        res.once("close", () => { stepsBusy.set(key, (stepsBusy.get(key) ?? 1) - 1); });
+      }
+      for (const a of r.actions) {
+        const action = cfg.actions[a.name];
+        if (!action || fired.has(a.name)) continue;
+        fired.add(a.name);
+        const facts: ActionFacts = {
+          action: a.name, node: cfg.name, asked, model: r.model, target: r.target, peer: r.target === "peer" ? r.peer : "",
+          lane: r.lane, caller, tokens: world.need?.tokens ?? 0, images: world.need?.images ?? false, tools: world.need?.tools ?? false,
+          flow: a.flow, line: a.step + 1, reason: r.reason, outcome: "decided", ms: 0, error: "",
+          backend: r.target === "local" ? pool.for(r.model).name : "", id: id ?? "", queuedMs: 0, ranMs: 0,
+        };
+        if (action.on === "decided") act(a.name, action, facts);
+        else ended.push((error) => {
+          const ms = Date.now() - startedAt;
+          if ((action.on === "failed" && error === null) || (action.slowerThan > 0 && ms <= action.slowerThan)) return;
+          // Where it ended up, which a failed backend or peer may have changed since the step decided.
+          const ran = t.startedAt > 0 ? Date.now() - t.startedAt : 0;
+          act(a.name, action, { ...facts, model, backend: ranOn, outcome: error === null ? "ok" : "failed", ms, error: error ?? "", queuedMs: ms - ran, ranMs: ran });
+        });
+      }
+    };
+    fire(decision);
+    if (model !== asked) {
+      refuseDegraded(model);
+      log.debug("route.flow", { asked, via: decision.via, as: model, reason: decision.reason });
+    } else if (decision.target === "local") {
+      using(model, res);
+    }
     const need = needsOf(payload, cfg.models[model]?.videoTokens);
-    const decision = decide(model, cfg, peers, localLoad(local, model), need);
 
     // What the local backend answered, for the log and the call history. A
     // relayed 400 — "this prompt does not fit" is the common one — is a failed
     // request that happens to carry a useful body.
     let localStatus = 0;
-    const runLocal = async (): Promise<void> => {
+    /** The backend here that last ran it, for an action told how it ended. */
+    let ranOn = "";
+    const runLocal = async (spare = false): Promise<void> => {
+      ranOn = local.name;
       await local.state.ensureFresh();
     // Our id and the route's params on the way to the backend; untouched when neither is set.
-      localStatus = await sendLocal(local.cfg.url, model, payload, res, { signal, ...backendDeadline(local.cfg) });
+      localStatus = await sendLocal(local.cfg, model, payload, res, { signal, ...backendDeadline(local.cfg), ...(local.cfg.cloud && t.meter ? { count: t.meter } : {}) }, spare);
     };
 
-    const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
+    const t: Timing = { enqueuedAt: Date.now(), startedAt: 0, meter: meter(res), need: Math.max(0, (need?.tokens ?? 0) - (need?.output ?? 0)) };
 
     if (decision.target === "unavailable") {
       // Refusing is the point. The operator said this can't run here.
       logRequest(t, { model, lane, caller, target: "unavailable" }, false, decision.reason);
-      // "none can take it": a peer can be up, mapped and simply too small for this request.
-      throw new Refusal(503, `${model} runs only on a peer, and none can take it (${decision.reason})`, "server_error");
+      // The flow's own words: a refusal step's reason, with why a peer was passed over when one was.
+      throw new Refusal(503, `${asked} is not being run: ${decision.reason}`, "server_error");
+    }
+
+    // A model that keeps its answers gives one back to a request identical to the one it answered.
+    // A stream opened early to report queue position is neither kept nor answered from what is.
+    const keepMs = cfg.models[model]?.cacheMs ?? 0;
+    if (keepMs > 0 && onPosition === undefined) {
+      const key = answers.key(model, payload);
+      const hit = answers.get(key);
+      if (hit !== null) {
+        res.writeHead(200, { "Content-Type": hit.type, "X-Hearth-Cache": "hit", "X-Accel-Buffering": "no", ...(res.hasHeader("x-hearth-model") ? { "x-hearth-model": String(res.getHeader("x-hearth-model")) } : {}) });
+        res.end(hit.body);
+        logRequest(t, { model, lane, caller, target: "cache" }, true);
+        return 200;
+      }
+      answers.keep(res, key, keepMs);
     }
 
     if (decision.target === "local") {
-    // Refused here only on reported limits, before queueing or evicting; the backend stays the authority.
-      const fitted = fitOutput(pool.statsFor(model), need, payload);
-      const tooMuch = unfit(pool.statsFor(model), fitted);
-      if (tooMuch !== null) {
-        logRequest(t, { model, lane, caller, backend: local.name, target: "local" }, false, tooMuch);
-        throw new Refusal(400, `${model} ${tooMuch}`);
-      }
-      try {
-        await local.scheduler.submit(
-          { lane, model, caller, maxPerCaller: callerCap(null, cfg), signal, tokens: pool.poolTokens(model, fitted), onPosition, ...(id ? { id } : {}) },
-          async () => {
-            t.startedAt = Date.now();
-            await runLocal();
-          },
+      // A backend that fails before anything reaches the client is passed over like a peer that is down:
+      // the flow is asked again without it, and the request runs where that lands, here.
+      const failed = new Set<string>();
+      let why = decision.reason;
+      for (;;) {
+        // A strict router's callers get the model its line names or its failure, so for them nothing is left to ask for.
+        const spare = (): ReturnType<typeof resolve> => (routerOf(caller)?.strict
+          ? { ...decision, target: "unavailable" as const, reason: "its router never falls back" }
+          : resolve(asked, { ...world, noPeers: true, skip: new Set([...failed, model]) }));
+        // A backend that keeps failing is not made to fail once more for each request, while another line fits.
+        if (local.state.restingMs() > 0 && !res.headersSent) {
+          const next = spare();
+          if (next.target === "local" && !failed.has(next.model) && next.model !== model) {
+            log.debug("route.resting_trying_next", { asked, model, backend: local.name, next: next.model, restingMs: local.state.restingMs() });
+            failed.add(model);
+            land(next);
+            fire(next);
+            why = next.reason;
+            continue;
+          }
+        }
+        // Refused here only on reported limits, before queueing or evicting; the backend stays the authority.
+        const fitted = fitOutput(pool.statsFor(model), needsOf(payload, cfg.models[model]?.videoTokens), payload);
+        const tooMuch = unfit(pool.statsFor(model), fitted);
+        if (tooMuch !== null) {
+          logRequest(t, { model, lane, caller, backend: local.name, target: "local" }, false, tooMuch);
+          throw new Refusal(400, `${model} ${tooMuch}`);
+        }
+        try {
+          const elsewhere = spare().target === "local";
+          await local.scheduler.submit(
+            // A second try goes back through admission without re-applying the caller cap.
+            { lane, model, caller, ...(failed.size === 0 ? { maxPerCaller: callerCap(null, cfg), onPosition, ...(id ? { id } : {}) } : {}), signal, tokens: pool.poolTokens(model, fitted) },
+            async () => {
+              t.startedAt = Date.now();
+              await runLocal(elsewhere);
+            },
+          );
+        } catch (e) {
+          logRequest(t, { model, lane, caller, backend: local.name, target: "local", reason: why }, false, e);
+          // Its own fault, not the caller's or a full queue's: counted towards resting it.
+          if (!signal.aborted && !(e instanceof QueueFullError) && (e instanceof BackendFailed || !(e instanceof Refusal))) local.state.struck(cfg.backendRestMs);
+          const mayMove = !res.headersSent && !signal.aborted && !(e instanceof QueueFullError) && (e instanceof BackendFailed || !(e instanceof Refusal));
+          const next = mayMove ? spare() : null;
+          if (!next || next.target !== "local" || failed.has(next.model) || next.model === model) throw e;
+          log.warn("route.local_failed_trying_next", { asked, model, next: next.model, error: e instanceof Error ? e.message : String(e) });
+          failed.add(model);
+          land(next);
+          fire(next);
+          why = next.reason;
+          continue;
+        }
+        // An answer of its own making that says it cannot serve (overloaded, rate limited) counts as a failure too.
+        if (localStatus >= 500 || localStatus === 429) local.state.struck(cfg.backendRestMs);
+        else local.state.answered();
+        logRequest(
+          t,
+          { model, lane, caller, backend: local.name, target: "local", reason: why,
+            ...(localStatus >= 400 ? { status: localStatus } : {}) },
+          localStatus < 400,
+          localStatus >= 400 ? `backend answered ${localStatus}` : undefined,
         );
-      } catch (e) {
-        logRequest(t, { model, lane, caller, backend: local.name, target: "local", reason: decision.reason }, false, e);
-        throw e;
+        return localStatus;
       }
-      logRequest(
-        t,
-        { model, lane, caller, backend: local.name, target: "local", reason: decision.reason,
-          ...(localStatus >= 400 ? { status: localStatus } : {}) },
-        localStatus < 400,
-        localStatus >= 400 ? `backend answered ${localStatus}` : undefined,
-      );
-      return;
     }
 
     const peer = peers.config(decision.peer)!;
@@ -555,8 +1028,11 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           await pipeThrough(up, res);
         } catch (e) {
           if (res.headersSent) throw e;
-          const route = cfg.models[model];
-          if (!route?.fallbackLocal) throw e;
+          // Where the flow sends it with peers out of the picture; only somewhere here will do.
+          const home = resolve(asked, { ...world, noPeers: true });
+          if (home.target !== "local") throw e;
+          land(home);
+          fire(home);
           // Nothing reached the client yet, so they'll never see this.
           log.warn("route.peer_failed_retrying_local", {
             model,
@@ -566,7 +1042,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           fellBack = true;
           lastTarget = "local";
           // A local retry goes back through admission, without re-applying the caller cap.
-          await local.scheduler.submit({ lane, model, caller, signal, tokens: pool.poolTokens(model, need) }, runLocal);
+          await local.scheduler.submit({ lane, model, caller, signal, tokens: pool.poolTokens(model, need) }, () => runLocal());
         }
       },
     );
@@ -584,6 +1060,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       !fellBack || localStatus < 400,
       fellBack && localStatus >= 400 ? `backend answered ${localStatus}` : undefined,
     );
+    return fellBack ? localStatus : 0;
   }
 
   /** Requests being served now, for the drain in `close()`; counts requests, not queued jobs. */
@@ -608,8 +1085,11 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       if (parked.has(res)) return;
       if (--inFlight === 0) drained?.();
     });
-    void handle(req, res).catch((e) => {
-      log.error("request.failed", { error: e instanceof Error ? e.message : String(e) });
+    // Sent back on every answer, and on this request's line in the log, so the two can be matched.
+    const id = "req_" + randomBytes(8).toString("hex");
+    res.setHeader("X-Request-Id", id);
+    void asking.run({ id, req }, () => handle(req, res)).catch((e) => {
+      log.error("request.failed", { id, error: e instanceof Error ? e.message : String(e) });
       if (!res.headersSent) apiError(res, 500, "internal error", "server_error");
       else res.end();
     });
@@ -617,18 +1097,36 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   /**
    * Refuse a write carrying a foreign `Origin`: any web page can POST to loopback, and loopback is
-   * trusted. curl, peers and apps send no Origin and are unaffected.
+   * trusted. curl, peers and apps send no Origin and are unaffected. `null` is what a sandboxed
+   * frame or a redirected form sends, and is as foreign as any other.
    */
   function crossOriginWrite(req: IncomingMessage): boolean {
     if (req.method === "GET" || req.method === "HEAD") return false;
     const origin = req.headers.origin;
-    if (origin === undefined || origin === "null") return false;
+    if (origin === undefined) return false;
     try {
       return new URL(origin).host !== req.headers.host;
     } catch {
       // An Origin we cannot parse is not one we can vouch for.
       return true;
     }
+  }
+
+  /**
+   * A loopback caller that asked for this node by a name: a page elsewhere whose name was
+   * re-pointed at 127.0.0.1, which the address gate would take for this machine. An address
+   * cannot be re-pointed, and `localhost` never leaves the machine.
+   */
+  function reboundHost(req: IncomingMessage): boolean {
+    const host = req.headers.host;
+    if (host === undefined || !isLoopback(req)) return false;
+    let name: string;
+    try {
+      name = new URL(`http://${host}`).hostname;
+    } catch {
+      return true;
+    }
+    return !(name.startsWith("[") || isIP(name) !== 0 || name === "localhost" || name.endsWith(".localhost"));
   }
 
   /** Forwardable headers, minus an Authorization that is our own api key. */
@@ -745,13 +1243,23 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Local only: /control changes state, so a peer must never reach it.
     { path: "/network", auth: "local", handler: routeNetwork },
     { path: "/control", auth: "local", handler: routeControl },
+    { path: "/lending", methods: ["GET"], auth: "local", handler: routeLending },
     { path: "/restart", methods: ["POST"], auth: "local", handler: routeRestart },
     { path: "/config", methods: ["GET", "PATCH", "POST"], auth: "local", handler: routeConfig },
+    { path: "/config/draft", methods: ["GET", "PUT", "DELETE"], auth: "local", handler: routeConfigDraft },
+    { path: "/config/versions", methods: ["GET", "POST"], auth: "local", handler: routeConfigVersions },
+    { path: "/flows/try", methods: ["POST"], auth: "local", handler: routeFlowsTry },
     { path: "/queue", auth: "local", handler: routeQueue },
     { path: "/queue/events", methods: ["GET"], auth: "local", handler: routeQueueEvents },
 
+    // Mint and revoke write the config file, and the node follows it at once.
+    { path: ["/keys/mint", "/keys/revoke", "/keys/rotate"], methods: ["POST"], auth: "local", handler: routeKeys },
+    { path: "/usage", methods: ["GET"], auth: "local", handler: routeUsage },
+    { path: "/backends/probe", methods: ["POST"], auth: "local", handler: routeProbe },
+
     // The OpenAI surface: a peer may send us work here, and so may we.
     { path: "/v1/warm", methods: ["POST"], auth: "either", envelope: "openai", handler: routeWarm },
+    { path: "/v1/evict", methods: ["POST"], auth: "local", envelope: "openai", handler: routeEvict },
     { path: ["/v1/models", "/v1/models/*"], auth: "either", envelope: "openai", scoped: true,
       handler: routeModels },
     { path: "/v1/chat/completions", methods: ["POST"], auth: "either", envelope: "openai",
@@ -760,7 +1268,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Login and logout take no credential by definition; cross-origin POSTs are refused above.
     { path: "/login", methods: ["POST"], auth: "open", handler: routeLogin },
     { path: "/logout", methods: ["POST"], auth: "open", handler: routeLogout },
-    // First run: whoever reaches the console before an operator exists creates one. Closed after.
+    // First run: the console creates the first operator, from this machine or with a full key. Closed after.
     { path: "/setup", methods: ["GET", "POST"], auth: "open", handler: routeSetup },
 
     // A bare address typed into a browser lands on the console instead of a 401.
@@ -777,6 +1285,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       handler: async (c) => json(c.res, 200, history.since(DAY_MS)) },
     { path: "/ui/logs", methods: ["GET"], auth: "loopback", envelope: "openai",
       handler: async (c) => json(c.res, 200, { entries: logs.all(), persisted: cfg.historyFile !== null }) },
+    { path: "/ui/lending", methods: ["GET"], auth: "loopback", envelope: "openai", handler: routeLending },
 
     { path: "*", auth: "local", envelope: "openai", handler: routePassthrough },
   ];
@@ -798,6 +1307,12 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     // Before anything is routed, because it is a fact about the REQUEST rather
     // than about any one path: a browser on some other site's page must not be
     // able to POST here just because loopback is trusted.
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (reboundHost(req)) {
+      log.warn("request.rebound_host", { path, method: req.method, host: req.headers.host });
+      apiError(res, 403, "on this machine, this node answers at localhost or an IP address, not at a name", "permission_error");
+      return;
+    }
     if (crossOriginWrite(req)) {
       log.warn("request.cross_origin", { path, method: req.method, origin: req.headers.origin });
       apiError(res, 403, "cross-origin writes are refused", "permission_error");
@@ -855,7 +1370,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       json(res, 200, {
         name: cfg.name,
         protocol: 2,
-        models: shared(),
+        models: shared(who),
         lanes: Object.keys(cfg.scheduler.lanes),
         // Additive, so older peers ignore it and newer ones need not probe.
         capabilities: ["warm"],
@@ -863,20 +1378,21 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       return;
     }
     // Loaded and served models ride with capacity, both filtered to what we share.
-    const warmAndShared = pool.loaded().filter((m) => shared().includes(m));
+    const lent = shared(who);
+    const warmAndShared = pool.loaded().filter((m) => lent.includes(m));
     const agg = pool.aggregate();
     // Protocol 2: capacity per shared model, beside the aggregate protocol-1 peers still read.
     const models: Record<string, unknown> = {};
-    for (const m of shared()) {
+    for (const m of lent) {
       // Per-model stats, absent until loaded; silence is not a claim of no limit.
       const stats = pool.statsFor(m);
       models[m] = { ...pool.capacityFor(m), ...(stats ? { stats } : {}) };
     }
     json(res, 200, {
       ...agg,
-      resident: agg.resident !== null && shared().includes(agg.resident) ? agg.resident : null,
+      resident: agg.resident !== null && lent.includes(agg.resident) ? agg.resident : null,
       loaded: warmAndShared,
-      serves: shared(),
+      serves: lent,
       models,
     });
     return;
@@ -929,6 +1445,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       apiError(res, 400, `body was not JSON: ${String(e)}`);
       return;
     }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      apiError(res, 400, "body must be a JSON object");
+      return;
+    }
     // Strict booleans. A missing field means "leave it", so accepting a
     // truthy string here would make `{"lending":"false"}` turn lending ON —
     // the exact opposite of what someone typing that in a hurry wants.
@@ -949,6 +1469,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       for (const [model, want] of Object.entries(body.share as Record<string, unknown>)) {
         if (want !== true && want !== false && want !== null) {
           apiError(res, 400, `share.${model} must be true, false or null`);
+          return;
+        }
+        if (want === true && catalog.includes(model) && pool.for(model).cfg.cloud) {
+          apiError(res, 400, `cannot lend "${model}": it runs on a cloud backend, and a peer's requests would spend that provider's key`);
           return;
         }
         if (want === true && !catalog.includes(model)) {
@@ -1084,8 +1608,36 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         ...(ops ? { ops: ops as never } : {}),
         ...(typeof body.text === "string" ? { text: body.text } : {}),
         dryRun: body.dryRun === true,
+        ...(typeof body.name === "string" ? { name: body.name.trim().slice(0, 80) } : {}),
       });
       if (body.dryRun !== true) log.info("config.patched", { hash: out.hash, restartPending: out.restartPending });
+      json(res, 200, { ...config.status(), ...out });
+    } catch (e) {
+      failConfig(res, e);
+    }
+  }
+
+  /** The console's draft of the file: kept here so it is there tomorrow and from another browser. Nothing reads it but the console. */
+  async function routeConfigDraft(c: Call): Promise<void> {
+    const { req, res } = c;
+    try {
+      if (req.method === "PUT") config.keepDraft(await readJson(req));
+      else if (req.method === "DELETE") config.keepDraft(null);
+      json(res, 200, { draft: config.draft() });
+    } catch (e) {
+      failConfig(res, e);
+    }
+  }
+
+  /** The versions written through the node, and `POST { hash, dryRun? }` to make one of them the file again. */
+  async function routeConfigVersions(c: Call): Promise<void> {
+    const { req, res } = c;
+    try {
+      if (req.method === "GET") { json(res, 200, { versions: config.versions() }); return; }
+      const body = await readJson(req);
+      if (typeof body.hash !== "string") throw new Refusal(400, "hash must be the hash of a kept version");
+      const out = config.restore(body.hash, body.dryRun === true);
+      if (body.dryRun !== true) log.info("config.restored", { hash: out.hash });
       json(res, 200, { ...config.status(), ...out });
     } catch (e) {
       failConfig(res, e);
@@ -1143,6 +1695,162 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       backends: pool.all().map((b) => ({ name: b.name, ...pool.loadedCapacity(b) })),
     });
     return;
+  }
+
+  /** The keys page's rows: every key by its label and scope, with the last time it spoke to this node. */
+  const keysView = (): KeyInfo[] =>
+    cfg.apiKeys.map((k, i) => {
+      const caller = "key:" + (cfg.apiKeyLabels[i] || keyId(k));
+      return { label: cfg.apiKeyLabels[i] ?? "", id: keyId(k), models: cfg.apiKeyModels[i] ?? null, lastSeen: keySeen.get(caller) ?? null, today: spent(caller, 1), month: spent(caller, KEEP_DAYS), rule: cfg.apiKeyRules[i] ?? null };
+    });
+
+  /** Whoever else used this node in the last month: this machine with no key, and peers. */
+  const othersView = (): CallerUse[] => {
+    const keys = new Set(cfg.apiKeys.map((k, i) => "key:" + (cfg.apiKeyLabels[i] || keyId(k))));
+    return usage.callers().filter((c) => !keys.has(c)).map((caller) => ({ caller, today: spent(caller, 1), month: spent(caller, KEEP_DAYS) }));
+  };
+
+  /** The ledger: every peer with what it ran here, what this node ran there, and whether its limits let it in now. */
+  const ledgerView = (): LedgerRow[] =>
+    [...new Set([...Object.keys(cfg.peerTokens), ...cfg.peers.map((p) => p.name)])].sort().map((peer) => ({
+      peer,
+      lent: { today: usage.total(`peer:${peer}`, 1), month: usage.total(`peer:${peer}`, KEEP_DAYS) },
+      borrowed: { today: borrowed.total(peer, 1), month: borrowed.total(peer, KEEP_DAYS) },
+      // Only a peer with a token can be lent to, so only one has limits to be held to.
+      ...(peer in cfg.peerTokens ? { terms: termsFor(cfg, peer), own: Object.keys(cfg.peerTerms[peer] ?? {}).filter((k) => k !== "off"), closed: controls.lendingOn ? closedTo(peer) : "lending is paused" } : {}),
+    }));
+
+  /** One caller's tokens for each day kept; a day with none is absent. */
+  const tokensByDay = (book: Usage, caller: string): Record<string, number> =>
+    Object.fromEntries(Object.entries(book.since()).flatMap(([day, callers]) => {
+      const n = Object.values(callers[caller] ?? {}).reduce((sum, r) => sum + r.in + r.out, 0);
+      return n > 0 ? [[day, n]] : [];
+    }));
+
+  // The ledger, with each peer's use by model and by day, which the page's own stream leaves out.
+  async function routeLending(c: Call): Promise<void> {
+    json(c.res, 200, {
+      days: KEEP_DAYS,
+      peers: ledgerView().map((row) => ({
+        ...row,
+        byModel: { lent: usage.byModel(`peer:${row.peer}`, KEEP_DAYS), borrowed: borrowed.byModel(row.peer, KEEP_DAYS) },
+        byDay: { lent: tokensByDay(usage, `peer:${row.peer}`), borrowed: tokensByDay(borrowed, row.peer) },
+      })),
+    });
+  }
+
+  // What was used, by whom: the last `days` days (31 at most) as day -> caller -> model -> counts.
+  async function routeUsage(c: Call): Promise<void> {
+    const days = Math.min(KEEP_DAYS, Math.max(1, Number(c.url.searchParams.get("days")) || KEEP_DAYS));
+    const prices = Object.fromEntries(Object.entries(cfg.models).flatMap(([id, m]) => (m.price ? [[id, m.price]] : [])));
+    json(c.res, 200, { days, usage: usage.since(days), prices });
+  }
+
+  // Drop a model off the card that serves it. Per-model where the backend can, because that
+  // leaves the card's other residents working; a whole-card clear only as its one and only verb,
+  // and then only when nothing else is resident to lose.
+  async function routeEvict(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const model = typeof body.model === "string" ? body.model.trim() : "";
+      if (model === "") throw new Refusal(400, "model is required");
+      const slot = pool.for(model);
+      const wire = pool.outboundId(model);
+      if (!slot.state.isWarm(wire)) throw new Refusal(409, `${model} is not resident on ${slot.name} — nothing to evict`);
+      // A request that is running would lose its model mid-answer.
+      const running = slot.scheduler.view().filter((j) => j.state === "running" && !j.offbox);
+      const mine = running.filter((j) => pool.outboundId(j.model) === wire).length;
+      if (mine > 0) throw new Refusal(409, `${model} is answering ${mine} request${mine > 1 ? "s" : ""} — evict it once ${mine > 1 ? "they finish" : "it finishes"}`);
+      let via: "model" | "card";
+      if (await slot.state.dropOne(wire)) {
+        via = "model";
+      } else if (slot.state.canUnload() && slot.state.loaded().length === 1 && running.length === 0) {
+        await slot.state.unload();
+        via = "card";
+      } else {
+        const others = slot.state.loaded().filter((m) => m !== wire);
+        throw new Refusal(409, others.length > 0
+          ? `${slot.name} keeps ${others.length} other resident model${others.length > 1 ? "s" : ""} and this kind can only clear the whole card`
+          : `${slot.name} cannot drop a single model`);
+      }
+      log.info("pool.evicted", { model, backend: slot.name, via, caller: c.caller });
+      json(c.res, 200, { model, backend: slot.name, evicted: true, via });
+    } catch (e) {
+      fail(c.res, e);
+    }
+  }
+
+  // Asks a server what it serves before it is a backend, with the key it would be sent: the answer is its
+  // model ids, or in a few words why there are none. Nothing is kept.
+  async function routeProbe(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      if (typeof body.url !== "string") throw new Refusal(400, "url is required");
+      const key = typeof body.key === "string" && body.key.trim() !== "" ? resolveSecret(body.key.trim(), "key") : null;
+      const format = body.format === "anthropic" ? "anthropic" : "openai";
+      let url: string;
+      try { url = backendBase(body.url.trim(), "url"); } catch (e) { throw new Refusal(400, e instanceof Error ? e.message : String(e)); }
+      try {
+        const got = await getJson<{ data?: { id?: unknown }[] }>(`${url}/v1/models`, { headers: backendAuth(format, key), headersTimeoutMs: 5_000 });
+        const models = (got.data ?? []).map((m) => m.id).filter((m): m is string => typeof m === "string" && m !== "").sort();
+        json(c.res, 200, { ok: true, url, models });
+      } catch (e) {
+        json(c.res, 200, { ok: false, url, problem: troubleSays(e instanceof UpstreamError && e.status !== undefined ? e.status : 0) });
+      }
+    } catch (e) {
+      // A key written as env:NAME with no such variable is the asker's mistake.
+      fail(c.res, e instanceof ConfigError ? new Refusal(400, e.message) : e);
+    }
+  }
+
+  // The keys page's writes: mint appends one entry, revoke removes one, rotate gives one a new
+  // secret and keeps the rest of it. Each lands in the config file through the same patch path
+  // every other config change uses, and takes effect at once. A plaintext comes back once, in
+  // the answer of the mint or the rotate that made it.
+  async function routeKeys(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const label = typeof body.label === "string" ? body.label.trim() : "";
+      if (label === "" || label.length > 40) throw new Refusal(400, "label must be 1-40 characters");
+      if (c.path === "/keys/mint") {
+        if (cfg.apiKeyLabels.includes(label)) throw new Refusal(409, `label ${label} is already used`);
+        const models = Array.isArray(body.models)
+          ? [...new Set((body.models as unknown[]).map((m) => {
+              if (typeof m !== "string" || cfg.models[m] === undefined) throw new Refusal(400, `model ${JSON.stringify(m)} is not configured here`);
+              return m;
+            }))] as string[]
+          : null;
+        const key = "hkey_" + randomBytes(20).toString("hex");
+        const entry: Record<string, unknown> = { key, label };
+        if (models !== null && models.length > 0) entry.models = models;
+        // The file's own parser judges these, as it would had they been typed there.
+        if (typeof body.expires === "string" && body.expires !== "") entry.expires = body.expires;
+        if (typeof body.limits === "object" && body.limits !== null && Object.keys(body.limits).length > 0) entry.limits = body.limits;
+        const commit = config.patch({ ops: [{ path: ["apiKeys", cfg.apiKeys.length], value: entry }] });
+        log.info("keys.minted", { label, id: keyId(key), caller: c.caller });
+        json(c.res, 200, { key, label, models, restartPending: commit.restartPending });
+        return;
+      }
+      const i = cfg.apiKeyLabels.indexOf(label);
+      if (i < 0) throw new Refusal(404, `no key labeled ${label}`);
+      if (c.path === "/keys/rotate") {
+        // Only the secret changes: its label, and so its router, scope, limits and usage, stay.
+        const written = ((config.text().doc as { apiKeys?: unknown[] } | null)?.apiKeys ?? [])[i];
+        const was = typeof written === "object" && written !== null ? (written as { key?: unknown }).key : written;
+        if (typeof was === "string" && was.startsWith("env:")) throw new Refusal(409, `${label} reads its key from the environment (${was}): change it there`);
+        const key = "hkey_" + randomBytes(20).toString("hex");
+        const commit = config.patch({ ops: [{ path: ["apiKeys", i, "key"], value: key }] });
+        log.info("keys.rotated", { label, id: keyId(key), caller: c.caller });
+        json(c.res, 200, { key, label, rotated: true, restartPending: commit.restartPending });
+        return;
+      }
+      const commit = config.patch({ ops: [{ path: ["apiKeys", i], delete: true }] });
+      keySeen.delete("key:" + label);
+      log.info("keys.revoked", { label, caller: c.caller });
+      json(c.res, 200, { label, revoked: true, restartPending: commit.restartPending });
+    } catch (e) {
+      failConfig(c.res, e);
+    }
   }
 
   // Ask a model to be resident without generating. Queued like any job, since loading one evicts
@@ -1255,7 +1963,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     let startedAt = 0;
     try {
       await slot.scheduler.submit(
-        { lane: WARM_LANE, model, caller, maxPerCaller: callerCap(fromPeer, cfg), signal: ctrl.signal },
+        { lane: WARM_LANE, model, caller, maxPerCaller: capFor(fromPeer), signal: ctrl.signal },
         async () => {
           startedAt = Date.now();
           // A health probe on the model's upstream loads it without generating, within the backend deadline.
@@ -1287,6 +1995,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     });
     return;
   }
+
+  /** A model as the OpenAI API lists one: clients that check an answer's shape look for `object`. */
+  const asModel = <T extends { id: string }>(m: T) => ({ object: "model" as const, owned_by: cfg.name, ...m });
 
   async function routeModels(c: Call): Promise<void> {
     const { res } = c;
@@ -1346,11 +2057,23 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       }
       // A peer sees only what we share.
       if (modelsPeer !== null) {
-        upstream.data = (upstream.data ?? []).filter((m) => shared().includes(m.id));
+        const lent = shared(modelsPeer);
+        upstream.data = (upstream.data ?? []).filter((m) => lent.includes(m.id));
+      } else {
+        // Everyone else sees what can be asked for: the names flows take, and every model as well
+        // only where the flow for other names runs them as themselves.
+        const mine = rulesFor(c.caller).flows;
+        const taken = Object.values(mine).filter((f) => !f.off).flatMap((f) => f.inputs).filter((id) => id !== ANY);
+        const open = Object.values(mine).some((f) => !f.off && f.inputs.includes(ANY) && f.steps.some((s) => "asked" in s.to));
+        const listed = new Set(upstream.data!.map((m) => m.id));
+        if (!open) upstream.data = upstream.data!.filter((m) => taken.includes(m.id));
+        for (const id of taken) if (!listed.has(id)) upstream.data!.push({ id });
+        // Each variant a type comes in is a name of its own to ask for.
+        for (const id of taken) for (const v of variantsOf(mine, id)) upstream.data!.push({ id: `${id}:${v}` });
       }
       // Same for a scoped key: its picker shows what it may pick.
       if (c.models !== null) {
-        upstream.data = (upstream.data ?? []).filter((m) => c.models!.includes(m.id));
+        upstream.data = (upstream.data ?? []).filter((m) => inScope(c.models!, m.id, isType));
       }
       // /v1/models/<id>: one entry from the same list, so a peer model answers
       // here too instead of falling through to the passthrough and asking a
@@ -1362,10 +2085,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           apiError(res, 404, `no model "${want}"`, "invalid_request_error");
           return;
         }
-        json(res, 200, one);
+        json(res, 200, asModel(one));
         return;
       }
-      json(res, 200, upstream);
+      json(res, 200, { object: "list", data: upstream.data!.map(asModel) });
     } catch (e) {
       apiError(res, 502, `backend unreachable: ${String(e)}`, "server_error");
     }
@@ -1387,8 +2110,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
   }
 
-  async function chat(c: Call, model: string, payload: Record<string, unknown>): Promise<void> {
+  async function chat(c: Call, asked: string, payload: Record<string, unknown>): Promise<void> {
     const { res } = c;
+    let model = asked;
     // A peer's request gets served here and never routed onward. Two nodes
     // that each prefer the other would otherwise bounce a request back and
     // forth until something gave out.
@@ -1401,7 +2125,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
 
     // Peers get cfg.peerLane; local callers may send a `lane` (stripped before forwarding); a route's lane wins.
-    const lane =
+    let lane =
       fromPeer !== null
         ? cfg.peerLane
         : cfg.models[model]?.lane ??
@@ -1416,24 +2140,26 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     });
 
     if (fromPeer === null) {
-      await dispatch(payload, model, lane, caller, res, ctrl.signal, positionStream(c.req, res, payload), jobId(c.req));
+      await dispatch(payload, model, lane, caller, res, ctrl.signal, positionStream(c.req, res, payload), jobId(c.req), headersOf(c.req));
       return;
     }
+    // A peer running a model here is that model in use.
+    using(model, res);
 
-    const t: Timing = { enqueuedAt: Date.now(), startedAt: 0 };
+    const t: Timing = { enqueuedAt: Date.now(), startedAt: 0, meter: meter(res) };
     const serving = pool.for(model);
     // As on the local path: what we relayed to the borrower, so lent
     // capacity that failed is not filed as lent capacity that worked.
     let lentStatus = 0;
     try {
       await serving.scheduler.submit(
-        // Peers are capped by peerMaxConcurrent per backend, whether or not apiKeys are set.
-        { lane, model, caller, maxPerCaller: callerCap(fromPeer, cfg), signal: ctrl.signal, tokens: pool.poolTokens(model, needsOf(payload, cfg.models[model]?.videoTokens)) },
+        // Peers are capped per backend, whether or not apiKeys are set.
+        { lane, model, caller, maxPerCaller: capFor(fromPeer), signal: ctrl.signal, tokens: pool.poolTokens(model, needsOf(payload, cfg.models[model]?.videoTokens)) },
         async () => {
           t.startedAt = Date.now();
           await serving.state.ensureFresh();
           // A lent request gets the same id rewrite and params as a local one.
-          lentStatus = await sendLocal(serving.cfg.url, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
+          lentStatus = await sendLocal(serving.cfg, model, payload, res, { signal: ctrl.signal, ...backendDeadline(serving.cfg) });
         },
       );
     } catch (e) {
@@ -1454,7 +2180,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** The operator login: verify against the config's hash, mint a session, set the cookie. */
   async function routeLogin(c: Call): Promise<void> {
     if (!cfg.operator) {
-      json(c.res, 404, { error: "no operator login is configured on this node" });
+      json(c.res, 404, { error: NO_OPERATOR });
       return;
     }
     let body: Record<string, unknown>;
@@ -1500,12 +2226,18 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   /** GET says whether the node still needs its first operator; POST creates it and signs it in. */
   async function routeSetup(c: Call): Promise<void> {
+    // Creating the operator is taking the node: only a caller who already holds all of it may.
+    const may = isLoopback(c.req) || localCaller(c.req)?.models === null;
     if (c.req.method === "GET") {
-      json(c.res, 200, { needed: cfg.operator === null });
+      json(c.res, 200, { needed: cfg.operator === null && may });
       return;
     }
     if (cfg.operator) {
       json(c.res, 409, { error: "this node already has an operator — log in instead" });
+      return;
+    }
+    if (!may) {
+      json(c.res, 403, { error: NO_OPERATOR });
       return;
     }
     let body: unknown;
@@ -1547,7 +2279,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     json(c.res, 200, { ok: true });
   }
 
-  /** A caller id like `operator:jadeyn` is the login the page can show and sign out of. */
+  /** A caller id like `operator:admin` is the login the page can show and sign out of. */
   const opOf = (caller: string): string | null => (caller.startsWith("operator:") ? caller.slice(9) : null);
 
   async function routeUi(c: Call): Promise<void> {
@@ -1574,7 +2306,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   /** Everything not claimed above, proxied to a backend as-is. */
   async function routePassthrough(c: Call): Promise<void> {
-    const { req, res, url, path } = c;
+    const { req, res, url } = c;
+    // Both may be rewritten below, when the name a path carries turns out to be one a flow takes.
+    let path = c.path;
+    let pathname = url.pathname;
     // Everything else is proxied as-is and unqueued (llama-swap's /unload, /running, /upstream/...),
     // unless `backends[].routes` names the path, in which case hearth is its admission control.
     const who = c.caller;
@@ -1587,7 +2322,6 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
     // A declared route wins over every heuristic below it, being the only
     // statement here the operator actually made.
-    const routed = pool.forPath(url.pathname);
 
     // The model from the /upstream/<model>/ path or the body, else the first backend. A form upload
     // (/v1/audio/transcriptions) names its model in a multipart field rather than in JSON.
@@ -1607,6 +2341,69 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         }
       }
     }
+    // Work that queues is asked for by name as chat is, and the name's flow says which model runs it. The
+    // name is the `{model}` segment of the path or the model in the body; a path that carries neither is
+    // asked for by the flow that takes it, else by the model its route names.
+    let routed = pool.forPath(pathname);
+    const held = pool.named(pathname);
+    // For a request a flow decided: the name it went by, how to ask its flow again without what just failed,
+    // and the backend its line named when that is not the one that declares the path.
+    let flowed: string | null = null;
+    let again: ((failed: readonly string[]) => ReturnType<typeof resolve>) | null = null;
+    let runOn: BackendSlot | undefined;
+    let picked: string | undefined;
+    /**
+     * The backend that can run a model on this path: the one that declares the path, its route's
+     * fallback, or another that serves the model and either declares the path too or declares none.
+     */
+    const placeOf = (model: string): BackendSlot | undefined => {
+      if (!routed) return undefined;
+      // The model a route names is its backend's whether or not the backend lists it.
+      if (model === routed.rule.model || pool.owns(routed.slot, model)) return routed.slot;
+      const fb = routed.rule.fallback ? pool.get(routed.rule.fallback.backend) : undefined;
+      if (fb && pool.owns(fb, model)) return fb;
+      return pool.all().find((b) => pool.owns(b, model) && (b.cfg.routes.length === 0 || b.cfg.routes.some((x) => x.path === pathname)));
+    };
+    if (c.peer === null && (held !== undefined || routed?.rule.queue === true)) {
+      const rules = rulesFor(who).flows;
+      const taker = Object.values(rules).find((f) => !f.off && f.takes?.includes(held?.path ?? pathname));
+      const name = held?.name ?? viaBody ?? taker?.inputs[0] ?? routed!.rule.model;
+      const world: World = { ...worldFor(who, routed?.rule.lane ?? Object.keys(cfg.scheduler.lanes)[0]!, undefined, rulesFor(who), headersOf(req)), path: held?.path ?? pathname };
+      const r = resolve(name, world);
+      const refuse = (status: number, why: string) => fail(res, new Refusal(status, why, status === 404 ? "invalid_request_error" : "server_error"));
+      if (r.unlisted) return refuse(404, r.reason);
+      // A type that says which paths it takes is not offered on any other.
+      const takes = rules[r.via[0] ?? ""]?.takes;
+      if (takes && !takes.includes(held?.path ?? pathname)) return refuse(404, `"${name}" is not offered on ${held?.path ?? pathname}: it takes ${takes.join(", ")}`);
+      if (r.target === "unavailable") return refuse(503, `${name} is not being run: ${r.reason}`);
+      if (r.target === "peer") return refuse(503, `${name} is not being run: its flow sends it to a peer, and only chat goes to a peer`);
+      settle(r, name, who);
+      if (r.model !== name) {
+        if (held) {
+          pathname = held.as(r.model);
+          path = pathname;
+          routed = pool.forPath(pathname);
+          if (!routed) return refuse(503, `${name} is not being run: its flow sends it to ${r.model}, which does not answer ${held.path}`);
+        } else {
+          // The model the flow picked has to be one this path can run, here or on another backend.
+          const at = placeOf(r.model);
+          if (!at) return refuse(503, `${name} is not being run: its flow sends it to ${r.model}, which does not answer ${pathname}`);
+          if (at !== routed!.slot) runOn = at;
+          picked = r.model;
+          // A body that named what it asked for names the model instead; one that named nothing is left as it came.
+          if (viaBody !== undefined && body) {
+            viaBody = r.model;
+            body = isForm ? replaceMultipartField(body, contentType, "model", r.model) ?? body : withModel(body, r.model) ?? body;
+          }
+        }
+      }
+      // A path with the model in it is matched to its backend by that name, so only the others can be asked again.
+      if (!held && r.path.length > 0) {
+        flowed = name;
+        again = (failed) => resolve(name, { ...world, noPeers: true, skip: new Set(failed) });
+      }
+    }
+
     // What the caller asked for, kept apart from the backend `named` picks.
     const asked = viaPath ?? viaBody;
     // A degraded model is out of rotation on EVERY door, not only the chat one.
@@ -1666,11 +2463,16 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         method: req.method ?? "GET",
         ...(sendBody && sendBody.length > 0 ? { raw: sendBody } : {}),
         // Client headers minus hop-by-hop, and minus our own key if that is what it carries.
-        headers: stripOurKey(req) as Record<string, string>,
+        // A backend with a key of its own is sent that, whatever the client carried.
+        headers: { ...stripOurKey(req), ...backendAuth(to.cfg.format, to.cfg.key, to.cfg.headers) } as Record<string, string>,
         signal: ctrl.signal,
         ...backendDeadline(to.cfg),
       });
       log.debug("passthrough", { path, status: up.status });
+      if (to.cfg.key && refusedKey(up.status)) {
+        up.body.resume();
+        throw new Refusal(502, KEY_REFUSED, "server_error");
+      }
       if (orFail && up.status >= 500) {
         up.body.resume();
         throw new Error(`${to.name} answered ${up.status}`);
@@ -1683,6 +2485,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     try {
       // `queue: false` routes (progress, job lists) go straight through.
       if (routed?.rule.queue) {
+        withinLimits(who);
         const { lane } = routed.rule;
         // Two models can share one routed path; each queues as itself.
         const model = pool.routedModel(routed.slot, routed.rule, asked);
@@ -1703,24 +2506,42 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           }
           logRequest(t, { model: as, lane, caller: who, backend: to.name, target: "local", path }, true);
         };
-        const fb = routed.rule.fallback;
+        // A strict router's callers get the model its line names or its failure: no next line, no route fallback.
+        const strict = routerOf(who)?.strict === true;
+        const fb = strict ? undefined : routed.rule.fallback;
         const spare = fb ? pool.get(fb.backend) : undefined;
-        if (!fb || !spare) {
-          await run(target, model, outBody, false);
-        } else if (asked !== undefined && asked !== model && pool.owns(spare, asked)) {
-          // Asked for by an id only the fallback serves: that is a choice, not a failure.
-          await run(spare, asked, outBody, false);
-        } else {
+        // A line that names a model on another backend runs there; a name only the fallback serves is a choice, not a failure.
+        let to = runOn ?? (spare && asked !== undefined && asked !== model && pool.owns(spare, asked) ? spare : target);
+        let as = to === target ? model : picked ?? asked ?? model;
+        let sendBody = outBody;
+        const failed: string[] = [];
+        let fellBack = to === spare;
+        const renamed = (m: string): Buffer | undefined => {
+          // A form names its model in a field, which is rewritten as a JSON body's is.
+          const wire = pool.outboundId(m);
+          return isForm && body ? replaceMultipartField(body, contentType, "model", wire) ?? body : withModel(body, wire);
+        };
+        for (;;) {
+          // What is left if this fails before anything reaches the client: the flow's next line that ends at a
+          // model this path can run, as a chat flow's would, and after the last of those the route's own fallback.
+          const next = !strict && again ? again([...failed, as]) : null;
+          const line = next && next.target === "local" && next.model !== as && !failed.includes(next.model) ? placeOf(next.model) : undefined;
+          const more = line ? { slot: line, model: next!.model, line: next }
+            : spare && fb && !fellBack ? { slot: spare, model: fb.model, line: null } : null;
           try {
-            await run(target, model, outBody, true);
+            await run(to, as, sendBody, more !== null);
+            break;
           } catch (e) {
             // A full lane is back-pressure, a closed socket has nobody to answer, and a started reply cannot be restarted.
-            if (e instanceof QueueFullError || ctrl.signal.aborted || res.headersSent) throw e;
-            log.warn("route.fallback", {
-              path, from: target.name, to: spare.name, model: fb.model,
+            if (!more || e instanceof QueueFullError || ctrl.signal.aborted || res.headersSent) throw e;
+            log.warn(more.line ? "route.next_line" : "route.fallback", {
+              path, from: to.name, to: more.slot.name, model: more.model,
               detail: e instanceof Error ? e.message : String(e),
             });
-            await run(spare, fb.model, withModel(body, pool.outboundId(fb.model)), false);
+            failed.push(as);
+            if (more.line && flowed !== null) settle(more.line, flowed, who);
+            else fellBack = true;
+            [to, as, sendBody] = [more.slot, more.model, renamed(more.model)];
           }
         }
       } else if (routed) {
@@ -1892,6 +2713,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       "Content-Length": Buffer.byteLength(html),
       // It is a live status page; a cached copy is a lie.
       "Cache-Control": "no-store",
+      "Content-Security-Policy": CONSOLE_CSP,
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
     });
     res.end(html);
   }
@@ -1901,22 +2725,37 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   const proxying = new Set<{ id: string; backend: string; model: string | null }>();
   const { uiPayload, networkView } = createViews({
     cfg, pool, peers, history, controls, config, shared, proxying, writeMode,
+    flowHits: () => (hitsFor === cfg.flows ? Object.fromEntries([...hits].map(([flow, row]) => [flow, Array.from(row, (n) => n ?? 0)])) : {}),
     // Drawn whether or not it is on, so "not configured" and "configured and
     // quiet" are not the same blank tile.
     canary: () => canary?.page() ?? { enabled: false, passive: false, recovery: false, models: {} },
+    keys: keysView,
+    others: othersView,
+    ledger: ledgerView,
+    lendDefaults: () => ({ tokensPerDay: cfg.lendTokensPerDay, maxConcurrent: cfg.peerMaxConcurrent, rateLimit: cfg.peerRateLimit }),
   });
 
   /** Expired sessions, swept like any other in-memory state; unref'd so it never holds the process. */
-  const sessionSweep = setInterval(() => { sessions.prune(); }, 30 * 60_000);
+  const sessionSweep = setInterval(() => { sessions.prune(); loginThrottle.prune(); }, 30 * 60_000);
   sessionSweep.unref?.();
 
   /** The day of history and recent logs, read once at start and written every minute and at close. */
   function loadHistory(): void {
     if (!cfg.historyFile || !existsSync(cfg.historyFile)) return;
     try {
-      const saved = JSON.parse(readFileSync(cfg.historyFile, "utf8")) as { history?: unknown; logs?: unknown };
+      const saved = JSON.parse(readFileSync(cfg.historyFile, "utf8")) as { v?: unknown; history?: unknown; logs?: unknown; lastUse?: unknown; usage?: unknown; borrowed?: unknown };
+      // A later hearth's file is set aside whole rather than half-read and then written over.
+      if (typeof saved.v === "number" && saved.v > HISTORY_VERSION) {
+        renameSync(cfg.historyFile, `${cfg.historyFile}.v${saved.v}`);
+        log.warn("history.newer", { path: cfg.historyFile, version: saved.v, reads: HISTORY_VERSION, keptAs: `${cfg.historyFile}.v${saved.v}` });
+        return;
+      }
       history.restore(saved.history);
+      usage.restore(saved.usage);
+      borrowed.restore(saved.borrowed);
       logs.restore(saved.logs);
+      // When each model was last asked for, so a restart does not make everything look long idle.
+      for (const [m, at] of Object.entries(saved.lastUse ?? {})) if (typeof at === "number") lastUse.set(m, at);
     } catch (e) {
       log.warn("history.unreadable", { path: cfg.historyFile, error: String(e) });
     }
@@ -1925,7 +2764,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   function saveHistory(): void {
     if (!cfg.historyFile) return;
     try {
-      writeFileAtomic(cfg.historyFile, JSON.stringify({ v: 1, history: history.snapshot(), logs: logs.all() }));
+      writeFileAtomic(cfg.historyFile, JSON.stringify({ v: HISTORY_VERSION, history: history.snapshot(), logs: logs.all(), lastUse: Object.fromEntries(lastUse), usage: usage.snapshot(), borrowed: borrowed.snapshot() }));
       historyWarned = false;
     } catch (e) {
       // Once per failure streak: a read-only path must not fill the journal every minute.

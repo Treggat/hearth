@@ -3,24 +3,28 @@
  * file it would write, shown as a diff with what needs a restart, and only then is it written.
  * The form knows each setting from fields.ts: its type, default and what it does.
  */
-import { ChevronRight, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { lineDiff, opsBetween, type Op } from "./diff.js";
 import { FIELDS, fieldAt, humanMs, scopeOf, seedOf, type Field, type Ref, type Scope } from "../fields.js";
-import { request, RequestError, toast, useStore } from "./store.js";
-import { Button, Card, cx, mono, Pill, Switch } from "./ui.js";
+import { changed, choose, useEdit } from "./editStore.js";
+import { go, request, RequestError, toast, useStore } from "./store.js";
+import { Button, Card, cx, Dialog, mono, Pill, Switch } from "./ui.js";
 
-type File = { text: string; hash: string; doc: Record<string, unknown> | null };
-type Plan = { before: string; after: string; restartPending: string[]; commit: () => Promise<void> };
-type Err = { message: string; path: string | null };
+export type File = { text: string; hash: string; doc: Record<string, unknown> | null };
+export type Plan = { before: string; after: string; restartPending: string[]; /** Write it, under a name for the list of versions when one was typed. */ commit: (name?: string) => Promise<void>; /** Offer to name this version. */ naming?: boolean; /** What it changes, a line per thing, in the map's words. */ summary?: string[]; /** What the button that writes says. */ verb?: string; /** Things worth knowing before writing: the file loads, but may not do what was meant. */ notes?: string[] };
+export type Err = { message: string; path: string | null };
 type Path = (string | number)[];
 
 /** The sections, in the order an operator reaches for them; anything else at the top level is "Node". */
 const SECTIONS: { key: string; label: string; hint: string; list?: true }[] = [
   { key: "backends", label: "Backends", hint: "Servers hearth fronts. A backend is its own queue." },
   { key: "resources", label: "Hardware", hint: "Cards and CPUs. Backends on the same exclusive card take turns." },
+  { key: "servers", label: "Machines", hint: "Other machines on your network that backends run on (`servers:` in the file). Across the internet, use a peer." },
   { key: "models", label: "Models & routes", hint: "Per-model routing, aliases, slots and parameters." },
+  { key: "flows", label: "Rules", hint: "Where requests go: the types each rule takes, and its lines in order (`flows:` in the file). The Routing page draws these." },
+  { key: "actions", label: "Actions", hint: "What a flow's step can set off beside routing: a log line, or a call to a URL. A step names them under `do:`." },
   { key: "scheduler", label: "Lanes & queues", hint: "Lane priorities and ceilings, queue limits." },
   { key: "peers", label: "Peers", hint: "One entry per friend: how to reach them, the tokens each side presents, what you borrow." },
   { key: "lending", label: "Lending", hint: "What peers may run here, and how much of it." },
@@ -29,11 +33,14 @@ const SECTIONS: { key: string; label: string; hint: string; list?: true }[] = [
 const OWN = new Set(SECTIONS.map((s) => s.key).filter((k) => k !== "node"));
 
 /** Named things made in one step: the name and the settings they cannot do without. */
-const NEW: Record<string, { noun: string; scope: Scope; keys: string[]; list?: true }> = {
+export const NEW: Record<string, { noun: string; scope: Scope; keys: string[]; list?: true }> = {
   backends: { noun: "backend", scope: "backend", keys: ["url", "kind", "resources"] },
   peers: { noun: "peer", scope: "peer", keys: ["url", "token", "accept"] },
-  models: { noun: "model", scope: "model", keys: ["policy", "lane"] },
+  models: { noun: "model", scope: "model", keys: ["lane", "note"] },
   resources: { noun: "hardware", scope: "resource", keys: ["kind", "shared"] },
+  servers: { noun: "machine", scope: "server", keys: ["host"] },
+  flows: { noun: "rule", scope: "flow", keys: ["inputs"] },
+  actions: { noun: "action", scope: "action", keys: ["log", "call"] },
   "scheduler.lanes": { noun: "lane", scope: "lane", keys: ["priority"] },
 };
 
@@ -44,9 +51,9 @@ const fid = (path: Path | string) => `f-${typeof path === "string" ? path : fmt(
 const INPUT = "h-8 rounded-md border bg-bg px-2 text-[12px] focus:border-accent focus:outline-none";
 
 /** The names a reference may pick from, read off the config being edited. */
-const Refs = createContext<Record<Ref, string[]>>({ models: [], lanes: [], resources: [], backends: [], peers: [] });
+export const Refs = createContext<Record<Ref, string[]>>({ models: [], lanes: [], resources: [], backends: [], peers: [], servers: [], actions: [] });
 
-function refsOf(doc: Record<string, unknown>, catalog: string[]): Record<Ref, string[]> {
+export function refsOf(doc: Record<string, unknown>, catalog: string[]): Record<Ref, string[]> {
   const sched = isObj(doc.scheduler) ? doc.scheduler : {};
   return {
     models: [...new Set([...Object.keys(isObj(doc.models) ? doc.models : {}), ...catalog])].sort(),
@@ -54,6 +61,8 @@ function refsOf(doc: Record<string, unknown>, catalog: string[]): Record<Ref, st
     resources: Object.keys(isObj(doc.resources) ? doc.resources : {}),
     backends: Object.keys(isObj(doc.backends) ? doc.backends : {}),
     peers: Object.keys(isObj(doc.peers) ? doc.peers : {}),
+    servers: Object.keys(isObj(doc.servers) ? doc.servers : {}),
+    actions: Object.keys(isObj(doc.actions) ? doc.actions : {}),
   };
 }
 
@@ -81,7 +90,7 @@ function secretHint(name: string, v: unknown): string | null {
   const vals = Array.isArray(v) ? v.flatMap((x) => (isObj(x) ? [x.key] : [x])) : isObj(v) ? Object.values(v) : [v];
   if (vals.some((x) => typeof x === "string" && STANDIN.test(x))
       && (name === "apiKeys" || name === "peerTokens" || name === "token" || name === "key")) {
-    return "stored in the file in plain text — `env:NAME` keeps it out of hearth.yaml";
+    return "shown as a stand-in, never the value itself; type over it to replace it. It is stored in the file in plain text — `env:NAME` keeps it out of hearth.yaml";
   }
   return null;
 }
@@ -146,8 +155,10 @@ function Chips({ id, v, options, noun, onChange }: { id: string; v: string[]; op
 }
 
 /** One value, drawn as its field says when the value is the shape the field expects; otherwise as what it is. */
-function Scalar({ id, name, f, v, onChange, bad }: {
+function Scalar({ id, name, f, v, onChange, bad, menu }: {
   id: string; name: string; f: Field | null; v: unknown; onChange: (v: unknown) => void; bad: boolean;
+  /** Beside the routing map a choice opens the map's own menu, like every other choice there. */
+  menu?: boolean;
 }) {
   const refs = useContext(Refs);
   const base = cx(INPUT, bad ? "border-bad" : "border-line");
@@ -163,6 +174,14 @@ function Scalar({ id, name, f, v, onChange, bad }: {
   }
   if (f?.type === "enum" && typeof v === "string") {
     const opts = f.options.includes(v) ? f.options : [v, ...f.options];
+    if (menu) {
+      return (
+        <button id={id} type="button" className={cx(base, "flex w-48 max-w-full items-center justify-between text-left")}
+                onClick={(e) => choose(e, opts.map((o) => ({ label: o, on: o === v })), onChange)}>
+          {v}<ChevronDown size={12} className="text-dim" />
+        </button>
+      );
+    }
     return <select id={id} ref={takeFocus(id)} className={cx(base, "w-48 max-w-full")} value={v} onChange={(e) => onChange(e.target.value)}>{opts.map((o) => <option key={o}>{o}</option>)}</select>;
   }
   if (f?.type === "ref" && (typeof v === "string" || v === null)) {
@@ -192,7 +211,7 @@ function Scalar({ id, name, f, v, onChange, bad }: {
 }
 
 /** Any value: maps as labelled rows, lists of maps as cards, scalars and scalar lists as controls. */
-function Value({ name, v, path, onChange, err, compact }: {
+export function Value({ name, v, path, onChange, err, compact }: {
   name: string; v: unknown; path: Path; onChange: (v: unknown) => void; err: Err | null; compact?: boolean;
 }): ReactNode {
   const bad = err?.path === fmt(path);
@@ -223,10 +242,11 @@ function Value({ name, v, path, onChange, err, compact }: {
   }
   return (
     <div className="min-w-0">
-      <Scalar id={fid(path)} name={name} f={f} v={v} onChange={onChange} bad={bad} />
+      <Scalar id={fid(path)} name={name} f={f} v={v} onChange={onChange} bad={bad} menu={compact} />
       {bad && <div className="mt-1 text-[11px] text-bad">{err!.message}</div>}
       {!bad && secretHint(name, v) && <div className="mt-1 text-[11px] text-warn">{secretHint(name, v)}</div>}
-      {f && <Hint f={f} quiet />}
+      {/* Always shown beside the map: one that comes and goes moves what is under the pointer. */}
+      {f && <Hint f={f} quiet={!compact} />}
     </div>
   );
 }
@@ -390,7 +410,9 @@ function AddSetting({ scope, have, onAdd, onFind, compact }: {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [hl, setHl] = useState(0);
-  const all = optionsOf(scope, have);
+  // An action is one kind: the other kind's settings are not offered on it.
+  const fits = (key: string) => scope !== "action" || ("log" in have ? !["call", "method", "headers", "body"].includes(key) : "call" in have ? key !== "log" : true);
+  const all = optionsOf(scope, have).filter((o) => fits(o.key));
   const unset = all.filter((o) => !o.set && o.keys.length === 1).length;
   if (all.length === 0) return null;
   const words = q.toLowerCase().split(/\s+/).filter(Boolean);
@@ -488,10 +510,11 @@ function NewButton({ spec, taken, onCreate }: {
   );
 }
 
-function NewDialog({ spec, taken, onClose, onCreate }: {
+export function NewDialog({ spec, taken, note, onClose, onCreate }: {
   spec: (typeof NEW)[string]; taken: string[]; onClose: () => void; onCreate: (id: string, vals: Record<string, unknown>) => void;
+  /** What happens next, in place of the usual line about settings. */
+  note?: string;
 }) {
-  const ref = useRef<HTMLDialogElement>(null);
   const refs = useContext(Refs);
   const [id, setId] = useState("");
   const [vals, setVals] = useState<Record<string, unknown>>(() => {
@@ -503,11 +526,11 @@ function NewDialog({ spec, taken, onClose, onCreate }: {
     return out;
   });
   const first = useRef<HTMLInputElement>(null);
-  // After showModal, which otherwise hands focus to the first button: the close ×.
-  useEffect(() => { ref.current?.showModal(); first.current?.focus(); }, []);
+  useEffect(() => first.current?.focus(), []);
   const name = id.trim();
   const problem = !name ? null : taken.includes(name) ? `a ${spec.noun} named ${name} already exists`
-    : typeof vals.url === "string" && vals.url !== "" && !/^https?:\/\/[^/:]+(:\d+)?$/.test(vals.url.replace(/\/$/, "")) ? "the url needs a host and port, like http://127.0.0.1:8080"
+    : typeof vals.url === "string" && vals.url !== "" && !/^https?:\/\/[^/:]+(:\d+)?(\/[^?#]*)?$/.test(vals.url.replace(/\/$/, "")) ? "the url needs a host and port, like http://127.0.0.1:8080"
+    : spec.scope === "server" && !String(vals.host ?? "").trim() ? "a machine needs its address: an IP or hostname on your network"
     : spec.scope === "peer" && !vals.url && !vals.accept ? "a peer needs a url (to borrow from it) or accept (to lend to it)"
     : spec.scope === "peer" && vals.url && !vals.token ? "borrowing needs the token you present to them" : null;
   // A model's id is usually one the backends already serve; offer those.
@@ -518,13 +541,8 @@ function NewDialog({ spec, taken, onClose, onCreate }: {
     onCreate(name, Object.fromEntries(Object.entries(vals).filter(([, x]) => x !== null && x !== "" && !(Array.isArray(x) && x.length === 0))));
   };
   return (
-    <dialog ref={ref} onClose={onClose} onCancel={onClose}
-            className="m-auto w-[min(32rem,calc(100vw-2rem))] rounded-xl border border-line bg-panel p-0 text-fg shadow-2xl backdrop:bg-black/40">
-      <form method="dialog" onSubmit={(e) => { e.preventDefault(); create(); }} className="flex flex-col">
-        <div className="flex items-center border-b border-line px-4 py-3">
-          <span className="font-semibold">New {spec.noun}</span>
-          <button type="button" className="ml-auto text-dim hover:text-fg" aria-label="close" onClick={() => ref.current?.close()}><X size={16} /></button>
-        </div>
+    <Dialog title={`New ${spec.noun}`} onClose={onClose}>
+      <form onSubmit={(e) => { e.preventDefault(); create(); }} className="flex min-h-0 flex-col overflow-auto">
         <div className="flex flex-col gap-3 p-4">
           <div>
             <label htmlFor="new-name" className="mb-1 block text-[12px] font-medium">{spec.scope === "model" ? "Model id" : "Name"}</label>
@@ -543,30 +561,39 @@ function NewDialog({ spec, taken, onClose, onCreate }: {
             );
           })}
           {problem && <div className="text-[12px] text-bad">{problem}</div>}
-          <div className="text-[11px] text-dim">Everything else is under “add setting” once it exists. Nothing is written until you review &amp; save.</div>
+          <div className="text-[11px] text-dim">{note ?? "Everything else is under “add setting” once it exists."} Nothing is written until you review it.</div>
         </div>
         <div className="flex justify-end gap-2 border-t border-line px-4 py-3">
-          <Button onClick={() => ref.current?.close()}>cancel</Button>
+          <Button onClick={onClose}>cancel</Button>
           <Button tone="primary" type="submit" disabled={!name || problem !== null}><Plus size={13} />add {spec.noun}</Button>
         </div>
       </form>
-    </dialog>
+    </Dialog>
   );
 }
 
 /* ---------------------------------------------------------------- review */
 
-function Review({ plan, onClose }: { plan: Plan; onClose: () => void }) {
+export function Review({ plan, onClose }: { plan: Plan; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [name, setName] = useState("");
   const lines = lineDiff(plan.before, plan.after);
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-6" onClick={onClose}>
-      <Card className="flex max-h-[85vh] w-full max-w-3xl flex-col shadow-2xl">
-        <div className="flex items-center gap-3 border-b border-line px-4 py-3" onClick={(e) => e.stopPropagation()}>
-          <span className="font-semibold">Review changes to hearth.yaml</span>
-          {plan.restartPending.length ? <Pill tone="warn">restart to apply {plan.restartPending.join(", ")}</Pill> : <Pill tone="ok">applies live</Pill>}
-          <button className="ml-auto text-dim hover:text-fg" onClick={onClose} aria-label="close"><X size={16} /></button>
-        </div>
+    <Dialog title="Review changes to hearth.yaml" size="lg" onClose={onClose}
+            head={plan.restartPending.length ? <Pill tone="warn">restart to apply {plan.restartPending.join(", ")}</Pill> : <Pill tone="ok">applies live</Pill>}>
+        {(plan.summary ?? []).length > 0 && (
+          <div className="max-h-40 shrink-0 overflow-auto border-b border-line px-4 py-2 text-[12px]" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-0.5 font-medium">What this changes</div>
+            {plan.summary!.map((n) => <div key={n} className="text-dim">• {n}</div>)}
+            {plan.restartPending.length > 0 && <div className="mt-1 text-warn">Publishing writes the file. {plan.restartPending.join(", ")} only take effect after hearth is restarted, which the header then offers.</div>}
+          </div>
+        )}
+        {(plan.notes ?? []).length > 0 && (
+          <div className="border-b border-line bg-warn/10 px-4 py-2 text-[12px] text-warn" onClick={(e) => e.stopPropagation()}>
+            <div className="font-medium">This will save, but check these first:</div>
+            {plan.notes!.map((n) => <div key={n}>• {n}</div>)}
+          </div>
+        )}
         <pre className="min-h-0 flex-1 overflow-auto px-0 py-2 font-mono text-[12px] leading-5" onClick={(e) => e.stopPropagation()}>
           {lines.map((l, i) => (
             <div key={i} className={cx("px-4", l.kind === "+" && "bg-ok/10 text-ok", l.kind === "-" && "bg-bad/10 text-bad", l.kind === "…" && "text-dim")}>
@@ -575,13 +602,14 @@ function Review({ plan, onClose }: { plan: Plan; onClose: () => void }) {
           ))}
         </pre>
         <div className="flex justify-end gap-2 border-t border-line px-4 py-3" onClick={(e) => e.stopPropagation()}>
+          {plan.naming && <input aria-label="a name for this version" placeholder="name this version (optional), e.g. image types added" maxLength={80} value={name} onChange={(e) => setName(e.target.value)}
+                                 className="mr-auto h-8 min-w-0 flex-1 rounded-md border border-line bg-bg px-2 text-[12px] focus:border-accent focus:outline-none" />}
           <Button onClick={onClose}>keep editing</Button>
-          <Button tone="primary" disabled={busy} onClick={() => { setBusy(true); void plan.commit().finally(() => setBusy(false)); }}>
-            <Save size={13} />save
+          <Button tone="primary" disabled={busy} onClick={() => { setBusy(true); void plan.commit(name.trim() || undefined).finally(() => setBusy(false)); }}>
+            <Save size={13} />{plan.verb ?? "save"}
           </Button>
         </div>
-      </Card>
-    </div>
+    </Dialog>
   );
 }
 
@@ -589,6 +617,7 @@ function Review({ plan, onClose }: { plan: Plan; onClose: () => void }) {
 
 export function Config() {
   const status = useStore((s) => s.data!.config);
+  const pending = useEdit(changed);
   const [file, setFile] = useState<File | null>(null);
   const [tab, setTab] = useState<string>("backends");
   const [drafts, setDrafts] = useState<Record<string, unknown>>({});
@@ -661,6 +690,14 @@ export function Config() {
 
   return (
     <div className="flex h-full flex-col gap-3">
+      {/* Changes made on the Topology page are a draft of their own until saved there; say so, since this page shows the file. */}
+      {pending > 0 && (
+        <Card className="flex flex-wrap items-center gap-3 px-4 py-3">
+          <Pill tone="accent">{pending} unsaved on Routing</Pill>
+          <span className="text-dim">This page shows the file as saved. Changes you made on the Routing page are waiting there.</span>
+          <Button onClick={() => go("routing")}>go to Routing</Button>
+        </Card>
+      )}
       {/* A clean, applied file needs no banner: the nav says where it lives. */}
       {(status.error || status.restartPending.length > 0 || !status.path) && (
         <Card className="flex flex-wrap items-center gap-3 px-4 py-3">

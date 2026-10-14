@@ -2,11 +2,16 @@
  * The read model: what /network, /control and the status page show, derived from live state
  * per call. Its only effects are freshening peers and sampling declared activity for the page.
  */
-import type { HearthConfig, RoutePolicy } from "./config.js";
+import { createHash } from "node:crypto";
+import type { Row } from "./usage.js";
+import { CONSOLE_HTML } from "./ui.js";
+import type { HearthConfig, KeyRule, LendTerms } from "./config.js";
+import { flowsOf } from "./route.js";
 import type { Controls } from "./controls.js";
 import { KEEP, type History } from "./history.js";
 import type { ConfigFile } from "./configfile.js";
 import type { PeerRegistry } from "./peers.js";
+import { troubleSays } from "./backend.js";
 import type { BackendPool } from "./pool.js";
 import type { ModelStats } from "./stats.js";
 
@@ -37,6 +42,42 @@ export interface CanaryView {
   models: Record<string, CanaryModelView>;
 }
 
+/** One api key, as the keys page draws it: who it is, what it may run, when it last spoke to this node. */
+/** What was used, and what it cost in dollars at the prices the models carry now. */
+export type Spent = Row & { cost: number };
+
+export interface KeyInfo {
+  label: string;
+  id: string;
+  models: string[] | null;
+  lastSeen: number | null;
+  /** What it used today (UTC) and over the days that are kept. */
+  today: Spent;
+  month: Spent;
+  /** When it expires and what it is limited to; null for a bare key. */
+  rule: KeyRule | null;
+}
+
+/** A caller that is not a key: this machine with none, or a peer. */
+export interface CallerUse {
+  caller: string;
+  today: Spent;
+  month: Spent;
+}
+
+/** One peer in the ledger: what it ran here and what this node ran there. */
+export interface LedgerRow {
+  peer: string;
+  lent: { today: Row; month: Row };
+  borrowed: { today: Row; month: Row };
+  /** What it is held to, for a peer that may borrow at all. */
+  terms?: LendTerms;
+  /** Which of those its own `lend:` restates; the rest are the node's. */
+  own?: string[];
+  /** Why it is turned away right now; null when it is not. */
+  closed?: string | null;
+}
+
 export interface ViewDeps {
   cfg: HearthConfig;
   pool: BackendPool;
@@ -50,19 +91,33 @@ export interface ViewDeps {
   proxying: ReadonlySet<{ id: string; backend: string; model: string | null }>;
   /** How the page must authenticate its writes. */
   writeMode: () => "open" | "key";
+  /** How many times each step of each flow has decided since the flows last changed. */
+  flowHits: () => Record<string, number[]>;
   /** The canary's state, and whether one is configured at all. */
   canary: () => CanaryView;
+  /** The keys page's rows, with last-seen — the one per-key fact only this process can know. */
+  keys: () => KeyInfo[];
+  /** Callers that are not keys, with what they used. */
+  others: () => CallerUse[];
+  /** Lent and borrowed, per peer. */
+  ledger: () => LedgerRow[];
+  /** The limits a peer is held to unless it has its own. */
+  lendDefaults: () => { tokensPerDay: number; maxConcurrent: number; rateLimit: number };
 }
 
-export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode, canary }: ViewDeps) {
+/** Which console this node serves. A page that was loaded from another one reloads itself when it sees this change. */
+const build = createHash("sha256").update(CONSOLE_HTML).digest("hex").slice(0, 12);
+
+export function createViews({ cfg, pool, peers, history, controls, config, shared, proxying, writeMode, canary, flowHits, keys, others, ledger, lendDefaults }: ViewDeps) {
   /**
    * Everything the page draws, shared by /ui/data and the event stream. Uses ensureFresh, never probeAll.
    */
   async function uiPayload(operator: string | null = null): Promise<Record<string, unknown>> {
     await peers.ensureFresh();
     // Declared activity paths are read only while a page is building data, never on a timer.
-    for (const b of pool.all()) if (b.cfg.activity) void b.state.sampleActivity(b.cfg.activity);
+    for (const b of pool.all()) void pool.sampleActivity(b);
     return {
+      build,
       // Who this request signed in as, so the page can show it and offer a sign-out;
       // loopback and key callers are nobody in particular.
       operator,
@@ -106,25 +161,24 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
       // time and the page trims to this, so its history stays the same length
       // as ours instead of growing for as long as the tab is open.
       histKeep: KEEP,
+      // Every flow in force.
+      flows: flowsOf(cfg),
+      flowHits: flowHits(),
+      // Every api key, by label and scope, with when it last authenticated here.
+      keys: keys(),
+      others: others(),
+      ledger: ledger(),
+      lendDefaults: lendDefaults(),
+      // Each action by name and kind. Its settings stay in the file: a URL or a header can be a secret.
+      actions: Object.fromEntries(Object.entries(cfg.actions).map(([name, action]) => [name, { kind: action.kind }])),
+      // Where the operator placed topology nodes; the page lays out the rest.
+      layout: cfg.layout,
     };
   }
 
-  /** Advertised id -> how it routes, including runtime links. */
-  function routingView(): Record<string, {
-    policy: RoutePolicy; peers: string[]; fallbackLocal: boolean; spilloverAt: number;
-  }> {
-    const out: Record<string, {
-      policy: RoutePolicy; peers: string[]; fallbackLocal: boolean; spilloverAt: number;
-    }> = {};
-    for (const [id, m] of Object.entries(cfg.models)) {
-      out[id] = {
-        policy: m.policy,
-        peers: [...m.peers],
-        fallbackLocal: m.fallbackLocal,
-        spilloverAt: m.spilloverAt,
-      };
-    }
-    return out;
+  /** Advertised id -> the backend that serves it here. Where its requests go is `flows`. */
+  function routingView(): Record<string, { backend: string }> {
+    return Object.fromEntries(Object.keys(cfg.models).map((id) => [id, { backend: pool.for(id).name }]));
   }
 
   /** advertised id -> `as`, for every model that declares one. */
@@ -174,7 +228,11 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
           return {
             name: b.name,
             url: b.cfg.url,
+            server: b.cfg.server,
             kind: b.cfg.kind,
+            // A provider's model list is the one thing asked of it between requests, so how that went is its state.
+            ...(b.cfg.cloud ? { cloud: true, ...(b.state.catalogTrouble() !== null ? { trouble: troubleSays(b.state.catalogTrouble()!) } : {}) } : {}),
+            ...(b.state.restingMs() > 0 ? { restingMs: b.state.restingMs() } : {}),
             // Whether it CAN report warm state. An empty loaded list from a
             // backend that cannot see is not the same claim as one from a
             // backend that looked, and the page must not render it as such.
@@ -183,6 +241,8 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
             ...(b.state.watched() ? { answering: b.state.answering() } : {}),
             // Sent whenever declared, including unread (ok:false), which the page shows as unknown.
             ...(b.cfg.activity ? { activity: b.state.activity() } : {}),
+            // Which lanes this backend keeps off its hardware while its app is in use, and whether it does so now.
+            ...(b.cfg.hold ? { hold: { lanes: [...b.cfg.hold.lanes], idleMs: b.cfg.hold.idleMs, active: pool.holds().some((h) => h.backend === b.name && h.active), quietMs: b.state.quietMs() } } : {}),
             // Only a kind that unloads evicts; one that keeps its set resident has no thrash to warn about.
             evicts: b.state.canUnload(),
             slots: c.slots,
@@ -297,6 +357,8 @@ export function createViews({ cfg, pool, peers, history, controls, config, share
       resources: pool.resources(),
       // What the last few handoffs cost somebody.
       evictions: pool.evictions(),
+      // Hardware kept for an app hearth does not schedule; a client can read this to plan around it.
+      holds: pool.holds(),
       readyNow: [...readyNow].sort(),
       available: [...available].sort(),
       unknownWarm: [...unknownWarm].sort(),

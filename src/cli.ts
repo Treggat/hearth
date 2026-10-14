@@ -9,17 +9,18 @@
  * validates and exits, for ExecStartPre. `set-operator` writes the login credential into the
  * config: the file holds only a scrypt salt:hash of the password, which verifies and reveals
  * nothing. The previous file is backed up beside it, and a restart picks the login up.
- * `migrate` rewrites a v1 hearth.yaml into the v2 layout, keeping comments and a backup.
+ * `migrate` rewrites an older hearth.yaml into the current layout, keeping comments and a backup.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { parseArgs } from "node:util";
 
-import { ConfigError, loadConfig, parseConfig } from "./config.js";
+import { CONFIG_VERSION, ConfigError, loadConfig, parseConfig } from "./config.js";
+import { mayLeave } from "./route.js";
 import { writeFileAtomic } from "./configfile.js";
 import { LEVELS, createLogger, type Level } from "./log.js";
 import { hashPassword } from "./login.js";
-import { migrateDoc, v1Marker } from "./migrate.js";
+import { migrateDoc, routedMarker, unguarded, v1Marker } from "./migrate.js";
 import { createNode } from "./server.js";
 import { getJson } from "./upstream.js";
 import { parseDocument } from "yaml";
@@ -46,8 +47,11 @@ async function probeBackend(): Promise<string | null> {
 function starterConfig(backendUrl: string, found: boolean): string {
   return `# hearth: a queue in front of your inference server.
 #
-# Everything runs locally until you add a peer AND point a model at it. Nothing
-# leaves this machine by default.
+# Everything runs locally until you add a peer or a cloud backend AND a flow
+# sends something to it. Nothing leaves this machine by default.
+#
+# Every setting: https://github.com/Vcvzgbzz/hearth/blob/main/docs/configuration.md
+version: ${CONFIG_VERSION}
 name: ${JSON.stringify(hostnameGuess())}
 
 listen:
@@ -63,6 +67,13 @@ backends:
     # llama-swap reports what is loaded, which lets the scheduler prefer it.
     # Use none for a server that cannot say.
     kind: llama-swap
+  # A provider's API can be a backend too. A request sent to it leaves this
+  # machine and this network, so nothing goes there unless a flow says so.
+  # provider:
+  #   url: https://api.example.com/v1
+  #   cloud: true
+  #   key: env:PROVIDER_KEY
+  #   serves: [their-model]
 
 backendDefaults:
   # One GPU fits one model at a time. Only raise this if your backend really
@@ -81,8 +92,8 @@ scheduler:
     chat: { priority: 0 }     # a person is watching this
     batch: { priority: 100 }  # a render nobody is waiting on
 
-# The console is on /ui. Off this machine it asks for a login: the first visit
-# creates one, or set it with \`hearth set-operator <user> <pass>\`.
+# The console is on /ui. Off this machine it asks for a login: create one in the
+# console on this machine, or with \`hearth set-operator <user> <pass>\`.
 #
 # Keep the console's day of history and recent logs across restarts.
 # historyFile: /var/lib/hearth/history.json
@@ -91,6 +102,9 @@ scheduler:
 # reasonable while this is bound to loopback. Setting it means loopback needs a
 # key too, including any local tool you point at this.
 apiKeys: []
+#   - { key: env:APP_KEY, label: app }
+#   # A key can have a last day and limits, and \`models: [name]\` holds it to the names listed.
+#   - { key: env:GUEST_KEY, label: guest, expires: 2030-12-31, limits: { requestsPerMinute: 20, tokensPerDay: 200000 } }
 
 # --- lending and borrowing (both optional) ---------------------------------
 #
@@ -98,6 +112,7 @@ apiKeys: []
 # lowest-priority lane and is capped, so a guest can't queue ahead of you.
 lending:
   models: []
+#   tokensPerDay: 500000   # per peer, in a UTC day
 #
 # One entry per friend. url + token to borrow from them, accept to lend to
 # them, or both. Generate a token with
@@ -107,36 +122,82 @@ peers: {}
 #     url: http://100.x.y.z:4141
 #     token: env:HEARTH_TO_FRIEND      # you present this to them
 #     accept: env:HEARTH_FROM_FRIEND   # they present this to you
+#     lend: { models: [my-big-model] } # their own limits, over lending: above
 #     models:
 #       # my id: their id. Also the allowlist: a model that isn't mapped can
-#       # never be sent to them, whatever the policy below says.
+#       # never be sent to them, whatever a flow below says.
 #       my-big-model: their-big-model
 #
-# models: routing policy and notes. Anything not listed here stays local.
+# models: per-model settings and notes.
 models: {}
 #   my-big-model:
-#     policy: peer        # local | peer | spillover | fastest
-#     peers: [friend]
 #     note: the 70B, for long documents
+#   their-model:
+#     price: { in: 3, out: 15 }   # dollars per million tokens: usage is then shown as spend
+#
+# flows: what can be asked for, and where each request goes. Only a name a flow
+# takes is offered; the flow with "*" says what becomes of every other name.
+flows:
+  anything-else:
+    inputs: ["*"]
+    steps:
+      # Runs any model your backend serves under its own name. Change this to
+      # { refuse: "..." } once the flows above it name everything you offer.
+      - to: { asked: true }
+#   LLM:                              # callers ask for LLM, never for a model
+#     inputs: [LLM]
+#     steps:
+#       - to: { peer: friend }        # try the peer first
+#       - to: my-big-model            # else run it here
 `;
 }
 
 function hostnameGuess(): string {
-  // node:os, not process.env.HOSTNAME. HOSTNAME is a bash shell variable and
-  // isn't exported, so it's missing under systemd, under `sh -c` and in Docker.
-  // This returned "hearth" for basically every install.
+  // node:os, not process.env.HOSTNAME: that is a shell variable and is missing under systemd, `sh -c` and Docker.
   return hostname() || "hearth";
 }
 
+const USAGE = `usage: hearth [command] [--config path]
+
+  serve                        run the node (the default)
+  init                         probe for a local inference server and write hearth.yaml
+  set-operator <user> <pass>   set the console login
+  migrate                      rewrite an older hearth.yaml in the current layout, keeping a backup
+
+  -c, --config <path>          the config file (default: ${DEFAULT_CONFIG})
+      --check                  with serve: load the config, say whether it is valid, and exit
+      --log <level>            debug, info, warn or error
+  -v, --version
+  -h, --help
+`;
+
 async function main(): Promise<void> {
-  const { values, positionals } = parseArgs({
-    allowPositionals: true,
-    options: {
-      config: { type: "string", short: "c" },
-      check: { type: "boolean", default: false },
-      log: { type: "string" },
-    },
-  });
+  let parsed;
+  try {
+    parsed = parseArgs({
+      allowPositionals: true,
+      options: {
+        config: { type: "string", short: "c" },
+        check: { type: "boolean", default: false },
+        log: { type: "string" },
+        help: { type: "boolean", short: "h", default: false },
+        version: { type: "boolean", short: "v", default: false },
+      },
+    });
+  } catch (e) {
+    // A mistyped flag is answered with how to type it, not a stack trace.
+    console.error(`${e instanceof Error ? e.message.split(". ")[0] : String(e)}\n\n${USAGE}`);
+    process.exit(1);
+  }
+  const { values, positionals } = parsed;
+  if (values.help || positionals[0] === "help") {
+    console.log(USAGE);
+    return;
+  }
+  if (values.version) {
+    console.log((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
+    return;
+  }
 
   const command = positionals[0] ?? "serve";
   const configPath = values.config ?? DEFAULT_CONFIG;
@@ -200,8 +261,8 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     const raw = doc.toJS() as Record<string, unknown> | null;
-    if (!raw || v1Marker(raw) === null) {
-      console.log(`${configPath} is already in the v2 layout; nothing to do`);
+    if (!raw || (v1Marker(raw) === null && routedMarker(raw) === null && !unguarded(raw))) {
+      console.log(`${configPath} is already in the current layout; nothing to do`);
       return;
     }
     let moved: string[];
@@ -223,11 +284,11 @@ async function main(): Promise<void> {
         process.exit(1);
       }
     }
-    const backup = `${configPath}.v1-${new Date().toISOString().slice(0, 10)}`;
+    const backup = `${configPath}.before-migrate-${new Date().toISOString().slice(0, 10)}`;
     writeFileSync(backup, text);
     writeFileAtomic(configPath, out);
     for (const line of moved) console.log(`  ${line}`);
-    console.log(`${configPath} is now v2; the v1 file is at ${backup}`);
+    console.log(`${configPath} is rewritten; the file as it was is at ${backup}`);
     return;
   }
 
@@ -236,6 +297,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  if (!existsSync(configPath)) {
+    console.error(`no ${configPath} here. Run \`hearth init\` to write one, or point at yours with --config.`);
+    process.exit(1);
+  }
   let cfg;
   try {
     cfg = loadConfig(configPath);
@@ -246,7 +311,7 @@ async function main(): Promise<void> {
   }
 
   if (values.check) {
-    console.log(`config: ok (${cfg.peers.length} peer(s), ${Object.keys(cfg.models).length} routed model(s))`);
+    console.log(`config: ok (${cfg.peers.length} peer(s), ${Object.keys(cfg.flows).length} flow(s))`);
     return;
   }
 
@@ -268,9 +333,7 @@ async function main(): Promise<void> {
       peers: cfg.peers.map((p) => p.name),
       // Said out loud at startup on purpose. You should be able to see in one
       // line which prompts can leave this machine and which can arrive.
-      routedAway: Object.entries(cfg.models)
-        .filter(([, r]) => r.policy !== "local")
-        .map(([m]) => m),
+      routedAway: [...new Set(Object.values(cfg.flows).flatMap((f) => f.inputs))].filter((id) => mayLeave(cfg, id)),
       shared: cfg.share,
     });
     // Accurate rather than alarmist. Without apiKeys, anyone off loopback still

@@ -5,11 +5,16 @@ import { parse as parseYaml } from "yaml";
 
 import { EMULATIONS, type Emulation } from "./emulate.js";
 import { KINDS, type KindName } from "./kinds.js";
+import { actionDecls, type Action } from "./actions.js";
 import { FIELDS, nearest, SECTION_KEYS, type Scope } from "./fields.js";
 import { v1Marker } from "./migrate.js";
 import { known, NOTE_MAX, type ModelStats } from "./stats.js";
 
+/** The shapes of flow a newly borrowed model can start as; see `routedFlow`. */
 export type RoutePolicy = "local" | "peer" | "spillover" | "fastest";
+
+/** Settings a model once routed by, each now a step of a flow. Refused, with the command that rewrites them. */
+export const MOVED_TO_FLOWS = ["policy", "peers", "spilloverAt", "fallbackLocal", "whenHeld"] as const;
 
 export interface PeerConfig {
   name: string;
@@ -20,6 +25,16 @@ export interface PeerConfig {
   token: string;
   /** my model id -> their model id. Also the allowlist: an unmapped model never goes to this peer. */
   models: Record<string, string>;
+}
+
+/** What a peer may take from this node, and how much of it. */
+export interface LendTerms {
+  models: readonly string[];
+  tokensPerDay: number;
+  maxConcurrent: number;
+  rateLimit: number;
+  /** Nothing is lent to this peer while set; only a peer's own `lend:` carries it. */
+  off?: boolean;
 }
 
 /** A backend's `kind`, one of the entries in kinds.ts. */
@@ -34,6 +49,11 @@ export interface ResourceDecl {
   kind: "gpu" | "cpu" | "other";
   /** Several backends may use it at once; filtered out before the scheduler sees it. */
   shared: boolean;
+}
+
+/** A machine on the local network that backends run on. It names where work goes; admission never reads it. */
+export interface ServerDecl {
+  host: string;
 }
 
 /**
@@ -80,6 +100,8 @@ export interface BackendConfig {
   name: string;
   /** The OpenAI-compatible server this backend fronts. */
   url: string;
+  /** The `servers` entry this backend runs on; null is the machine hearth is on. */
+  server: string | null;
   /** Where warm state comes from. */
   kind: WarmSource;
   /**
@@ -107,6 +129,59 @@ export interface BackendConfig {
   activity: ActivityDecl | null;
   /** Lives on its `resources` without taking turns for them; see ResidentDecl. null for a normal backend. */
   resident: ResidentDecl | null;
+  /** Keeps named lanes off its `resources` while its app is in use; see HoldDecl. null holds nothing. */
+  hold: HoldDecl | null;
+  /** Sent to this backend as `Authorization: Bearer` on every call, in place of anything the client sent. null sends none. */
+  key: string | null;
+  /** Sent to this backend on every call beside its key, for an API that asks for more than one. */
+  headers: Record<string, string>;
+  /**
+   * Someone else's server, reached over the internet: it has no hardware here and no warm state,
+   * and serves only what `serves` names. A request sent to it leaves this machine and this network.
+   */
+  cloud: boolean;
+  /** The API it speaks: OpenAI's chat completions, or Anthropic's Messages, which requests and answers are rewritten for. */
+  format: BackendFormat;
+  /** With `format: anthropic`: mark each request's system prompt, tools and conversation so far for the provider's prompt cache. */
+  promptCache: boolean;
+  /** With `promptCache`: how long the provider keeps a prefix after its last use. */
+  promptCacheTtl: CacheTtl;
+}
+
+export const BACKEND_FORMATS = ["openai", "anthropic"] as const;
+export type BackendFormat = (typeof BACKEND_FORMATS)[number];
+/** How long a provider keeps a cached prefix after its last use. The longer one costs more to write. */
+export const CACHE_TTLS = ["5m", "1h"] as const;
+export type CacheTtl = (typeof CACHE_TTLS)[number];
+
+/**
+ * What a backend is sent to say who is calling: its key in the header its API reads, for Messages
+ * the version, and its own `headers`, none of which stands in for the key's.
+ */
+export function backendAuth(format: BackendFormat, key: string | null, headers: Record<string, string> = {}): Record<string, string> {
+  const more = Object.fromEntries(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]));
+  if (format === "anthropic") return { ...more, "anthropic-version": "2023-06-01", ...(key ? { "x-api-key": key } : {}) };
+  return { ...more, ...(key ? { authorization: `Bearer ${key}` } : {}) };
+}
+
+/**
+ * `hold:` on a backend with an `activity:` path: work hearth does not schedule (an image app
+ * driven from its own page) keeps the listed lanes of every backend sharing its hardware from
+ * starting, from the moment the app answers until it has reported nothing running or queued
+ * for `idleMs`. Other lanes take the card as before.
+ */
+export interface HoldDecl {
+  /** The lanes kept waiting; a flow's `held` condition sends them somewhere else meanwhile. */
+  lanes: string[];
+  /** How long the app must stay idle before the lanes may start again. */
+  idleMs: number;
+  /**
+   * The id the app loads under when it is a seat in a model swapper: one a backend declares in
+   * `serves`, this one included. The hold then starts when that seat starts loading, not a load
+   * later when the app first answers, and ends when the swapper drops it. null for an app that
+   * is simply up or down.
+   */
+  seat: string | null;
 }
 
 /**
@@ -118,6 +193,112 @@ export interface ResidentDecl {
   /** null for a resident with nothing to ask: it shares the card and is never told to move. */
   yield: string | null;
   resume: string | null;
+}
+
+/**
+ * What a flow step tests. Every condition present must hold. `warm`, `free` and `queuedUnder`
+ * read the step's own target; the rest read the request and the node.
+ */
+export interface FlowWhen {
+  images?: boolean;
+  tools?: boolean;
+  /** Estimated prompt plus reserved output, strictly over or under. */
+  tokensOver?: number;
+  tokensUnder?: number;
+  /** The id the client asked for, when several enter one flow. */
+  asked?: string[];
+  /** An api key's label, or `local` for loopback without a key. */
+  caller?: string[];
+  lane?: string[];
+  /** One of these ids has its hardware held against the request's lane; see HoldDecl. */
+  held?: string[];
+  /** None of these peers can take the request: down, not lending the id, or too small for it. */
+  down?: string[];
+  /**
+   * `model` has had no work here for at least `ms`: nothing queued or running now, and nothing
+   * finished more recently. A null `model` reads the step's own target.
+   */
+  idle?: { model: string | null; ms: number };
+  warm?: boolean;
+  free?: boolean;
+  queuedUnder?: number;
+  /**
+   * Running it on the step's own target needs no swap: the model is loaded there, or nothing
+   * else is loaded on its backend or on the exclusive hardware that backend uses.
+   */
+  ready?: boolean;
+  /**
+   * The variant the name was asked for with, after its last colon: `ImageGen:realism` is the
+   * type `ImageGen` in its `realism` variant. A request with no variant matches none of these.
+   */
+  variant?: string[];
+  /**
+   * A header the request carries, by name (lower case), is one of these values; an empty list is
+   * any value at all. A request without the header matches none.
+   */
+  header?: Record<string, string[]>;
+  /** The opposite: the header is not one of these values, or with an empty list is not there. A request without it matches. */
+  headerNot?: Record<string, string[]>;
+  /** The path the request arrived on is one of these, each as a backend declares it under `routes:`. A chat request matches none. */
+  path?: string[];
+  /** The opposite of `asked`, `caller` and `lane`: none of these. */
+  askedNot?: string[];
+  callerNot?: string[];
+  laneNot?: string[];
+  /** The node's own clock is between these, `HH:MM` each; `from` later than `to` runs through midnight. */
+  time?: { from: string; to: string };
+}
+
+/** Somewhere a request can run: here as `model`, or on `peer` as its id for `model` (null: the id asked for). */
+export type FlowEnd = { model: string } | { peer: string; model: string | null };
+
+/**
+ * Where a step sends a request: to run, into another flow, to whichever of several would start
+ * it soonest, nowhere, or here as the very id that was asked for.
+ */
+export type FlowTo = FlowEnd | { flow: string } | { fastest: FlowEnd[] } | { refuse: string } | { asked: true };
+
+/** The input that stands for every name no other flow takes: the flow that has it decides what happens to those. */
+export const ANY = "*";
+
+/** One step of a flow: when its conditions hold and its target can take the request, the request goes there. */
+export interface FlowStep {
+  /** null always holds. */
+  when: FlowWhen | null;
+  to: FlowTo;
+  /** The lane it queues in, over the target's own and the client's. */
+  lane: string | null;
+  /** Request fields stamped before the target model's own `params`. */
+  params: Record<string, unknown> | null;
+  /** Actions set off when this step decides, by their names under `actions:`. */
+  do: string[];
+  /** The most requests this step may have in flight at once; past it the step is passed over. */
+  max?: number;
+}
+
+/**
+ * `flows.<name>`: how requests for its `inputs` are routed. Steps are tried in order and the
+ * first that holds wins; the last always can. Only what a client asked for enters a flow:
+ * a step that names a model runs it as named.
+ */
+export interface Flow {
+  inputs: string[];
+  steps: FlowStep[];
+  /** Switched off: requests for its inputs run as themselves. Another flow can still hand work to it. */
+  off?: true;
+  /** What it is for, in the operator's words. */
+  note?: string;
+  /**
+   * The request paths this flow answers besides chat, each as a backend declares it under
+   * `routes:`. A path with no name in it (`/generate`) is asked for by this flow's first input;
+   * one with a `{model}` segment, or a model in its body, is asked for by the name it carries.
+   */
+  takes?: string[];
+  /**
+   * How long a conversation stays where this flow first sent it, in ms. A later turn of the same
+   * conversation goes there again while it can take it, whatever the steps would say now.
+   */
+  sticky?: number;
 }
 
 export interface ModelRoute {
@@ -132,13 +313,6 @@ export interface ModelRoute {
    * gets swapped by hand: a fixed id would swap the card back on every request.
    */
   follow: boolean;
-  policy: RoutePolicy;
-  /** Who may serve it, in preference order. Empty means anyone that maps it. */
-  peers: string[];
-  /** `spillover` only: go remote once this many jobs are queued here. */
-  spilloverAt: number;
-  /** Fall back to the local backend if no peer can take it. */
-  fallbackLocal: boolean;
   /**
    * Request fields stamped on every chat completion for this id, after `as` and over the
    * client's own, so several ids can front one resident model with different defaults.
@@ -153,8 +327,12 @@ export interface ModelRoute {
   emulate: Emulation | null;
   /** Tokens the model's running requests share (vLLM's KV cache, llama.cpp `--kv-unified`); `output` caps each request's counted `max_tokens`, null counts it whole. */
   pool: { tokens: number; output: number | null } | null;
+  /** What a million tokens in and out cost, in dollars, where using this model is paid for. null is not priced. */
+  price: { in: number; out: number; cached?: number } | null;
   /** A turn shares the backend with this model's running turns only once each has run this long; unset never waits. */
   shareAfterMs?: number;
+  /** How long an answer is kept for an identical request; unset or 0 keeps none. */
+  cacheMs?: number;
   /**
    * Jobs this model may run at once locally, overriding the backend's `concurrency` either way:
    * vLLM's --max-num-seqs above it, llama.cpp's --parallel below it. A raise applies only while
@@ -185,6 +363,11 @@ export interface CanaryProbe {
   failureThreshold: number;
   /** This many consecutive clean probes brings it back. */
   recoverAfter: number;
+  /**
+   * Watch this id only while it goes out as this backend id: for a `follow` id, whose card may
+   * hold a model the question, or the cost of a wrong verdict, does not fit. null always watches.
+   */
+  onlyAs: string | null;
 }
 
 /** Where a state change is announced, and with what. */
@@ -229,6 +412,8 @@ export interface CanaryConfig {
 export interface HearthConfig {
   /** Declared hardware by name; an undeclared name is an exclusive `gpu`. */
   resources: Record<string, ResourceDecl>;
+  /** Other machines on the local network, by name. Empty when every backend is addressed by `url`. */
+  servers: Record<string, ServerDecl>;
   /** The file this config was loaded from, or null when built in memory (which cannot be saved). */
   configPath: string | null;
   /**
@@ -238,6 +423,18 @@ export interface HearthConfig {
   stateFile: string | null;
   /** Where the console's day of history and recent logs survive a restart; null keeps them in memory. */
   historyFile: string | null;
+  /** How requests are routed, by flow name. Ids no flow takes as an input run where they are served. */
+  flows: Record<string, Flow>;
+  /** Rulebooks besides `flows`, by name. */
+  routers: Record<string, Router>;
+  /** Which rulebook a caller goes by: a router's name, or `default` for `flows`. `*` is everyone not named. */
+  callers: Record<string, string>;
+  /** Whether a chat answer carries `x-hearth-model`, the id it ran as. */
+  modelHeader: boolean;
+  /** `actions:`: what a flow step can set off beside routing, by name. */
+  actions: Record<string, Action>;
+  /** Where the console draws a topology node the operator has placed, by node id; the rest are laid out. */
+  layout: Record<string, { x: number; y: number }>;
   /** What this node calls itself when talking to peers. */
   name: string;
   listen: { host: string; port: number };
@@ -269,6 +466,8 @@ export interface HearthConfig {
    * key to chat and `/v1/models` for exactly those routed ids.
    */
   apiKeyModels: (string[] | null)[];
+  /** When each key stops working and how much it may use, index-aligned with `apiKeys`. */
+  apiKeyRules: KeyRule[];
   /** Tokens peers present to us, by peer name (`peers.<name>.accept`). Kept separate from apiKeys so
    *  peer traffic is attributable and can be capped on its own. */
   peerTokens: Record<string, string>;
@@ -288,6 +487,10 @@ export interface HearthConfig {
   peerLane: string;
   /** Jobs one peer may have queued or running at once (`lending.maxConcurrent`). */
   peerMaxConcurrent: number;
+  /** Tokens one peer may run here in a UTC day (`lending.tokensPerDay`); 0 is no limit. */
+  lendTokensPerDay: number;
+  /** One peer's own terms (`peers.<name>.lend`), each laid over the `lending.*` setting it names. */
+  peerTerms: Record<string, Partial<LendTerms>>;
   /** Biggest request body we'll take. Multi-image vision payloads get close to
    *  the old hardcoded 32MB, so it's a knob now instead of a constant. */
   maxBodyBytes: number;
@@ -320,6 +523,8 @@ export interface HearthConfig {
    * Catches a generation that hangs mid-stream, which would otherwise hold its slot and card.
    */
   backendIdleMs: number;
+  /** How long a backend is passed over, where a flow has another line that fits, after three failures in a row. 0 never passes one over. */
+  backendRestMs: number;
   /**
    * How long shutdown waits for in-flight requests, in ms; 0 kills them at once. Keep the
    * service manager's stop timeout above it.
@@ -352,12 +557,12 @@ export class ConfigError extends Error {
   }
 }
 
-function bad(path: string | null, text: string): ConfigError {
+export function bad(path: string | null, text: string): ConfigError {
   return new ConfigError(path, path !== null && !text.startsWith(path) ? `${path} ${text}` : text);
 }
 
 /** Refuse a key this place does not take: a typo would otherwise load as the default, silently. */
-function only(rec: Record<string, unknown>, allowed: Scope | readonly string[], where: string): void {
+export function only(rec: Record<string, unknown>, allowed: Scope | readonly string[], where: string): void {
   const keys = typeof allowed === "string" ? Object.keys(FIELDS[allowed]) : allowed;
   for (const k of Object.keys(rec)) {
     if (keys.includes(k)) continue;
@@ -369,7 +574,7 @@ function only(rec: Record<string, unknown>, allowed: Scope | readonly string[], 
 /** `env:NAME` indirection, so tokens live in the environment and the config
  *  stays committable. A missing variable is fatal, because starting up with an
  *  empty token means every peer call 401s and nothing says why. */
-function resolveSecret(value: string, where: string): string {
+export function resolveSecret(value: string, where: string): string {
   if (!value.startsWith("env:")) return value;
   const name = value.slice(4);
   const got = process.env[name];
@@ -377,14 +582,14 @@ function resolveSecret(value: string, where: string): string {
   return got;
 }
 
-function asRecord(v: unknown, where: string): Record<string, unknown> {
+export function asRecord(v: unknown, where: string): Record<string, unknown> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     throw bad(where, "must be a mapping");
   }
   return v as Record<string, unknown>;
 }
 
-function str(v: unknown, where: string, fallback?: string): string {
+export function str(v: unknown, where: string, fallback?: string): string {
   if (v === undefined) {
     if (fallback !== undefined) return fallback;
     throw bad(where, "is required");
@@ -443,9 +648,260 @@ function declaredStats(raw: unknown, id: string): ModelStats | null {
  * `models.<id>.params`: flat request fields to stamp. `model`, `messages`, `stream` and `lane`
  * are refused, since stamping them breaks the request.
  */
-function modelParams(raw: unknown, id: string): Record<string, unknown> | null {
+/** `layout:`: a position per topology node id. Ids that no longer exist are kept and ignored. */
+function layoutDecl(raw: unknown): Record<string, { x: number; y: number }> {
+  const out: Record<string, { x: number; y: number }> = {};
+  for (const [id, v] of Object.entries(asRecord(raw ?? {}, "layout"))) {
+    const at = asRecord(v, `layout.${id}`);
+    only(at, ["x", "y"], `layout.${id}`);
+    out[id] = { x: num(at.x, `layout.${id}.x`, 0), y: num(at.y, `layout.${id}.y`, 0) };
+  }
+  return out;
+}
+
+const WHEN_KEYS = ["images", "tools", "tokensOver", "tokensUnder", "variant", "path", "header", "headerNot", "asked", "askedNot", "caller", "callerNot", "lane", "laneNot", "time", "held", "down", "idle", "warm", "free", "queuedUnder", "ready"] as const;
+const CLOCK = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/** A step's `to`: a bare id runs it here; a map says a peer, another flow, the fastest of several, or a refusal. */
+function flowTo(raw: unknown, at: string): FlowTo {
+  if (typeof raw === "string" && raw.trim() !== "") return { model: raw.trim() };
+  const o = asRecord(raw, at);
+  only(o, ["model", "peer", "flow", "fastest", "refuse", "asked"], at);
+  const said = ["peer", "flow", "fastest", "refuse", "asked"].filter((k) => o[k] !== undefined);
+  if (said.length > 1 || (said.length === 1 && said[0] !== "peer" && o.model !== undefined)) {
+    throw bad(at, "must say one thing: a model, a peer, a flow, fastest, refuse or asked");
+  }
+  if (o.asked !== undefined) {
+    if (o.asked !== true) throw bad(`${at}.asked`, "must be true: run it here as the id that was asked for");
+    return { asked: true };
+  }
+  if (o.refuse !== undefined) return { refuse: str(o.refuse, `${at}.refuse`) };
+  if (o.flow !== undefined) return { flow: str(o.flow, `${at}.flow`) };
+  if (o.fastest !== undefined) {
+    if (!Array.isArray(o.fastest) || o.fastest.length < 2) throw bad(`${at}.fastest`, "must list at least two places to choose between");
+    return {
+      fastest: o.fastest.map((e, i) => {
+        const end = flowTo(e, `${at}.fastest[${i}]`);
+        if ("flow" in end || "fastest" in end || "refuse" in end || "asked" in end) throw bad(`${at}.fastest[${i}]`, "must be a model or a peer");
+        return end;
+      }),
+    };
+  }
+  if (o.peer !== undefined) return { peer: str(o.peer, `${at}.peer`), model: o.model === undefined ? null : str(o.model, `${at}.model`) };
+  return { model: str(o.model, `${at}.model`) };
+}
+
+/** A flow as hearth.yaml writes it: the shortest form of each step, with nothing that is only a default. */
+export function rawFlow(flow: Flow): Record<string, unknown> {
+  const end = (e: FlowEnd): unknown => ("peer" in e ? (e.model === null ? { peer: e.peer } : { peer: e.peer, model: e.model }) : e.model);
+  return {
+    ...(flow.note !== undefined ? { note: flow.note } : {}),
+    ...(flow.off ? { off: true } : {}),
+    ...(flow.sticky !== undefined ? { sticky: flow.sticky } : {}),
+    ...(flow.takes !== undefined ? { takes: [...flow.takes] } : {}),
+    inputs: [...flow.inputs],
+    steps: flow.steps.map((s) => ({
+      ...(s.when !== null ? { when: s.when } : {}),
+      to: "fastest" in s.to ? { fastest: s.to.fastest.map(end) } : "flow" in s.to || "refuse" in s.to || "asked" in s.to ? s.to : end(s.to),
+      ...(s.max !== undefined ? { max: s.max } : {}),
+      ...(s.lane !== null ? { lane: s.lane } : {}),
+      ...(s.params !== null ? { params: s.params } : {}),
+      ...(s.do.length > 0 ? { do: [...s.do] } : {}),
+    })),
+  };
+}
+
+/** The places a target can run a request: itself, or each of the several it chooses between. `asked` is the id in hand, for a target that runs "what was asked for". */
+export function endsOf(to: FlowTo, asked?: string): FlowEnd[] {
+  if ("fastest" in to) return to.fastest;
+  if ("asked" in to) return asked === undefined ? [] : [{ model: asked }];
+  return "flow" in to || "refuse" in to ? [] : [to];
+}
+
+/** Can this target be passed over when it cannot take the request? Only a peer can be down. */
+const skippable = (to: FlowTo): boolean => "peer" in to || ("fastest" in to && to.fastest.every((e) => "peer" in e));
+
+/** The name that stands for `flows:` where a caller is given a rulebook. */
+export const DEFAULT_ROUTER = "default";
+
+/**
+ * `routers.<name>`: a rulebook used in place of `flows:` for the callers `callers:` gives it.
+ * `strict` switches off a flow's next line after a failure and a backend route's own fallback
+ * for them, so a request runs where its line says or fails.
+ */
+export interface Router {
+  strict: boolean;
+  note?: string;
+  flows: Record<string, Flow>;
+}
+
+/** `routers:`, each checked as `flows:` is. */
+function routerDecls(raw: unknown, flows: (raw: unknown) => Record<string, Flow>): Record<string, Router> {
+  const out: Record<string, Router> = {};
+  for (const [name, v] of Object.entries(asRecord(raw ?? {}, "routers"))) {
+    const at = `routers.${name}`;
+    if (name === DEFAULT_ROUTER) throw bad(at, `is the name flows: goes by; give this router another`);
+    const r = asRecord(v, at);
+    only(r, ["strict", "note", "flows"], at);
+    const own = flows(r.flows);
+    if (!Object.values(own).some((f) => f.inputs.includes(ANY))) throw bad(`${at}.flows`, `needs a flow with inputs: ["${ANY}"], as flows: does, to say what happens to a name no other flow takes`);
+    out[name] = { strict: bool(r.strict, `${at}.strict`, false), ...(typeof r.note === "string" && r.note ? { note: r.note } : {}), flows: own };
+  }
+  return out;
+}
+
+/** `callers:`: an api key's label, `local`, or `*` for everyone else, each to a router's name or `default`. */
+function callerDecls(raw: unknown, routers: Record<string, Router>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [who, v] of Object.entries(asRecord(raw ?? {}, "callers"))) {
+    if (typeof v !== "string" || (v !== DEFAULT_ROUTER && routers[v] === undefined)) throw bad(`callers.${who}`, `must be "${DEFAULT_ROUTER}" or a name under routers:`);
+    out[who] = v;
+  }
+  return out;
+}
+
+/** Check a `flows:` section against a running config, as loading the file would. */
+export function flowsFor(raw: unknown, cfg: HearthConfig, actions: Record<string, unknown> = cfg.actions): Record<string, Flow> {
+  return flowDecls(raw, cfg.scheduler.lanes, cfg.peers, actions, cfg.backends.flatMap((b) => b.routes.map((r) => r.path)));
+}
+
+/**
+ * A flow's `takes`: paths a backend declares. What arrives on one is not a chat request, so a step
+ * cannot test what only chat has, nor send it to a peer, which is only ever sent chat.
+ */
+function takesOf(raw: unknown, at: string, steps: readonly FlowStep[], routed: readonly string[]): string[] {
+  const paths = strList(typeof raw === "string" ? [raw] : raw, at);
+  for (const p of paths) {
+    if (!routed.includes(p)) throw bad(at, `names "${p}", which no backend declares under routes: (${routed.join(", ") || "none"})`);
+  }
+  steps.forEach((s, i) => {
+    const chatOnly = (["images", "tools", "tokensOver", "tokensUnder"] as const).find((k) => s.when?.[k] !== undefined);
+    if (chatOnly) throw bad(`${at.replace(/takes$/, `steps[${i}].when.${chatOnly}`)}`, "reads a chat request, and this flow takes paths that are not chat");
+    if (endsOf(s.to).some((e) => "peer" in e)) throw bad(`${at.replace(/takes$/, `steps[${i}].to`)}`, "sends to a peer, and a peer is only ever sent chat: this flow takes paths that are not chat");
+  });
+  return paths;
+}
+
+/** `flows:`, checked whole: every name resolves, every flow ends in an answer, and none leads back to itself. */
+function flowDecls(
+  raw: unknown, lanes: Record<string, unknown>, peers: readonly PeerConfig[], actions: Record<string, unknown>, routed: readonly string[],
+): Record<string, Flow> {
+  const flows: Record<string, Flow> = {};
+  const entry = new Map<string, string>();
+  const inLanes = (l: string, where: string) => {
+    if (!(l in lanes)) throw bad(where, `names lane "${l}", which is not in scheduler.lanes (${Object.keys(lanes).join(", ")})`);
+  };
+  for (const [name, v] of Object.entries(asRecord(raw ?? {}, "flows"))) {
+    const at = `flows.${name}`;
+    const decl = asRecord(v, at);
+    only(decl, "flow", at);
+    const inputs = strList(decl.inputs, `${at}.inputs`);
+    for (const id of inputs) {
+      const other = entry.get(id);
+      if (other !== undefined) throw bad(`${at}.inputs`, `names "${id}", which already enters flows.${other}`);
+      if (id === ANY && inputs.length > 1) throw bad(`${at}.inputs`, `lists "${ANY}" beside other names: the flow for every other name takes only "${ANY}"`);
+      entry.set(id, name);
+    }
+    const rawSteps = decl.steps;
+    if (!Array.isArray(rawSteps) || rawSteps.length === 0) throw bad(`${at}.steps`, "must be a list of steps, the last one a bare `to:`");
+    const steps = rawSteps.map((r, i): FlowStep => {
+      const here = `${at}.steps[${i}]`;
+      const step = asRecord(r, here);
+      only(step, ["when", "to", "lane", "params", "do", "max"], here);
+      if (step.to === undefined) throw bad(`${here}.to`, "is required");
+      const to = flowTo(step.to, `${here}.to`);
+      let when: FlowWhen | null = null;
+      if (step.when !== undefined && step.when !== null) {
+        const w = asRecord(step.when, `${here}.when`);
+        only(w, WHEN_KEYS, `${here}.when`);
+        when = {};
+        for (const k of ["images", "tools", "warm", "free", "ready"] as const) if (w[k] !== undefined) when[k] = bool(w[k], `${here}.when.${k}`, false);
+        for (const k of ["tokensOver", "tokensUnder", "queuedUnder"] as const) if (w[k] !== undefined) when[k] = count(w[k], `${here}.when.${k}`, 0, k === "tokensOver" ? 0 : 1);
+        for (const k of ["variant", "path", "asked", "askedNot", "caller", "callerNot", "lane", "laneNot", "held", "down"] as const) if (w[k] !== undefined) when[k] = strList(typeof w[k] === "string" ? [w[k]] : w[k], `${here}.when.${k}`);
+        for (const l of [...(when.lane ?? []), ...(when.laneNot ?? [])]) inLanes(l, `${here}.when.lane`);
+        for (const k of ["header", "headerNot"] as const) {
+          if (w[k] === undefined || w[k] === null) continue;
+          const named: Record<string, string[]> = {};
+          for (const [name, v] of Object.entries(asRecord(w[k], `${here}.when.${k}`))) {
+            if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) throw bad(`${here}.when.${k}`, `names "${name}", which is not a header name`);
+            // One value may be written bare, and nothing at all is the empty list: any value, or for headerNot none.
+            named[name.toLowerCase()] = strList(v === null || v === undefined ? [] : typeof v === "string" ? [v] : v, `${here}.when.${k}.${name}`).map((x) => x.trim());
+          }
+          if (Object.keys(named).length) when[k] = named;
+        }
+        for (const p of when.path ?? []) if (!routed.includes(p)) throw bad(`${here}.when.path`, `names "${p}", which no backend declares under routes: (${routed.join(", ") || "none"})`);
+        for (const v of when.variant ?? []) if (v === "" || v.includes(":")) throw bad(`${here}.when.variant`, `names "${v}": a variant is a plain word, asked for as <name>:<variant>`);
+        if (w.time !== undefined) {
+          const time = asRecord(w.time, `${here}.when.time`);
+          only(time, ["from", "to"], `${here}.when.time`);
+          when.time = { from: str(time.from, `${here}.when.time.from`), to: str(time.to, `${here}.when.time.to`) };
+          for (const k of ["from", "to"] as const) if (!CLOCK.test(when.time[k])) throw bad(`${here}.when.time.${k}`, "must be a time of day as HH:MM, like 22:00");
+        }
+        for (const p of when.down ?? []) if (!peers.some((x) => x.name === p)) throw bad(`${here}.when.down`, `names "${p}", which is not a peer you borrow from (one with a url)`);
+        if (w.idle !== undefined) {
+          const idle = asRecord(w.idle, `${here}.when.idle`);
+          only(idle, ["model", "ms"], `${here}.when.idle`);
+          when.idle = { model: idle.model === undefined ? null : str(idle.model, `${here}.when.idle.model`), ms: atLeast(idle.ms, `${here}.when.idle.ms`, 0, 0) };
+          if (idle.ms === undefined) throw bad(`${here}.when.idle.ms`, "is required: how long it must have been idle, in ms");
+        }
+        const ownTarget = when.warm !== undefined || when.free !== undefined || when.queuedUnder !== undefined || when.ready !== undefined || when.idle?.model === null;
+        if (ownTarget && !("model" in to)) {
+          throw bad(`${here}.when`, "tests warm, free, queuedUnder, ready or idle, which read a model or a peer — this step goes somewhere else (give idle a model)");
+        }
+        if (Object.keys(when).length === 0) when = null;
+      }
+      const last = i === rawSteps.length - 1;
+      const max = step.max === undefined ? undefined : count(step.max, `${here}.max`, 1);
+      if (last && max !== undefined) throw bad(`${here}.max`, "cannot be set on the last step, which must always apply");
+      if (last && (when !== null || skippable(to))) {
+        throw bad(`${at}.steps`, "must end with a step that always applies: no `when`, and somewhere that can always answer (a model, a flow or refuse)");
+      }
+      // A model here can fail before it answers, and the next line is where the request goes then.
+      const mayFail = "model" in to && !("peer" in to);
+      if (!last && when === null && max === undefined && !skippable(to) && !mayFail) throw bad(here, "has no `when`, so the steps after it can never be reached");
+      for (const end of "fastest" in to ? to.fastest : "peer" in to ? [to] : []) {
+        if (!("peer" in end)) continue;
+        const peer = peers.find((x) => x.name === end.peer);
+        if (!peer) throw bad(`${here}.to`, `names peer "${end.peer}", which is not a peer you borrow from (one with a url)`);
+        if (end.model === null && inputs.includes(ANY)) throw bad(`${here}.to`, `sends every other name to ${end.peer}: say which model with \`model:\`, since a peer maps ids one by one`);
+        for (const id of end.model === null ? inputs : [end.model]) {
+          if (peer.models[id] === undefined) throw bad(`${here}.to`, `sends "${id}" to ${end.peer}, which does not map it — add it to peers.${end.peer}.models`);
+        }
+      }
+      const lane = str(step.lane, `${here}.lane`, "");
+      if (lane !== "") inLanes(lane, `${here}.lane`);
+      const doing = step.do === undefined ? [] : strList(typeof step.do === "string" ? [step.do] : step.do, `${here}.do`);
+      for (const a of doing) if (!(a in actions)) throw bad(`${here}.do`, `names action "${a}", which is not under actions:`);
+      return { when, to, lane: lane === "" ? null : lane, params: modelParams(step.params, name, `${here}.params`), do: doing, ...(max !== undefined ? { max } : {}) };
+    });
+    flows[name] = {
+      inputs, steps,
+      ...(bool(decl.off, `${at}.off`, false) ? { off: true as const } : {}),
+      ...(str(decl.note, `${at}.note`, "") !== "" ? { note: str(decl.note, `${at}.note`) } : {}),
+      ...(decl.sticky !== undefined ? { sticky: atLeast(decl.sticky, `${at}.sticky`, 0, 1000) } : {}),
+      ...(decl.takes !== undefined ? { takes: takesOf(decl.takes, `${at}.takes`, steps, routed) } : {}),
+    };
+  }
+  for (const [name, flow] of Object.entries(flows)) {
+    flow.steps.forEach((step, i) => {
+      if ("flow" in step.to && flows[step.to.flow] === undefined) {
+        throw bad(`flows.${name}.steps[${i}].to`, `names flow "${step.to.flow}", which is not under flows:`);
+      }
+    });
+    const walk = (at: string, seen: string[]): void => {
+      for (const step of flows[at]!.steps) {
+        if (!("flow" in step.to)) continue;
+        if (step.to.flow === name) throw bad(`flows.${name}`, `leads back to itself: ${[...seen, at, name].join(" → ")}`);
+        if (!seen.includes(step.to.flow)) walk(step.to.flow, [...seen, at]);
+      }
+    };
+    walk(name, []);
+  }
+  return flows;
+}
+
+function modelParams(raw: unknown, id: string, where = `models.${id}.params`): Record<string, unknown> | null {
   if (raw === undefined || raw === null) return null;
-  const where = `models.${id}.params`;
   const rec = asRecord(raw, where);
   for (const k of ["model", "messages", "stream", "lane"]) {
     if (k in rec) {
@@ -462,6 +918,17 @@ function modelParams(raw: unknown, id: string): Record<string, unknown> | null {
 function modelConcurrency(entry: Record<string, unknown>, id: string): number | null {
   if (entry.concurrency === undefined || entry.concurrency === null) return null;
   return count(entry.concurrency, `models.${id}.concurrency`, 1, 1);
+}
+
+/** `price: { in: 3, out: 15, cached: 0.3 }`: dollars per million tokens; `cached` is for input read from the provider's prompt cache. */
+function modelPrice(v: unknown, id: string): ModelRoute["price"] {
+  if (v === undefined || v === null) return null;
+  const p = asRecord(v, `models.${id}.price`);
+  only(p, "price", `models.${id}.price`);
+  return {
+    in: atLeast(p.in, `models.${id}.price.in`, 0), out: atLeast(p.out, `models.${id}.price.out`, 0),
+    ...(p.cached !== undefined ? { cached: atLeast(p.cached, `models.${id}.price.cached`, 0) } : {}),
+  };
 }
 
 /** `pool: 144000`, or `pool: { tokens: 144000, output: 8192 }`. */
@@ -487,17 +954,35 @@ const WARM_SOURCES = Object.keys(KINDS) as WarmSource[];
 
 /** A backend's `kind`, defaulting to llama-swap. */
 function warmSource(entry: Record<string, unknown>, where: string): WarmSource {
-  const kind = str(entry.kind, `${where}.kind`, "llama-swap");
+  // A provider's servers are not ours to ask what is loaded.
+  const kind = str(entry.kind, `${where}.kind`, entry.cloud === true ? "none" : "llama-swap");
   if (!WARM_SOURCES.includes(kind as WarmSource)) {
     throw bad(`${where}.kind`, `is "${kind}" — expected ${WARM_SOURCES.join(", ")}`);
   }
   return kind as WarmSource;
 }
 
+/** `promptCacheTtl: 1h`. */
+function cacheTtl(v: unknown, where: string): CacheTtl {
+  const ttl = str(v, where, "5m");
+  if (!CACHE_TTLS.includes(ttl as CacheTtl)) throw bad(where, `is "${ttl}" — expected ${CACHE_TTLS.join(" or ")}`);
+  return ttl as CacheTtl;
+}
+
 function bool(v: unknown, where: string, fallback: boolean): boolean {
   if (v === undefined) return fallback;
   if (typeof v !== "boolean") throw bad(where, "must be true or false");
   return v;
+}
+
+/** The lending terms a block states, and only those: `lending:` for every peer, `peers.<name>.lend` for one. */
+function lendTerms(rec: Record<string, unknown>, at: string): Partial<LendTerms> {
+  const out: Partial<LendTerms> = {};
+  if (rec.models !== undefined) out.models = strList(rec.models, `${at}.models`);
+  if (rec.tokensPerDay !== undefined) out.tokensPerDay = count(rec.tokensPerDay, `${at}.tokensPerDay`, 0, 0);
+  if (rec.maxConcurrent !== undefined) out.maxConcurrent = count(rec.maxConcurrent, `${at}.maxConcurrent`, 2, 1);
+  if (rec.rateLimit !== undefined) out.rateLimit = count(rec.rateLimit, `${at}.rateLimit`, 600, 1);
+  return out;
 }
 
 function strList(v: unknown, where: string): string[] {
@@ -508,19 +993,41 @@ function strList(v: unknown, where: string): string[] {
   return v as string[];
 }
 
+/** What bounds one key. 0 is no limit; `expires` is the first moment it no longer works, or null for never. */
+export interface KeyRule {
+  expires: number | null;
+  requestsPerMinute: number;
+  tokensPerDay: number;
+  /** What it may spend in a UTC day, in dollars, on models that carry a `price`. 0 is no limit. */
+  dollarsPerDay: number;
+}
+const NO_RULE: KeyRule = { expires: null, requestsPerMinute: 0, tokensPerDay: 0, dollarsPerDay: 0 };
+
+/** Every name a flow takes, in `flows:` and in each router's: what a client may ask for besides a model. Read off the file as written. */
+function typeNames(root: Record<string, unknown>): string[] {
+  const inputsOf = (flows: unknown): string[] =>
+    Object.values(typeof flows === "object" && flows !== null ? flows : {}).flatMap((f) => {
+      const inputs = (f as { inputs?: unknown } | null)?.inputs;
+      return Array.isArray(inputs) ? inputs.filter((n): n is string => typeof n === "string" && n !== ANY) : [];
+    });
+  const routers = typeof root.routers === "object" && root.routers !== null ? Object.values(root.routers) : [];
+  return [...inputsOf(root.flows), ...routers.flatMap((r) => inputsOf((r as { flows?: unknown } | null)?.flows))];
+}
+
 /** `apiKeys:` entries: a bare secret, or `{ key, label }`. Labels are shown wherever caller ids are. */
 function apiKeyList(
   v: unknown, where: string, routeIds: Set<string>,
-): { keys: string[]; labels: string[]; models: (string[] | null)[] } {
-  if (v === undefined) return { keys: [], labels: [], models: [] };
+): { keys: string[]; labels: string[]; models: (string[] | null)[]; rules: KeyRule[] } {
+  if (v === undefined) return { keys: [], labels: [], models: [], rules: [] };
   if (!Array.isArray(v)) throw bad(where, "must be a list");
   const keys: string[] = [];
   const labels: string[] = [];
   const models: (string[] | null)[] = [];
+  const rules: KeyRule[] = [];
   // Both refuse a duplicate, and neither message ever names the secret.
   const seenKey = new Map<string, number>();
   const seenLabel = new Map<string, number>();
-  const take = (key: string, label: string, at: string, scope: string[] | null = null): void => {
+  const take = (key: string, label: string, at: string, scope: string[] | null = null, rule: KeyRule = NO_RULE): void => {
     // The first match wins in localCaller, so a repeated secret makes every
     // later entry unreachable — including its label, which would then be a name
     // the operator sees in the config and never in a log.
@@ -544,6 +1051,7 @@ function apiKeyList(
     keys.push(key);
     labels.push(label);
     models.push(scope);
+    rules.push(rule);
   };
   v.forEach((raw, i) => {
     const at = `${where}[${i}]`;
@@ -552,7 +1060,7 @@ function apiKeyList(
       return;
     }
     const entry = asRecord(raw, at);
-    only(entry, ["key", "label", "models"], at);
+    only(entry, ["key", "label", "models", "expires", "limits"], at);
     const key = resolveSecret(str(entry.key, `${at}.key`), `${at}.key`);
     // A blank label is a typo, not "no label" — the string form is how you say
     // no label — so it is refused rather than silently falling back to the hash.
@@ -567,13 +1075,28 @@ function apiKeyList(
       if (scope.length === 0) throw bad(`${at}.models`, "must name at least one model");
       for (const id of scope) {
         if (!routeIds.has(id)) {
-          throw bad(`${at}.models`, `names "${id}", which is not a route in models:`);
+          throw bad(`${at}.models`, `names "${id}", which is not a route in models: or a name a flow takes`);
         }
       }
     }
-    take(key, label, at, scope);
+    // A day, and the key works through the end of it (UTC).
+    let expires: number | null = null;
+    if (entry.expires !== undefined) {
+      const day = str(entry.expires, `${at}.expires`);
+      const t = /^\d{4}-\d{2}-\d{2}$/.test(day) ? Date.parse(`${day}T00:00:00Z`) : NaN;
+      if (Number.isNaN(t)) throw bad(`${at}.expires`, `must be a day as YYYY-MM-DD (got ${day})`);
+      expires = t + 86_400_000;
+    }
+    const limits = entry.limits === undefined ? {} : asRecord(entry.limits, `${at}.limits`);
+    only(limits, ["requestsPerMinute", "tokensPerDay", "dollarsPerDay"], `${at}.limits`);
+    const cap = (k: "requestsPerMinute" | "tokensPerDay"): number => {
+      const n = num(limits[k], `${at}.limits.${k}`, 0);
+      if (!Number.isInteger(n) || n < 0) throw bad(`${at}.limits.${k}`, "must be a whole number, 0 or more");
+      return n;
+    };
+    take(key, label, at, scope, { expires, requestsPerMinute: cap("requestsPerMinute"), tokensPerDay: cap("tokensPerDay"), dollarsPerDay: atLeast(limits.dollarsPerDay, `${at}.limits.dollarsPerDay`, 0) });
   });
-  return { keys, labels, models };
+  return { keys, labels, models, rules };
 }
 
 /** A path that can match a request: absolute, no query string. Shared by `routes:` and `activity:`. */
@@ -615,6 +1138,18 @@ function residentDecl(v: unknown, where: string): ResidentDecl | null {
   requirePath(out.yield, `${where}.yield`);
   requirePath(out.resume, `${where}.resume`);
   return out;
+}
+
+/** `hold:` on a backend; lane names are checked once the lanes exist. */
+function holdDecl(v: unknown, where: string): HoldDecl | null {
+  if (v === undefined || v === null) return null;
+  const o = asRecord(v, where);
+  only(o, ["lanes", "idleMs", "seat"], where);
+  const lanes = strList(o.lanes, `${where}.lanes`);
+  if (lanes.length === 0) throw bad(`${where}.lanes`, "must name at least one lane to hold");
+  if (o.idleMs === undefined) throw bad(`${where}.idleMs`, "is required: how long the app must stay idle before the lanes start again");
+  const seat = str(o.seat, `${where}.seat`, "");
+  return { lanes, idleMs: atLeast(o.idleMs, `${where}.idleMs`, 0), seat: seat === "" ? null : seat };
 }
 
 /** `routes:` entries, as a bare path or an object; lane and model are filled in once lanes exist. */
@@ -673,6 +1208,22 @@ function trimUrl(u: string, where: string): string {
   return u.replace(/\/+$/, "");
 }
 
+/** A backend's base url as given, without the `/v1` every call adds: a provider's is usually copied with it. */
+export const backendBase = (url: string, where: string): string => trimUrl(url, where).replace(/\/v1$/, "");
+
+/** A backend's address: its own `url`, else `http://<its server's host>:<port>`. */
+function backendUrl(entry: Record<string, unknown>, at: string, host: string | null): string {
+  if (entry.url !== undefined) {
+    if (entry.port !== undefined) throw bad(`${at}.port`, "is set beside url — keep one: url already carries a port");
+    return backendBase(str(entry.url, `${at}.url`), `${at}.url`);
+  }
+  if (entry.port === undefined) throw bad(`${at}.url`, "is required, or set server and port");
+  if (host === null) throw bad(`${at}.port`, "needs server: a port alone says nothing about which machine");
+  const port = count(entry.port, `${at}.port`, 0, 1);
+  // A bare IPv6 address takes brackets in a URL.
+  return `http://${host.includes(":") && !host.startsWith("[") ? `[${host}]` : host}:${port}`;
+}
+
 /** Peers a route may use that map `id`, in preference order; an empty `named` means every peer. */
 export function peersMapping(id: string, named: readonly string[], peers: readonly PeerConfig[]): string[] {
   const order = named.length > 0 ? named : peers.map((p) => p.name);
@@ -711,6 +1262,11 @@ function probeOverrides(raw: unknown, where: string): Partial<CanaryProbe> {
     out.failureThreshold = count(o.failureThreshold, `${where}.failureThreshold`, 1, 1);
   }
   if (o.recoverAfter !== undefined) out.recoverAfter = count(o.recoverAfter, `${where}.recoverAfter`, 1, 1);
+  if (o.onlyAs !== undefined) {
+    const onlyAs = str(o.onlyAs, `${where}.onlyAs`).trim();
+    if (onlyAs === "") throw bad(`${where}.onlyAs`, "must not be empty");
+    out.onlyAs = onlyAs;
+  }
   return out;
 }
 
@@ -732,6 +1288,7 @@ function canaryDecl(v: unknown, backends: readonly BackendConfig[]): CanaryConfi
     intervalMs: count(c.intervalMs, "canary.intervalMs", 30_000, 1),
     failureThreshold: count(c.failureThreshold, "canary.failureThreshold", 2, 1),
     recoverAfter: count(c.recoverAfter, "canary.recoverAfter", 1, 1),
+    onlyAs: null,
   };
 
   const models: Record<string, Partial<CanaryProbe>> = {};
@@ -798,8 +1355,18 @@ function canaryDecl(v: unknown, backends: readonly BackendConfig[]): CanaryConfi
   };
 }
 
+/** The layout of hearth.yaml this build reads and writes. A file that names a later one is refused, never half-read. */
+export const CONFIG_VERSION = 3;
+
 export function parseConfig(raw: unknown): HearthConfig {
   const root = asRecord(raw, "config");
+  if (root.version !== undefined) {
+    const version = count(root.version, "version", CONFIG_VERSION, 1);
+    if (version > CONFIG_VERSION) {
+      throw bad("version", `is ${version}, a layout newer than this hearth reads (${CONFIG_VERSION}) — upgrade hearth, or restore the file an older one wrote`);
+    }
+    if (version < CONFIG_VERSION) throw bad("version", `is ${version}, an older layout — run \`hearth migrate\` to rewrite it; the original is kept beside it`);
+  }
   const v1 = v1Marker(root);
   if (v1 !== null) {
     throw new ConfigError(null, `this hearth.yaml is in the v1 layout (it has ${v1}) — run \`hearth migrate\` to rewrite it; the original is kept beside it`);
@@ -838,15 +1405,48 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
   }
 
+  const servers: Record<string, ServerDecl> = {};
+  for (const [name, raw] of Object.entries(asRecord(root.servers ?? {}, "servers"))) {
+    const at = `servers.${name}`;
+    const entry = asRecord(raw, at);
+    only(entry, "server", at);
+    const host = str(entry.host, `${at}.host`).trim();
+    if (host === "" || /[\s/]/.test(host)) {
+      throw bad(`${at}.host`, `must be an IP or hostname with no scheme, port or path (got ${JSON.stringify(host)})`);
+    }
+    servers[name] = { host };
+  }
+
   const backends: BackendConfig[] = [];
   if (root.backends === undefined) throw bad("backends", "is required: name at least one server for hearth to front");
   for (const [name, b] of Object.entries(asRecord(root.backends, "backends"))) {
     const at = `backends.${name}`;
     const entry = asRecord(b, at);
     only(entry, "backend", at);
+    const server = str(entry.server ?? "", `${at}.server`) || null;
+    if (server !== null && servers[server] === undefined) {
+      throw bad(`${at}.server`, `names "${server}", which is not in servers`);
+    }
+    const cloud = bool(entry.cloud, `${at}.cloud`, false);
+    if (cloud) {
+      if (str(entry.kind, `${at}.kind`, "none") !== "none") throw bad(`${at}.kind`, "must be none (or left out) on a cloud backend: its provider does not say what is loaded");
+      if (strList(entry.resources, `${at}.resources`).length > 0) throw bad(`${at}.resources`, "names hardware, which a cloud backend does not use here");
+      if (server !== null) throw bad(`${at}.server`, "is a machine on your network; a cloud backend takes a url");
+      if (strList(entry.serves, `${at}.serves`).length === 0) throw bad(`${at}.serves`, "is required on a cloud backend: name the models to offer from it, as its provider names them or as `models.<id>.as` maps them");
+    }
+    const format = str(entry.format, `${at}.format`, "openai");
+    if (!BACKEND_FORMATS.includes(format as BackendFormat)) throw bad(`${at}.format`, `is "${format}" — expected ${BACKEND_FORMATS.join(" or ")}`);
     backends.push({
       name,
-      url: trimUrl(str(entry.url, `${at}.url`), `${at}.url`),
+      format: format as BackendFormat,
+      promptCache: bool(entry.promptCache, `${at}.promptCache`, true),
+      promptCacheTtl: cacheTtl(entry.promptCacheTtl, `${at}.promptCacheTtl`),
+      key: entry.key === undefined ? null : resolveSecret(str(entry.key, `${at}.key`), `${at}.key`),
+      headers: Object.fromEntries(Object.entries(asRecord(entry.headers ?? {}, `${at}.headers`))
+        .map(([k, v]) => [k, resolveSecret(str(v, `${at}.headers.${k}`), `${at}.headers.${k}`)])),
+      cloud,
+      url: backendUrl(entry, at, server === null ? null : servers[server]!.host),
+      server,
       kind: warmSource(entry, at),
       serves: strList(entry.serves, `${at}.serves`),
       concurrency: count(entry.concurrency, `${at}.concurrency`, defaultConcurrency, 1),
@@ -856,6 +1456,7 @@ export function parseConfig(raw: unknown): HearthConfig {
       routes: routeList(entry.routes, `${at}.routes`),
       activity: activityDecl(entry.activity, `${at}.activity`),
       resident: residentDecl(entry.resident, `${at}.resident`),
+      hold: holdDecl(entry.hold, `${at}.hold`),
     });
   }
   if (backends.length === 0) throw bad("backends", "must not be empty");
@@ -877,6 +1478,23 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
   }
   const backendNames = new Set(backends.map((b) => b.name));
+  // One card is in one machine: backends taking turns for it from two would arbitrate nothing real.
+  const cardOn = new Map<string, BackendConfig>();
+  for (const b of backends) {
+    for (const r of b.resources) {
+      if (resourceDecls[r]?.shared) continue;
+      const first = cardOn.get(r);
+      if (first === undefined) cardOn.set(r, b);
+      else if (first.server !== b.server) {
+        const on = (x: BackendConfig) => (x.server === null ? "this machine" : `server "${x.server}"`);
+        throw new ConfigError(
+          "backends",
+          `backends "${first.name}" (${on(first)}) and "${b.name}" (${on(b)}) both use ${r} — ` +
+            `hardware on two machines needs two names`,
+        );
+      }
+    }
+  }
   // A resident on shared hardware (or none) would never be asked to yield, which is its only job.
   for (const b of backends) {
     if (b.resident && !b.resources.some((r) => !resourceDecls[r]?.shared)) {
@@ -923,6 +1541,23 @@ export function parseConfig(raw: unknown): HearthConfig {
   // explicit `lanes:` block that would otherwise replace it.
   if (lanes[WARM_LANE] === undefined) lanes[WARM_LANE] = { priority: WARM_LANE_PRIORITY };
 
+  // A hold is read off the backend's own busy signal and only means something on hardware others wait for.
+  for (const b of backends) {
+    if (b.hold === null) continue;
+    const at = `backends.${b.name}.hold`;
+    if (b.activity === null) throw bad(at, `needs backends.${b.name}.activity: the path that says whether the app is in use`);
+    if (!b.resources.some((r) => !resourceDecls[r]?.shared)) {
+      throw bad(at, `needs an exclusive resource on backends.${b.name}.resources: there is nothing to hold`);
+    }
+    for (const l of b.hold.lanes) {
+      if (!(l in lanes)) throw bad(`${at}.lanes`, `names "${l}", which is not in scheduler.lanes (${Object.keys(lanes).join(", ")})`);
+    }
+    // Only a declared id says which backend loads the seat; a discovered one could be anybody's.
+    if (b.hold.seat !== null && !backends.some((o) => o.serves.includes(b.hold!.seat!))) {
+      throw bad(`${at}.seat`, `is "${b.hold.seat}", which no backend declares in serves: name the swapper's id for this app`);
+    }
+  }
+
   // Route defaults need the lanes: the lowest-priority lane, since a named path is usually the heavy work.
   const fallbackLane = Object.entries(lanes)
     .filter(([n]) => n !== WARM_LANE)
@@ -965,11 +1600,22 @@ export function parseConfig(raw: unknown): HearthConfig {
   // One entry per friend: url and token to borrow from it, accept to lend to it, either or both.
   const peers: PeerConfig[] = [];
   const peerTokens: Record<string, string> = {};
+  const peerTerms: Record<string, Partial<LendTerms>> = {};
   for (const [name, p] of Object.entries(asRecord(root.peers ?? {}, "peers"))) {
     const at = `peers.${name}`;
     const entry = asRecord(p, at);
     only(entry, "peer", at);
     if (entry.accept !== undefined) peerTokens[name] = resolveSecret(str(entry.accept, `${at}.accept`), `${at}.accept`);
+    if (entry.lend !== undefined) {
+      if (entry.accept === undefined) throw bad(`${at}.lend`, `is what ${name} may take from you, which needs its accept`);
+      const lend = asRecord(entry.lend, `${at}.lend`);
+      only(lend, "lend", `${at}.lend`);
+      peerTerms[name] = lendTerms(lend, `${at}.lend`);
+      if (lend.off !== undefined) {
+        if (typeof lend.off !== "boolean") throw bad(`${at}.lend.off`, "must be true or false");
+        if (lend.off) peerTerms[name].off = true;
+      }
+    }
     if (entry.url === undefined) {
       if (entry.accept === undefined) throw bad(at, "needs url (to borrow from it) or accept (to lend to it)");
       for (const k of ["token", "models"]) {
@@ -989,13 +1635,15 @@ export function parseConfig(raw: unknown): HearthConfig {
       models: map,
     });
   }
-  const names = new Set(peers.map((p) => p.name));
 
   const models: Record<string, ModelRoute> = {};
   const modelsRaw = root.models === undefined ? {} : asRecord(root.models, "models");
   const notes: Record<string, string> = {};
   for (const [id, v] of Object.entries(modelsRaw)) {
     const entry = asRecord(v, `models.${id}`);
+    for (const k of MOVED_TO_FLOWS) {
+      if (entry[k] !== undefined) throw bad(`models.${id}.${k}`, "is routing, which now lives under flows: — run `hearth migrate` to rewrite this file, with a backup");
+    }
     only(entry, "model", `models.${id}`);
     if (entry.note !== undefined) {
       const note = str(entry.note, `models.${id}.note`).trim();
@@ -1004,26 +1652,6 @@ export function parseConfig(raw: unknown): HearthConfig {
     }
     // A note alone describes a model; it is not a route.
     if (entry.note !== undefined && Object.keys(entry).length === 1) continue;
-    const policy = str(entry.policy, `models.${id}.policy`, "local") as RoutePolicy;
-    if (!["local", "peer", "spillover", "fastest"].includes(policy)) {
-      throw bad(`models.${id}.policy`, `is "${policy}" — expected local, peer, spillover or fastest`);
-    }
-    const named = strList(entry.peers, `models.${id}.peers`);
-    for (const n of named) {
-      if (!names.has(n)) {
-        throw bad(`models.${id}.peers`, `names "${n}", which is not a peer you borrow from (one with a url)`);
-      }
-    }
-    // Catching it here instead of at request time is the reason this validation
-    // exists at all. A policy that can never fire is a typo.
-    if (policy !== "local") {
-      if (peersMapping(id, named, peers).length === 0) {
-        throw bad(
-          `models.${id}.policy`, `is "${policy}" but no peer maps "${id}" — ` +
-            `add it to a peer's models mapping, or set policy: local`,
-        );
-      }
-    }
     const pinned = str(entry.backend, `models.${id}.backend`, "");
     if (pinned !== "" && !backendNames.has(pinned)) {
       throw bad(
@@ -1055,27 +1683,46 @@ export function parseConfig(raw: unknown): HearthConfig {
       backend: pinned === "" ? null : pinned,
       as: alias === "" ? null : alias,
       follow,
-      policy,
-      peers: named,
-      spilloverAt: count(entry.spilloverAt, `models.${id}.spilloverAt`, 1, 1),
-      fallbackLocal: bool(entry.fallbackLocal, `models.${id}.fallbackLocal`, true),
       concurrency: modelConcurrency(entry, id),
       params,
       lane: lane === "" ? null : lane,
       stats: declaredStats(entry.stats, id),
       emulate: emulate === "" ? null : (emulate as Emulation),
       pool: modelPool(entry.pool, id),
+      price: modelPrice(entry.price, id),
     };
     if (entry.shareAfterMs !== undefined) {
       models[id].shareAfterMs = count(entry.shareAfterMs, `models.${id}.shareAfterMs`, 0, 0);
+    }
+    if (entry.cacheMs !== undefined) {
+      models[id].cacheMs = count(entry.cacheMs, `models.${id}.cacheMs`, 0, 0);
     }
     if (entry.videoTokens !== undefined) {
       models[id].videoTokens = count(entry.videoTokens, `models.${id}.videoTokens`, 1);
     }
   }
 
-  const { keys: apiKeys, labels: apiKeyLabels, models: apiKeyModels } =
-    apiKeyList(root.apiKeys, "apiKeys", new Set(Object.keys(models)));
+  // A provider answers for its own models, and every probe of one would be billed.
+  const canary = canaryDecl(root.canary, backends);
+  for (const name of Object.keys(canary?.backends ?? {})) {
+    if (backends.find((b) => b.name === name)?.cloud) throw bad(`canary.backends.${name}`, "is a cloud backend: the canary does not probe a provider's models");
+  }
+  for (const id of Object.keys(canary?.models ?? {})) {
+    const on = backends.find((b) => b.name === models[id]?.backend) ?? backends.find((b) => b.serves.includes(id));
+    if (on?.cloud) throw bad(`canary.models.${id}`, `runs on the cloud backend "${on.name}": the canary does not probe a provider's models`);
+  }
+
+  // A provider's model is not ours to lend: a peer's requests would be paid for with this node's key.
+  const lent = strList(lending.models, "lending.models");
+  for (const [at, ids] of [["lending.models", lent], ...Object.entries(peerTerms).map(([name, t]) => [`peers.${name}.lend.models`, t.models ?? []])] as [string, readonly string[]][]) {
+    for (const id of ids) {
+      const on = backends.find((b) => b.name === models[id]?.backend) ?? backends.find((b) => b.serves.includes(id));
+      if (on?.cloud) throw bad(at, `names "${id}", which runs on the cloud backend "${on.name}": lending it would spend that provider's key on a peer's requests`);
+    }
+  }
+
+  const { keys: apiKeys, labels: apiKeyLabels, models: apiKeyModels, rules: apiKeyRules } =
+    apiKeyList(root.apiKeys, "apiKeys", new Set([...Object.keys(models), ...typeNames(root)]));
 
   const mainListen = {
     // Loopback by default. Anyone who wants it on the network says so, and
@@ -1099,15 +1746,24 @@ export function parseConfig(raw: unknown): HearthConfig {
     operator = { user, passHash };
   }
 
+  const actions = actionDecls(root.actions);
   // A removed key is refused, not ignored: ignoring it would close the page's port with no word why.
+  const routers = routerDecls(root.routers, (raw) => flowDecls(raw, lanes, peers, actions, backends.flatMap((b) => b.routes.map((r) => r.path))));
   return {
     name: str(root.name, "name", "hearth"),
     // Set by loadConfig, which is the only caller that knows one.
     configPath: null,
     stateFile: str(root.stateFile, "stateFile", "") || null,
     historyFile: str(root.historyFile, "historyFile", "") || null,
+    layout: layoutDecl(root.layout),
+    modelHeader: bool(root.modelHeader, "modelHeader", true),
+    flows: flowDecls(root.flows, lanes, peers, actions, backends.flatMap((b) => b.routes.map((r) => r.path))),
+    routers,
+    callers: callerDecls(root.callers, routers),
+    actions,
     listen: mainListen,
     resources: resourceDecls,
+    servers,
     backends,
     scheduler: {
       concurrency: defaultConcurrency,
@@ -1121,9 +1777,10 @@ export function parseConfig(raw: unknown): HearthConfig {
     apiKeys,
     apiKeyLabels,
     apiKeyModels,
+    apiKeyRules,
     peerTokens,
     operator,
-    share: strList(lending.models, "lending.models"),
+    share: lent,
     notes,
     peerRateLimit: count(lending.rateLimit, "lending.rateLimit", 600, 1),
     peerLane: (() => {
@@ -1142,10 +1799,12 @@ export function parseConfig(raw: unknown): HearthConfig {
       return pick.sort((a, b) => b[1].priority - a[1].priority)[0]![0];
     })(),
     peerMaxConcurrent: count(lending.maxConcurrent, "lending.maxConcurrent", 2, 1),
+    lendTokensPerDay: count(lending.tokensPerDay, "lending.tokensPerDay", 0, 0),
+    peerTerms,
     maxBodyBytes: count(root.maxBodyBytes, "maxBodyBytes", 32 * 1024 * 1024, 1024),
     peers,
     models,
-    canary: canaryDecl(root.canary, backends),
+    canary,
     peerFreshMs: count(borrowing.freshMs, "borrowing.freshMs", 4_000, 100),
     peerDownMs: count(borrowing.downMs, "borrowing.downMs", 30_000, 1000),
     // Slower than it used to be, since on-demand probing does the real work.
@@ -1156,6 +1815,7 @@ export function parseConfig(raw: unknown): HearthConfig {
     peerFirstByteMs: atLeast(borrowing.firstByteMs, "borrowing.firstByteMs", 180_000),
     backendFirstByteMs: atLeast(defaults.firstByteMs, "backendDefaults.firstByteMs", 900_000),
     backendIdleMs: atLeast(defaults.idleMs, "backendDefaults.idleMs", 600_000),
+    backendRestMs: atLeast(defaults.restMs, "backendDefaults.restMs", 30_000),
     coldPenalty: atLeast(borrowing.coldPenalty, "borrowing.coldPenalty", 2),
     // 30s covers a sidecar call, an embedding and most chat turns. A box whose
     // routes are minutes-long renders wants more, and its TimeoutStopSec too.
@@ -1177,6 +1837,10 @@ export function loadConfig(path: string): HearthConfig {
     throw new ConfigError(null, `${path} is not valid YAML: ${String(e)}`);
   }
   const cfg = parseConfig(raw);
+  // A file says what becomes of a name no flow takes, so that nothing is callable or refused by an oversight.
+  if (!Object.values(cfg.flows).some((f) => f.inputs.includes(ANY))) {
+    throw new ConfigError("flows", `flows: needs a flow with inputs: ["${ANY}"], which says what happens to a name no other flow takes — \`to: { asked: true }\` runs it as itself, \`to: { refuse: "..." }\` turns it away. \`hearth migrate\` adds one that runs them as themselves`);
+  }
   cfg.configPath = path;
   return cfg;
 }

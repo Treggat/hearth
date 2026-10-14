@@ -4,19 +4,22 @@
  */
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
+import type { Readable } from "node:stream";
 
 export interface UpstreamResponse {
   ok: boolean;
   status: number;
   headers: Record<string, string | string[] | undefined>;
   /** Raw body chunks. Async-iterable: `for await (const chunk of body)`. */
-  body: IncomingMessage;
+  body: Readable;
   /** Drain the body to a string, capped at `maxBytes`; error and control-plane paths only. */
   text: (maxBytes?: number) => Promise<string>;
 }
 
 /** The most of a buffered body we hold, so a peer's oversized reply costs bounded memory. */
 const MAX_TEXT_BYTES = 1 << 20;
+/** The most of a stream held while waiting for the end of a line or an event: past it, what is held goes on as it is. */
+export const MAX_HELD_CHARS = 16 << 20;
 
 export class UpstreamError extends Error {
   constructor(

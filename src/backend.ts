@@ -7,9 +7,15 @@ import type { ActivityDecl } from "./config.js";
 import { KINDS, readingFromStatus, type Kind, type KindName, type ModelStatus, type Placement } from "./kinds.js";
 import type { Logger } from "./log.js";
 import { known, type ModelStats } from "./stats.js";
-import { getJson, send } from "./upstream.js";
+import { getJson, MAX_HELD_CHARS, send, UpstreamError } from "./upstream.js";
 
-/** How often an activity path is read, and its timeout; sampled only while a page is open. */
+/** How often an activity path is read, and its timeout; sampled while a page is open, or always for a backend with a `hold`. */
+/** Why a read of a backend's model list failed, in a few words, from the status it answered with (0: no answer). */
+export const troubleSays = (status: number): string =>
+  status === 401 || status === 403 ? "key refused" : status === 429 ? "rate limited" : status === 0 ? "not reachable" : `answered ${status}`;
+
+/** Failures in a row before a backend is rested. */
+const STRIKES = 3;
 const ACTIVITY_POLL_MS = 2_000;
 const ACTIVITY_TIMEOUT_MS = 2_000;
 
@@ -27,6 +33,12 @@ function countField(body: unknown, field: string): number | null {
   return null;
 }
 
+/**
+ * How long an app may go unread and still count as up, for a `hold`: longer than the status
+ * staleness above, so a slow answer in the middle of a job does not hand its card away.
+ */
+const HOLD_GAP_MS = 30_000;
+
 /** How long we'll trust a quiet stream before going and asking. */
 const STALE_MS = 60_000;
 
@@ -35,9 +47,14 @@ const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 export class BackendState {
   private loadedIds: string[] = [];
   private loadingIds: string[] = [];
+  private readonly loadEndedAt = new Map<string, number>();
   private placements = new Map<string, Placement>();
   private placementFor: string = "";
   private catalogIds: string[] = [];
+  private catalogFault: number | null = null;
+  /** Requests that failed here in a row, and until when it is passed over for that. */
+  private strikes = 0;
+  private restUntil = 0;
   /** False for `kind: none`, where an empty warm set means "we cannot see",
    *  not "nothing is warm". Callers must not turn one into the other. */
   private warmIsKnown = true;
@@ -65,6 +82,10 @@ export class BackendState {
   private activityReading: { running: number; queued: number | null; at: number } | null = null;
   private activityAt = 0;
   private activityInFlight: Promise<void> | null = null;
+  /** When the app last answered its activity path, when it last had work, and when it began answering. */
+  private seenAt = 0;
+  private busyAt = 0;
+  private upAt = 0;
 
   private readonly k: Kind;
 
@@ -77,6 +98,8 @@ export class BackendState {
      * what it serves, so a sidecar pinned beside a swapping model is nobody's resident but its own.
      */
     private readonly mine: (id: string) => boolean = () => true,
+    /** Sent with the catalogue read, for a backend that wants a key before it answers anything. */
+    private readonly headers: Record<string, string> = {},
     /** `mine` is exactly this backend's declared ids, so an unload drops those one by one and never clears the URL. */
     private readonly scoped = false,
   ) {
@@ -100,11 +123,13 @@ export class BackendState {
         // the app changing shape — not zero, and not a reading. Leave the last
         // good one to age out, exactly as a failed read does.
         if (running !== null) {
-          this.activityReading = {
-            running,
-            queued: decl.queued ? countField(body, decl.queued) : null,
-            at: Date.now(),
-          };
+          const queued = decl.queued ? countField(body, decl.queued) : null;
+          const now = Date.now();
+          this.activityReading = { running, queued, at: now };
+          // Only work counts as use: an idle app answering again, or for the first time, says nothing of who wants it.
+          if (running > 0 || (queued ?? 0) > 0) this.busyAt = now;
+          if (now - this.seenAt > HOLD_GAP_MS) this.upAt = now;
+          this.seenAt = now;
         }
       } catch {
         // Unreachable, timed out, or not JSON: cannot tell, never idle. The last
@@ -126,6 +151,18 @@ export class BackendState {
     return a.queued === null
       ? { running: a.running, ok: true }
       : { running: a.running, queued: a.queued, ok: true };
+  }
+
+  /** Is the app up, and was it in use within `idleMs`? False once it stops answering for HOLD_GAP_MS. */
+  holding(idleMs: number): boolean {
+    const now = Date.now();
+    return this.seenAt > 0 && now - this.seenAt <= HOLD_GAP_MS && now - this.busyAt < idleMs;
+  }
+
+  /** How long the app has reported nothing to do, counted from when it began answering if it has had no work since; null when it is not answering. */
+  quietMs(): number | null {
+    const now = Date.now();
+    return this.seenAt > 0 && now - this.seenAt <= HOLD_GAP_MS ? now - Math.max(this.busyAt, this.upAt) : null;
   }
 
   private useEvents: boolean;
@@ -155,6 +192,18 @@ export class BackendState {
     // The event stream may take a moment to say so; scoring the next job against an evicted model is worse.
     this.loadedIds = [];
     this.lastUpdateAt = Date.now();
+  }
+
+  /**
+   * Drop one resident model and leave the rest; true once it is gone. False where this kind
+   * cannot name a model to drop — the caller then decides whether clearing the whole card is safe.
+   */
+  async dropOne(model: string): Promise<boolean> {
+    const fn = this.k.unloadModel;
+    if (fn === undefined) return false;
+    const dropped = await fn(this.url, model, this.log);
+    if (dropped) await this.refresh().catch(() => {});
+    return dropped;
   }
 
   /** Can this backend tell us what is loaded at all? */
@@ -187,6 +236,27 @@ export class BackendState {
    *  whether we re-ask, not transport. */
   streamingNow(): boolean {
     return this.streaming;
+  }
+
+  /** A request failed here through the backend's own fault. The third in a row rests it for `restMs`, and so does each one after. */
+  struck(restMs: number): void {
+    if (++this.strikes >= STRIKES && restMs > 0) this.restUntil = Date.now() + restMs;
+  }
+
+  /** A request was answered here: whatever was counted against it is forgotten. */
+  answered(): void {
+    this.strikes = 0;
+    this.restUntil = 0;
+  }
+
+  /** How much longer it is passed over, in ms; 0 when it is not. Once that runs out the next request tries it. */
+  restingMs(): number {
+    return Math.max(0, this.restUntil - Date.now());
+  }
+
+  /** How the last read of the model list failed: the status it answered with, 0 for no answer at all, null when it worked or has not been tried. */
+  catalogTrouble(): number | null {
+    return this.catalogFault;
   }
 
   /** True where we hold an event stream, the only place silence from a backend means anything; never before the first attempt settles. */
@@ -251,7 +321,7 @@ export class BackendState {
   private apply(models: ModelStatus[]): void {
     const r = readingFromStatus(models.filter((m) => this.mine(m.id)));
     this.catalogIds = r.catalog;
-    this.loadingIds = r.loading;
+    this.setLoading(r.loading);
     this.setLoaded(r.loaded);
     // Placement is fetched from /running when the resident set changes, never on a timer.
     void this.learnPlacement();
@@ -265,6 +335,7 @@ export class BackendState {
     // serves. Warm state depends on who we are talking to, so that half is
     // asked differently per kind, or not at all.
     const catalogRead = getJson<{ data?: { id?: string }[] }>(`${this.url}/v1/models`, {
+      headers: this.headers,
       headersTimeoutMs: 3_000,
     }).then((c) => (c.data ?? []).map((m) => m.id ?? "").filter((m) => m !== ""));
     // A kind may answer warm state from the catalogue, so it is handed the fresh one when it arrives.
@@ -274,10 +345,11 @@ export class BackendState {
     ]);
 
     if (catalog.status === "fulfilled") this.catalogIds = catalog.value.filter((m) => this.mine(m));
+    this.catalogFault = catalog.status === "fulfilled" ? null : catalog.reason instanceof UpstreamError && catalog.reason.status !== undefined ? catalog.reason.status : 0;
 
     if (warm.status === "fulfilled" && warm.value !== null) {
       this.setLoaded(warm.value.loaded.filter((m) => this.mine(m)));
-      this.loadingIds = warm.value.loading.filter((m) => this.mine(m));
+      this.setLoading(warm.value.loading.filter((m) => this.mine(m)));
       if (warm.value.placements) this.placements = warm.value.placements;
     } else {
       // Missing warm endpoint isn't an error, it just means we never know
@@ -335,6 +407,18 @@ export class BackendState {
     return [...this.loadingIds];
   }
 
+  private setLoading(ids: string[]): void {
+    const now = Date.now();
+    for (const id of this.loadingIds) if (!ids.includes(id)) this.loadEndedAt.set(id, now);
+    this.loadingIds = ids;
+  }
+
+  /** How long since `id` was last seen loading: 0 while it is, Infinity if it never was. */
+  sinceLoading(id: string): number {
+    if (this.loadingIds.includes(id)) return 0;
+    return Date.now() - (this.loadEndedAt.get(id) ?? -Infinity);
+  }
+
   /** Refresh only if we have to. This is what the hot path calls. */
   async ensureFresh(): Promise<void> {
     // Just fresh(), not `streaming && fresh()`. `streaming` is only true on the
@@ -386,6 +470,7 @@ export class BackendState {
       // Frames are blank-line delimited. Hang on to the trailing partial.
       const frames = buffer.split("\n\n");
       buffer = frames.pop() ?? "";
+      if (buffer.length > MAX_HELD_CHARS) buffer = "";
       for (const frame of frames) {
         // Data lines get joined with newlines. It's not just the first one.
         const data = frame

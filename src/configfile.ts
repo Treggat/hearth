@@ -14,22 +14,23 @@ import { basename, dirname } from "node:path";
 import { isMap, isScalar, parseDocument, type Document } from "yaml";
 
 import { Refusal } from "./admit.js";
-import { ConfigError, parseConfig, peersMapping, type HearthConfig, type ModelRoute, type RoutePolicy } from "./config.js";
+import { ConfigError, endsOf, parseConfig, peersMapping, rawFlow, type Flow, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
+import { routedFlow } from "./route.js";
 import type { Logger } from "./log.js";
 
 /** Keys the running node reads per call, so a new value takes effect on the next request. */
 const LIVE_KEYS = [
-  "models", "share", "notes", "apiKeys", "apiKeyLabels", "apiKeyModels", "peerTokens",
-  "peerRateLimit", "peerLane", "peerMaxConcurrent", "maxBodyBytes", "peerFreshMs", "peerDownMs",
-  "peerStaleMs", "peerFirstByteMs", "backendFirstByteMs", "backendIdleMs", "coldPenalty", "shutdownGraceMs",
-  "operator",
+  "models", "share", "notes", "apiKeys", "apiKeyLabels", "apiKeyModels", "apiKeyRules", "peerTokens",
+  "peerRateLimit", "peerLane", "peerMaxConcurrent", "lendTokensPerDay", "peerTerms", "maxBodyBytes", "peerFreshMs", "peerDownMs",
+  "peerStaleMs", "peerFirstByteMs", "backendFirstByteMs", "backendIdleMs", "backendRestMs", "coldPenalty", "shutdownGraceMs",
+  "operator", "layout", "flows", "routers", "callers", "actions", "modelHeader",
 ] as const satisfies readonly (keyof HearthConfig)[];
 
 /** Restart-only internal keys whose hearth.yaml name differs, for "restart to apply …". */
 const YAML_NAME: Record<string, string> = { peerPollMs: "borrowing.pollMs" };
 
 /** Live keys that stay frozen once applied, as the fixed config is. */
-const FROZEN_LIVE = new Set<string>(["apiKeys", "apiKeyLabels", "apiKeyModels", "peerTokens", "operator"]);
+const FROZEN_LIVE = new Set<string>(["apiKeys", "apiKeyLabels", "apiKeyModels", "apiKeyRules", "peerTokens", "operator"]);
 
 export function deepFreeze(v: unknown): void {
   if (v === null || typeof v !== "object" || Object.isFrozen(v)) return;
@@ -40,10 +41,6 @@ export function deepFreeze(v: unknown): void {
 /** Keys that never count as a change to the node. */
 const IGNORED = new Set<string>(["configPath", "stateFile"]);
 
-const DEFAULT_ROUTE: ModelRoute = {
-  backend: null, as: null, follow: false, policy: "local", peers: [], spilloverAt: 1,
-  fallbackLocal: true, concurrency: null, params: null, lane: null, stats: null, emulate: null, pool: null,
-};
 
 /** One edit to the YAML document: set `value` at `path`, or delete it. */
 export interface ConfigOp {
@@ -57,64 +54,128 @@ export interface ConfigOp {
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
- * A secret (an apiKeys entry, a peer token) never reaches a console — not in a form, not in the
+ * A secret (an apiKeys entry, a peer token, a backend's key) never reaches a console — not in a form, not in the
  * YAML tab. Each one is read back as a stand-in; the stand-in then travels with an edit: left
  * standing, it is written back as the original, replaced, and the new value takes its place.
  */
 const SECRET = "hearth-secret";
 
-/** One stand-in per secret in the file, in file order; `env:NAME` entries are already out of the file. */
-function secretTable(doc: unknown): Map<string, string> {
-  const d = (doc ?? {}) as Record<string, unknown>;
-  const table = new Map<string, string>();
-  let n = 0;
-  const grab = (v: unknown): void => {
-    if (typeof v === "string" && v !== "" && !v.startsWith("env:")) table.set(`${SECRET}${++n}`, v);
+const HAS_STANDIN = /hearth-secret\d+/;
+const IS_STANDIN = /^hearth-secret\d+$/;
+type Path = (string | number)[];
+
+/** Every place a secret sits in the file, in one order: the table, the masking and the way home all walk this. */
+function secretPaths(d: Record<string, unknown>): Path[] {
+  const out: Path[] = [];
+  const each = (v: unknown, f: (name: string, o: Record<string, unknown>) => void): void => {
+    if (isObj(v)) for (const [name, o] of Object.entries(v)) if (isObj(o)) f(name, o);
   };
-  // An apiKeys entry is a bare key or {key, label, models}; the secret sits in the same place either way.
-  for (const e of (d.apiKeys ?? []) as unknown[]) {
-    if (typeof e === "string") grab(e);
-    else if (isObj(e)) grab(e.key);
-  }
-  if (isObj(d.peers)) for (const p of Object.values(d.peers)) if (isObj(p)) { grab(p.token); grab(p.accept); }
+  const headers = (h: unknown, at: Path): void => {
+    if (isObj(h)) for (const name of Object.keys(h)) out.push([...at, name]);
+  };
+  // An apiKeys entry is a bare key or {key, label, models}.
+  if (Array.isArray(d.apiKeys)) d.apiKeys.forEach((e, i) => out.push(isObj(e) ? ["apiKeys", i, "key"] : ["apiKeys", i]));
+  each(d.peers, (name) => out.push(["peers", name, "token"], ["peers", name, "accept"]));
   // Only a hash, but one that can be attacked offline, and nothing on the page needs it.
-  if (isObj(d.operator)) grab(d.operator.passHash);
+  out.push(["operator", "passHash"]);
+  each(d.backends, (name, b) => { out.push(["backends", name, "key"]); headers(b.headers, ["backends", name, "headers"]); });
+  // What a webhook is sent to prove who is calling.
+  each(d.actions, (name, a) => headers(a.headers, ["actions", name, "headers"]));
+  if (isObj(d.canary) && isObj(d.canary.notify)) headers(d.canary.notify.headers, ["canary", "notify", "headers"]);
+  return out;
+}
+
+const valueAt = (d: unknown, path: Path): unknown =>
+  path.reduce<unknown>((v, k) => (typeof v === "object" && v !== null ? (v as Record<string | number, unknown>)[k] : undefined), d);
+/** A secret that is in the file; `env:NAME` entries are already out of it. */
+const held = (v: unknown): v is string => typeof v === "string" && v !== "" && !v.startsWith("env:");
+
+/** One stand-in per secret in the file, in the order of `secretPaths`. */
+function secretTable(doc: unknown): Map<string, string> {
+  const table = new Map<string, string>();
+  if (!isObj(doc)) return table;
+  let n = 0;
+  for (const path of secretPaths(doc)) {
+    const v = valueAt(doc, path);
+    if (held(v)) table.set(`${SECRET}${++n}`, v);
+  }
   return table;
 }
 
-function maskSecrets(text: string, doc: unknown): { text: string; doc: unknown } {
-  const table = secretTable(doc);
-  if (table.size === 0) return { text, doc };
+/** Each `[from, to, text]` written over the source, last first so earlier offsets hold. */
+function splice(text: string, cuts: [number, number, string][]): string {
+  let out = text;
+  for (const [from, to, put] of cuts.sort((x, y) => y[0] - x[0])) out = out.slice(0, from) + put + out.slice(to);
+  return out;
+}
+
+function maskSecrets(text: string, doc: Record<string, unknown>): { text: string; doc: unknown } {
   const d = JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
+  const src = parseDocument(text);
+  const cuts: [number, number, string][] = [];
+  const loose: [string, string][] = [];
   let n = 0;
-  // Must skip exactly what secretTable skipped, or the stand-ins misalign.
-  const swap = (v: unknown): unknown =>
-    typeof v === "string" && v !== "" && !v.startsWith("env:") ? `${SECRET}${++n}` : v;
-  const keys = d.apiKeys as unknown[] | undefined;
-  if (Array.isArray(keys))
-    for (let i = 0; i < keys.length; i++) {
-      const e = keys[i];
-      if (typeof e === "string") keys[i] = swap(e);
-      else if (isObj(e)) e.key = swap(e.key);
-    }
-  if (isObj(d.peers)) {
-    for (const p of Object.values(d.peers)) {
-      if (!isObj(p)) continue;
-      if (p.token !== undefined) p.token = swap(p.token);
-      if (p.accept !== undefined) p.accept = swap(p.accept);
-    }
+  for (const path of secretPaths(d)) {
+    const v = valueAt(d, path);
+    if (!held(v)) continue;
+    const standIn = `${SECRET}${++n}`;
+    (valueAt(d, path.slice(0, -1)) as Record<string | number, unknown>)[path[path.length - 1]!] = standIn;
+    const node = src.getIn(path, true);
+    if (isScalar(node) && node.range) cuts.push([node.range[0], node.range[1], standIn]);
+    else loose.push([v, standIn]);
   }
-  if (isObj(d.operator)) d.operator.passHash = swap(d.operator.passHash);
-  let masked = text;
-  for (const [m, s] of table) masked = masked.split(s).join(m);
+  if (n === 0) return { text, doc };
+  let masked = splice(text, cuts);
+  // A secret with no scalar of its own in the text (an alias) is taken out wherever it is written.
+  for (const [secret, standIn] of loose) masked = masked.split(secret).join(standIn);
   return { text: masked, doc: d };
 }
 
-/** A file the console sent back: every stand-in it left standing comes home as the original. */
+/** A string as a YAML scalar that reads back as that string wherever it is put. */
+const scalarOf = (s: string): string =>
+  /^[\w./+=:@-]+$/.test(s) && !s.endsWith(":") && parseDocument(s).toJS() === s ? s : JSON.stringify(s);
+
+/** The first value or key outside a secret's place that carries a stand-in, as a dotted path. */
+function strayStandIn(v: unknown, path: Path, own: Set<string>): string | null {
+  if (typeof v === "string") return HAS_STANDIN.test(v) && !own.has(JSON.stringify(path)) ? path.join(".") : null;
+  if (typeof v !== "object" || v === null) return null;
+  for (const [k, x] of Array.isArray(v) ? v.entries() : Object.entries(v)) {
+    if (typeof k === "string" && HAS_STANDIN.test(k)) return [...path, k].join(".");
+    const found = strayStandIn(x, [...path, k], own);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/**
+ * A file the console sent back: every stand-in left standing where a secret goes comes home as
+ * the original. Anywhere else it is refused, or a stand-in typed into a field the page shows
+ * would read the secret out.
+ */
 function unmaskSecrets(text: string, table: Map<string, string>): string {
-  let out = text;
-  for (const [m, s] of table) out = out.split(m).join(s);
-  return out;
+  let d: unknown;
+  const src = parseDocument(text);
+  try {
+    d = src.toJS();
+  } catch {
+    return text;
+  }
+  // A file that does not parse is refused whole by the commit; nothing of it is written.
+  if (src.errors.length > 0 || !isObj(d)) return text;
+  const paths = secretPaths(d);
+  const stray = strayStandIn(d, [], new Set(paths.map((p) => JSON.stringify(p))));
+  if (stray !== null) throw new ConfigRefusal(422, `${stray} carries the stand-in for a secret, which only goes back where a secret is kept`, stray);
+  const cuts: [number, number, string][] = [];
+  for (const path of paths) {
+    const v = valueAt(d, path);
+    if (typeof v !== "string" || !IS_STANDIN.test(v)) continue;
+    const at = path.join(".");
+    const secret = table.get(v);
+    const node = src.getIn(path, true);
+    if (secret === undefined || !isScalar(node) || !node.range) throw new ConfigRefusal(422, `${at} is a stand-in this node did not hand out for this file; enter the value itself`, at);
+    cuts.push([node.range[0], node.range[1], scalarOf(secret)]);
+  }
+  return splice(text, cuts);
 }
 
 export interface ConfigStatus {
@@ -143,6 +204,11 @@ export class ConfigRefusal extends Refusal {
     super(status, message);
   }
 }
+
+/** A version of the file that was written through the node: when, the name it was given (may be empty), and its hash. */
+export interface Version { at: string; name: string; hash: string }
+/** How many versions are kept; older ones go. */
+const KEEP_VERSIONS = 50;
 
 /** Write via temp file, fsync and rename, keeping the file's mode; in place where only the file is writable. */
 export function writeFileAtomic(path: string, text: string): void {
@@ -181,7 +247,10 @@ export function writeFileAtomic(path: string, text: string): void {
 
 /* ------------------------------------------------- edits on a parsed draft */
 
-/** Map one of our ids to a peer's and route it there; a route naming its peers gains this one, never widens. */
+/**
+ * Map one of our ids to a peer's and send its requests there. An id no flow takes yet gets one in
+ * the shape `policy` names; one that is already routed keeps its flow, which gains this peer.
+ */
 export function link(cfg: HearthConfig, peer: string, mine: string, theirs: string, policy: RoutePolicy, fallbackLocal: boolean): void {
   const p = cfg.peers.find((x) => x.name === peer);
   if (!p) {
@@ -191,39 +260,57 @@ export function link(cfg: HearthConfig, peer: string, mine: string, theirs: stri
     );
   }
   if (mine === "" || theirs === "") throw new ConfigError(null, "both model ids are required");
-  const prev = cfg.models[mine];
   p.models[mine] = theirs;
-  const peers = prev && prev.peers.length > 0 && !prev.peers.includes(peer) ? [...prev.peers, peer] : (prev?.peers ?? []);
-  cfg.models[mine] = { ...DEFAULT_ROUTE, ...prev, policy, peers, fallbackLocal };
+  const taken = Object.values(cfg.flows).find((f) => f.inputs.includes(mine));
+  if (!taken) {
+    const flow = routedFlow(mine, { policy, peers: [peer], fallbackLocal });
+    // A name already used by a flow that takes other ids gets one beside it.
+    let name = mine;
+    for (let n = 2; name in cfg.flows; n++) name = `${mine}-${n}`;
+    if (flow) cfg.flows[name] = flow;
+    return;
+  }
+  const sends = (e: FlowEnd) => "peer" in e && e.peer === peer && (e.model ?? mine) === mine;
+  if (taken.steps.some((s) => endsOf(s.to).some(sends))) return;
+  // Beside the peers it already tries: in the choice of the fastest when there is one, else as a step ahead of the last.
+  const choice = taken.steps.find((s) => "fastest" in s.to);
+  if (choice && "fastest" in choice.to) choice.to.fastest.push({ peer, model: mine });
+  else taken.steps.splice(-1, 0, { when: null, to: { peer, model: mine }, lane: null, params: null, do: [] });
 }
 
-/** Remove a mapping, and retire any route nothing it names still maps; an emptied peer list is dead, not open. */
+/** Remove a mapping, and with it every step that sent the id to that peer. */
 export function unlink(cfg: HearthConfig, peer: string, mine: string): void {
   const p = cfg.peers.find((x) => x.name === peer);
   if (!p) throw new ConfigError(null, `"${peer}" is not a configured peer`);
   delete p.models[mine];
-  const route = cfg.models[mine];
-  if (route && route.peers.includes(peer)) {
-    const rest = route.peers.filter((n) => n !== peer);
-    if (rest.length === 0) retireRoute(cfg, mine);
-    else route.peers = rest;
-  }
-  pruneDeadRoutes(cfg);
+  pruneUnmapped(cfg);
 }
 
-/** Stop a route sending work away: delete it if it is only a policy, else demote it to local and keep its settings. */
-function retireRoute(cfg: HearthConfig, id: string): void {
-  const r = cfg.models[id];
-  if (!r) return;
-  const onlyAPolicy = r.backend === null && r.as === null && r.concurrency === null && r.spilloverAt === 1
-    && r.params === null && r.lane === null && r.stats === null;
-  if (onlyAPolicy) delete cfg.models[id];
-  else cfg.models[id] = { ...r, policy: "local", peers: [] };
-}
-
-function pruneDeadRoutes(cfg: HearthConfig): void {
-  for (const [id, route] of Object.entries(cfg.models)) {
-    if (route.policy !== "local" && peersMapping(id, route.peers, cfg.peers).length === 0) retireRoute(cfg, id);
+/**
+ * Take out of every flow what a peer can no longer be sent: a step or a candidate for an id that
+ * peer does not map. A flow left doing nothing but running its own id here, or refusing it, goes.
+ */
+function pruneUnmapped(cfg: HearthConfig): void {
+  const maps = (peer: string, id: string) => cfg.peers.find((x) => x.name === peer)?.models[id] !== undefined;
+  for (const [name, flow] of Object.entries(cfg.flows)) {
+    const before = JSON.stringify(flow);
+    // An id this flow takes that a peer step can no longer be sent as goes back to running as itself.
+    const open = flow.steps.flatMap((s) => endsOf(s.to)).filter((e): e is Extract<FlowEnd, { peer: string }> => "peer" in e && e.model === null);
+    if (flow.inputs.length > 1) flow.inputs = flow.inputs.filter((id) => open.every((e) => maps(e.peer, id)));
+    const dead = (e: FlowEnd) => "peer" in e && (e.model === null ? flow.inputs.some((id) => !maps(e.peer, id)) : !maps(e.peer, e.model));
+    flow.steps = flow.steps.flatMap((s): Flow["steps"] => {
+      if ("flow" in s.to || "refuse" in s.to || "asked" in s.to) return [s];
+      if (!("fastest" in s.to)) return dead(s.to) ? [] : [s];
+      const left = s.to.fastest.filter((e) => !dead(e));
+      return left.length === 0 ? [] : [{ ...s, to: left.length === 1 ? left[0]! : { fastest: left } }];
+    });
+    if (JSON.stringify(flow) === before) continue;
+    const idle = flow.steps.every((s) => "refuse" in s.to || (!("flow" in s.to) && !("fastest" in s.to) && !("peer" in s.to) && ("asked" in s.to || flow.inputs.includes(s.to.model)) && s.do.length === 0 && s.params === null && s.lane === null));
+    if (flow.steps.length === 0 || flow.inputs.length === 0 || idle) { delete cfg.flows[name]; continue; }
+    // What is left still has to end in a step that always applies.
+    const last = flow.steps.at(-1)!;
+    flow.steps[flow.steps.length - 1] = { ...last, when: null };
+    delete flow.steps[flow.steps.length - 1]!.max;
   }
 }
 
@@ -233,15 +320,20 @@ export function setNote(cfg: HearthConfig, model: string, text: string | null): 
   else notes[model] = text.trim();
 }
 
-/** Lend or withhold one model; new ids append, existing order is kept. */
+/**
+ * Lend or withhold one model; new ids append, existing order is kept. Withheld, it leaves each
+ * peer's own list too: that list stands in for the node's, and would go on lending it.
+ */
 export function setShare(cfg: HearthConfig, model: string, on: boolean): void {
   if (on && !cfg.share.includes(model)) cfg.share = [...cfg.share, model];
-  if (!on) cfg.share = cfg.share.filter((m) => m !== model);
+  if (on) return;
+  cfg.share = cfg.share.filter((m) => m !== model);
+  for (const terms of Object.values(cfg.peerTerms)) if (terms.models) terms.models = terms.models.filter((m) => m !== model);
 }
 
 /**
  * Write what changed between two parsed configs into the YAML document, touching only the share
- * list, peers' model maps, routes' policy/peers/fallbackLocal, and notes — the fields edits move.
+ * list, peers' own lists and model maps, flows, and notes — the fields edits move.
  */
 function writeDiff(doc: Document, before: HearthConfig, after: HearthConfig, where: string): void {
   /** Replace a list, keeping its flow or block style. */
@@ -254,6 +346,9 @@ function writeDiff(doc: Document, before: HearthConfig, after: HearthConfig, whe
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
   if (!same(before.share, after.share)) setList(["lending", "models"], after.share);
+  for (const [name, terms] of Object.entries(after.peerTerms)) {
+    if (terms.models && !same(before.peerTerms[name]?.models, terms.models)) setList(["peers", name, "lend", "models"], [...terms.models]);
+  }
 
   for (const p of after.peers) {
     const was = before.peers.find((x) => x.name === p.name)?.models ?? {};
@@ -268,22 +363,15 @@ function writeDiff(doc: Document, before: HearthConfig, after: HearthConfig, whe
     }
   }
 
-  for (const id of new Set([...Object.keys(before.models), ...Object.keys(after.models)])) {
-    const was = before.models[id];
-    const now = after.models[id];
-    if (!now) {
-      // A retired route keeps its note: the note describes the model, not where it runs.
-      if (was) for (const k of Object.keys(was)) if (k !== "note") doc.deleteIn(["models", id, k]);
-      dropIfEmpty(id);
-      continue;
+  for (const name of new Set([...Object.keys(before.flows), ...Object.keys(after.flows)])) {
+    const now = after.flows[name];
+    if (same(before.flows[name], now)) continue;
+    if (now) doc.setIn(["flows", name], doc.createNode(rawFlow(now)));
+    else {
+      doc.deleteIn(["flows", name]);
+      const left = doc.getIn(["flows"], true) as { items?: unknown[] } | undefined;
+      if (left && Array.isArray(left.items) && left.items.length === 0) doc.delete("flows");
     }
-    if (was && was.policy === now.policy && was.fallbackLocal === now.fallbackLocal && same(was.peers, now.peers)) continue;
-    doc.setIn(["models", id, "policy"], now.policy);
-    if (now.peers.length) setList(["models", id, "peers"], now.peers);
-    else doc.deleteIn(["models", id, "peers"]);
-    // Only when not the default, so the file does not accumulate restatements.
-    if (now.fallbackLocal) doc.deleteIn(["models", id, "fallbackLocal"]);
-    else doc.setIn(["models", id, "fallbackLocal"], false);
   }
 
   const wasNotes = before.notes ?? {};
@@ -344,6 +432,67 @@ export class ConfigFile {
     return (cfg as unknown as Record<string, unknown>)[key];
   }
 
+  /** The console's draft, kept beside the file so it outlasts a browser; null when there is none. */
+  draft(): unknown {
+    if (!this.path) return null;
+    try {
+      return JSON.parse(readFileSync(`${this.path}.draft.json`, "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  /** Keep a draft, or with null let go of the one kept. It is the console's to read: nothing here applies it. */
+  keepDraft(draft: unknown): void {
+    if (!this.path) throw new ConfigRefusal(409, "this node was not loaded from a config file, so there is nowhere to keep a draft", null);
+    if (draft === null) rmSync(`${this.path}.draft.json`, { force: true });
+    else writeFileAtomic(`${this.path}.draft.json`, JSON.stringify(draft));
+  }
+
+  /** The list as kept: a bare list, or `{v: 1, versions}`. Null for a file a later hearth wrote, which is left as it is. */
+  private kept(): (Version & { text: string })[] | null {
+    try {
+      const all = JSON.parse(readFileSync(`${this.path}.versions.json`, "utf8")) as unknown;
+      if (Array.isArray(all)) return all as (Version & { text: string })[];
+      if (!isObj(all)) return [];
+      if (all.v !== 1) return null;
+      return Array.isArray(all.versions) ? all.versions as (Version & { text: string })[] : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** What has been written through here, oldest first: when, and the name it was given. */
+  versions(): Version[] {
+    return this.path ? (this.kept() ?? []).map(({ text: _, ...v }) => v) : [];
+  }
+
+  /** Remember what was just written. A save never fails for want of its place in the list. */
+  private remember(was: string, text: string, name: string): void {
+    try {
+      const all = this.kept();
+      if (all === null) {
+        this.log.warn("config.version_not_kept", { error: "the list of versions was written by a later hearth" });
+        return;
+      }
+      // The file as it stood before the first change made here is somewhere to go back to as well.
+      if (all.length === 0 && was) all.push({ at: new Date().toISOString(), name: "before the first change made here", hash: hashOf(was), text: was });
+      all.push({ at: new Date().toISOString(), name, hash: hashOf(text), text });
+      writeFileAtomic(`${this.path}.versions.json`, JSON.stringify(all.slice(-KEEP_VERSIONS)));
+    } catch (e) {
+      this.log.warn("config.version_not_kept", { error: String(e) });
+    }
+  }
+
+  /** Write an earlier version back as the file, through the same checks as any other save. */
+  restore(hash: string, dryRun: boolean): CommitResult {
+    if (!this.path) throw new ConfigRefusal(409, "this node was not loaded from a config file, so there is no file to edit", null);
+    const v = (this.kept() ?? []).findLast((x) => x.hash === hash);
+    if (!v) throw new ConfigRefusal(404, "no version by that hash is kept", null);
+    this.syncFromDisk();
+    return this.commit(v.text, dryRun, `back to ${v.name || v.at}`);
+  }
+
   status(): ConfigStatus {
     return { path: this.path, hash: this.hash, savedAt: this.savedAt, restartPending: [...this.pending], error: this.error };
   }
@@ -394,7 +543,7 @@ export class ConfigFile {
    * Edit the YAML itself: path ops, or the whole text. `baseHash` is the file the caller last saw;
    * if it moved since, ops still apply when the paths they touch did not change, and text never does.
    */
-  patch(req: { baseHash?: string; ops?: ConfigOp[]; text?: string; dryRun?: boolean }): CommitResult {
+  patch(req: { baseHash?: string; ops?: ConfigOp[]; text?: string; dryRun?: boolean; /** What to call this version in the list of them. */ name?: string }): CommitResult {
     if (!this.path) throw new ConfigRefusal(409, "this node was not loaded from a config file, so there is no file to edit", null);
     const base = this.lastText;
     const baseHash = this.hash;
@@ -444,7 +593,7 @@ export class ConfigFile {
       }
       out = unmaskSecrets(this.render(doc), table);
     }
-    return this.commit(out, req.dryRun === true);
+    return this.commit(out, req.dryRun === true, req.name);
   }
 
   /** What the file the caller last held was masking, so its stand-ins come home on the way in. */
@@ -458,7 +607,7 @@ export class ConfigFile {
   }
 
   /** Validate, write, apply. Nothing is written unless the result loads, and nothing applies unless it was written. */
-  private commit(text: string, dryRun: boolean): CommitResult {
+  private commit(text: string, dryRun: boolean, name = ""): CommitResult {
     const next = this.parse(text, 422);
     const masked = this.masked(text);
     if (dryRun) return { hash: hashOf(text), text: masked, restartPending: this.restartPendingFor(next) };
@@ -468,10 +617,11 @@ export class ConfigFile {
       } catch (e) {
         throw new ConfigRefusal(500, `could not write ${this.path}: ${String(e)} — nothing changed`, null);
       }
+      this.remember(this.lastText, text, name);
       this.lastText = text;
       this.hash = hashOf(text);
       this.savedAt = new Date().toISOString();
-      this.log.info("config.saved", { path: this.path, hash: this.hash });
+      this.log.info("config.saved", { path: this.path, hash: this.hash, ...(name ? { name } : {}) });
     }
     this.apply(next);
     return { hash: this.hash, text: masked, restartPending: [...this.pending] };
@@ -570,8 +720,10 @@ export class ConfigFile {
     }
     this.lastText = text;
     this.hash = hashOf(text);
-    this.log.info("config.reloaded", { path: this.path, hash: this.hash });
     this.apply(next);
+    // A hand edit has no reply to carry restartPending, so the journal must say what is still waiting.
+    if (this.pending.length) this.log.warn("config.reloaded", { path: this.path, hash: this.hash, restartPending: this.pending, hint: "restart hearth to apply these" });
+    else this.log.info("config.reloaded", { path: this.path, hash: this.hash });
   }
 
   /** Pick up hand edits: watch the directory (editors replace files), debounced, ignoring our own writes. */
@@ -627,12 +779,14 @@ export class ConfigFile {
           else p.models[mine] = theirs;
         }
       }
+      // A route the sidecar held becomes the flow it described, for an id nothing routes yet.
       for (const [id, r] of Object.entries(saved.routes ?? {})) {
-        if (r === null) delete d.models[id];
-        else d.models[id] = { ...DEFAULT_ROUTE, ...d.models[id], ...r };
+        if (r === null || Object.values(d.flows).some((f) => f.inputs.includes(id)) || id in d.flows) continue;
+        const flow = routedFlow(id, { policy: r.policy, peers: peersMapping(id, r.peers, d.peers), fallbackLocal: r.fallbackLocal });
+        if (flow) d.flows[id] = flow;
       }
       for (const [m, text] of Object.entries(saved.notes ?? {})) setNote(d, m, text);
-      pruneDeadRoutes(d);
+      pruneUnmapped(d);
     };
     try {
       this.update(fold);

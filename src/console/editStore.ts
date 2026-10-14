@@ -1,0 +1,464 @@
+/**
+ * The routing map's draft of hearth.yaml and what is selected on it. Drawing lines and the forms
+ * change the draft; nothing is written until it goes through the same review as the Config page.
+ */
+import { create } from "zustand";
+
+import type { Err, File, Plan } from "./config.js";
+import { added, BAYS, followed, pastedAll, RANK, routeTyped, summary, factsOf, isObj, nodeOf, obj, opsOf, placed, problems, put, rebase, refusal, removed, renamed, retyped, routeId, scoped, TEMPLATES, unscoped, wholes, type Copied, type Doc, type Facts, type Landing, type Picked } from "./draft.js";
+import { request, RequestError, toast, useStore } from "./store.js";
+
+/** A whole draft and the router it was shown by, to go back to. */
+export type Snap = { full: Doc; router: string | null };
+export type EditSel = { kind: "flow" | "action"; id: string } | null;
+/** A request to try against the draft, and where it went. */
+export type Trial = { model: string; images: boolean; tools: boolean; long: boolean; caller?: string; lane?: string; /** State to pretend, as `<what>:<model>` (idle, used, busy, warm or held) or `now:<HH:MM>`. */ pretend?: string[] };
+export type Tried = { target: string; model: string; reason: string; backend?: string; peer?: string; path: { flow: string; step: number }[]; /** The actions it would set off. */ actions?: string[]; error?: string; /** Why the backend it reaches would turn this request down, when what is known says it would. */ unfit?: string };
+/** A list of places to send a wire, open at a point on the page. `from` is the outlet it was dragged from. */
+export type Picking = { x: number; y: number; from: { node: string; handle: string | null } | null } | null;
+/** One choice in a menu; `head` is a label between groups, `on` marks the current one. */
+export type Choice = { label: string; value?: string; hint?: string; /** A few words beside the label, where a line under it would be too much. */ aside?: string; /** What stands before the label, by name. */ icon?: "plus" | "rotate" | "bin" | "split" | "users"; /** A heading; with no label, a rule between two groups. */ head?: boolean; /** A colour drawn as a dot before the label, where the choice is about one. */ swatch?: string; /** There to be read, not picked. */ still?: boolean; on?: boolean; off?: boolean; danger?: boolean; mono?: boolean };
+/** A list of choices open at a point on the page. */
+export type Choosing = { x: number; y: number; items: Choice[]; onPick: (value: string) => void; /** Always offer the filter, however short the list. */ search?: boolean; /** What typing a name that is not listed makes, and the words for it. */ create?: { says: string; make: (name: string) => void }; /** What the field asks for, where the menu is there to take a name. */ ask?: string } | null;
+
+interface EditState {
+  file: File | null;
+  draft: Doc | null;
+  sel: EditSel;
+  /** The selected rule is open in its dialog, at this line where one was asked for. */
+  opened: { line: number | null } | null;
+  err: Err | null;
+  plan: Plan | null;
+  trial: Trial | null;
+  tried: Tried | null;
+  picking: Picking;
+  choosing: Choosing;
+  /** Names typed onto the node that go nowhere yet: they exist in the file once they are wired. */
+  pending: string[];
+  /** The line under the pointer, by the start of its id, so it can be told from the ones it crosses. */
+  hover: string | null;
+  /** The nodes picked out together on the map, by id, each with where it stands: what a drag box or a ctrl-click selects. */
+  many: Picked[];
+  /** Drafts to go back to, oldest first. */
+  past: Snap[];
+  /** Drafts undone, to go forward to again; a new change lets them go. */
+  future: Snap[];
+  /** Why there is no draft to edit, once that is known; null while one is loaded or still loading. */
+  unread: string | null;
+  /** The dialog that names a new thing: `flows`, or `actions:<kind>`. */
+  adding: string | null;
+  /** The router whose rulebook `draft` shows as its `flows`; null for the rules everyone else goes by. */
+  router: string | null;
+  /** The whole draft that view was taken of: what `draft` leaves out while a router is being edited. */
+  rest: Doc | null;
+  /** A node to bring into view, or `*` for the whole map; a new object each time so asking twice works. */
+  focus: { node: string } | null;
+}
+
+export const useEdit = create<EditState>(() => ({
+  file: null, draft: null, sel: null, opened: null, err: null, plan: null, trial: null, tried: null, picking: null, choosing: null, pending: [], hover: null, many: [], past: [], future: [], unread: null, adding: null, focus: null, router: null, rest: null,
+}));
+const set = useEdit.setState;
+const said = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+type Shown = Pick<EditState, "file" | "draft" | "router" | "rest">;
+/** The whole draft, whichever router's rulebook is being shown. */
+export const whole = (s: Pick<EditState, "draft" | "router" | "rest">): Doc | null => (s.draft && s.router !== null ? unscoped(s.draft, s.rest ?? s.draft, s.router) : s.draft);
+/** A whole draft as what is shown of it: the router's view where there still is such a router, else the rules everyone goes by. */
+const show = (full: Doc | null, router: string | null): Pick<EditState, "draft" | "router" | "rest"> => {
+  const at = full && router !== null && isObj(obj(full.routers)[router]) ? router : null;
+  return { draft: full && scoped(full, at), router: at, rest: full };
+};
+
+// A draft outlives the browser: the node keeps it beside the file it was made on, and it is carried over if that file has moved since.
+type Kept = { base: Doc; draft: Doc } | null;
+let keeping: ReturnType<typeof setTimeout> | null = null;
+let toKeep: Kept = null;
+/** Hand the node what is to be kept, or with null have it let go. */
+const send = (): void => {
+  if (keeping === null) return;
+  clearTimeout(keeping);
+  keeping = null;
+  // Keeping is a convenience: where it fails, a reload starts from the file.
+  void (toKeep ? request("PUT", "/config/draft", toKeep) : request("DELETE", "/config/draft")).catch(() => {});
+};
+/** Let go of the draft the node keeps, and of any change still on its way there. */
+const forget = async (): Promise<void> => {
+  if (keeping !== null) clearTimeout(keeping);
+  keeping = null;
+  await request("DELETE", "/config/draft").catch(() => {});
+};
+const keep = (s: Shown): void => {
+  // With no file read there is nothing to compare a draft with: what was kept stays kept.
+  if (!s.file) return;
+  toKeep = s.file.doc && s.draft && dirty(s) ? { base: s.file.doc, draft: whole(s)! } : null;
+  // Typing changes the draft at every key; the node hears once it pauses.
+  if (keeping !== null) clearTimeout(keeping);
+  keeping = setTimeout(send, 600);
+};
+addEventListener("pagehide", send);
+// Every change to the draft is one step back for undo, and is kept across a reload.
+let stepping = false;
+useEdit.subscribe((s, prev) => {
+  if (s.draft === prev.draft) return;
+  keep(s);
+  if (!stepping && prev.draft && s.draft && s.file === prev.file) set({ past: [...s.past.slice(-99), { full: whole(prev)!, router: prev.router }], future: [] });
+});
+
+/**
+ * Read hearth.yaml. A draft nobody has touched becomes the file; one with changes is carried
+ * over to the file as it is now, unless both changed the same setting.
+ */
+export async function loadDraft(): Promise<void> {
+  let file: File;
+  try {
+    file = await request<File>("GET", "/config");
+  } catch (e) {
+    // What is being edited stays as it is; with nothing loaded yet, the map is a picture to look at and says why.
+    if (!useEdit.getState().draft) set({ unread: `hearth.yaml could not be read (${said(e)}), so the map cannot be edited yet.` });
+    return;
+  }
+  if (!file.doc) { set({ file: null, draft: null, unread: "This node's hearth.yaml does not load as it stands: fix it on the Config page, then routing can be edited here." }); return; }
+  const now = useEdit.getState();
+  let mine: { base: Doc; draft: Doc } | null = now.file?.doc && now.draft && dirty(now) ? { base: now.file.doc, draft: whole(now)! } : null;
+  if (!mine && !now.file) {
+    try { mine = (await request<{ draft: Kept }>("GET", "/config/draft")).draft; } catch { mine = null; }
+    if (!isObj(mine?.base) || !isObj(mine?.draft)) mine = null;
+  }
+  stepping = true;
+  set({ unread: null });
+  if (!mine) set({ file, ...show(file.doc, now.router), err: null, plan: null, past: [] });
+  else {
+    const moved = rebase(mine.base, mine.draft, file.doc);
+    if ("doc" in moved) set({ file, ...show(moved.doc, now.router), err: null, plan: null });
+    // Changes kept from before a reload that no longer fit the file are let go, and said so: there is nothing on screen to keep editing.
+    else if (!now.draft) {
+      void forget();
+      set({ file, ...show(file.doc, null), err: null, plan: null, past: [] });
+      toast("bad", `Unsaved changes from before could not be carried over: ${moved.clash} has changed in the file since.`);
+    }
+    else set({ err: { message: `Someone else changed ${moved.clash} while you were editing it. Discard your changes to see theirs, or keep editing and save over it from the Config page.`, path: null } });
+  }
+  stepping = false;
+}
+
+export const dirty = (s: Shown) => JSON.stringify(s.file?.doc ?? null) !== JSON.stringify(whole(s));
+/** How many things the draft changes: a rule, a backend, the layout each count once however much of them moved. */
+export const changed = (s: Shown): number =>
+  s.file?.doc && s.draft ? new Set(opsOf(s.file.doc, whole(s)!).map((op) => op.path.slice(0, 2).join("."))).size : 0;
+/** How many edits the draft holds: each one made here counts, and after a reload, each thing that differs from the file. */
+export const edits = (s: EditState): number => (s.past.length > 0 && dirty(s) ? s.past.length : changed(s));
+export const revert = () => { set((s) => ({ ...show(s.file?.doc ?? null, s.router), err: null, pending: [], trial: null, tried: null })); toast("ok", "draft discarded — undo brings it back"); };
+export function undo(): void {
+  const now = useEdit.getState();
+  const back = now.past.at(-1);
+  if (!back || !now.draft) return;
+  stepping = true;
+  set({ ...show(back.full, back.router), past: now.past.slice(0, -1), future: [...now.future, { full: whole(now)!, router: now.router }], err: null });
+  stepping = false;
+}
+/** Go forward again to what was just undone. */
+export function redo(): void {
+  const now = useEdit.getState();
+  const on = now.future.at(-1);
+  if (!on || !now.draft) return;
+  stepping = true;
+  set({ ...show(on.full, on.router), future: now.future.slice(0, -1), past: [...now.past, { full: whole(now)!, router: now.router }], err: null });
+  stepping = false;
+}
+/** Select it. A rule's dialog stays open only while that rule stays the one selected. */
+export const editSelect = (sel: EditSel) => set((s) => ({ sel, opened: sel && s.sel?.kind === sel.kind && s.sel.id === sel.id ? s.opened : null }));
+/** Open a rule in its dialog, at one of its lines if given. */
+export const openRule = (id: string, line: number | null = null) => set({ sel: { kind: "flow", id }, opened: { line } });
+export const closeRule = () => set({ opened: null });
+export const pick = (picking: Picking) => set({ picking });
+export const hover = (id: string | null) => { if (useEdit.getState().hover !== id) set({ hover: id }); };
+/** Open a menu under whatever was clicked. */
+export function choose(e: { currentTarget: Element }, items: Choice[], onPick: (value: string) => void, create?: NonNullable<Choosing>["create"]): void {
+  const r = e.currentTarget.getBoundingClientRect();
+  set({ choosing: { x: r.left, y: r.bottom + 4, items, onPick, ...(create ? { create, search: true } : {}) } });
+}
+/** Open a menu at a point on the page: where the pointer was right-clicked, say. */
+export const chooseAt = (x: number, y: number, items: Choice[], onPick: (value: string) => void, search = false) => set({ choosing: { x, y, items, onPick, search } });
+/** Ask for a name at a point on the page: a menu with only a field, and `make` is given what is typed. */
+export const askAt = (x: number, y: number, ask: string, says: string, make: (name: string) => void) => set({ choosing: { x, y, items: [], onPick: () => {}, search: true, ask, create: { says, make } } });
+export const closeMenu = () => set({ choosing: null });
+export const setAdding = (adding: string | null) => set({ adding });
+/** Bring a node into view. */
+export const focusOn = (node: string) => set({ focus: { node } });
+
+/** Start a rule from one of the common shapes, or ask for the name of a blank one. */
+export function startRule(template: string): void {
+  const t = TEMPLATES.find((x) => x.name === template);
+  const { draft } = useEdit.getState();
+  if (!t || !draft) { set({ adding: "flows" }); return; }
+  // A name that is free: the rule opens straight away, to be pointed at the models it is for.
+  let name = t.name;
+  for (let n = 2; name in obj(draft.flows); n++) name = `${t.name}-${n}`;
+  change((d) => put(d, "flows", name, { inputs: [], steps: t.steps }));
+  set({ sel: { kind: "flow", id: name }, focus: { node: `flow:${name}` } });
+}
+
+/** Take a rule or an action out of the draft, saying what else that touched. */
+export function remove(sel: NonNullable<EditSel>): void {
+  change((d) => removed(d, sel.kind === "flow" ? "flows" : "actions", sel.id));
+  if (useEdit.getState().sel?.id === sel.id) set({ sel: null });
+  toast("ok", `${sel.id} deleted — undo brings it back`);
+}
+const SECTION = { flow: "flows", action: "actions" } as const;
+
+/** Give a rule or an action another name; says why when it cannot. */
+export function rename(sel: NonNullable<EditSel>, to: string): void {
+  const { draft } = useEdit.getState();
+  const name = to.trim();
+  if (!draft || !name || name === sel.id) return;
+  const next = renamed(draft, SECTION[sel.kind], sel.id, name);
+  if (!next) { toast("bad", `"${name}" is taken, or not a name`); return; }
+  set((s) => ({ draft: next, err: null, ...(s.sel?.kind === sel.kind && s.sel.id === sel.id ? { sel: { kind: sel.kind, id: name } } : {}) }));
+}
+
+/** Give a type another name, one that is routed or one still waiting to be. */
+export function retype(from: string, to: string, order: string[] = []): void {
+  const { draft, pending } = useEdit.getState();
+  const name = to.trim();
+  if (!draft || !name || name === from) return;
+  const next = retyped(draft, from, name);
+  if (!next || pending.includes(name)) { toast("bad", `"${name}" is taken, or not a name a type can have`); return; }
+  // It keeps its place in the list, which is otherwise the order the file names things in.
+  const placed = order.includes(from) ? order.map((n) => (n === from ? name : n)).reduce<Doc>((d, n, k) => put(d, "layout", RANK + n, { x: 0, y: k }), next) : next;
+  set({ draft: placed, err: null, pending: pending.map((p) => (p === from ? name : p)) });
+}
+
+/** Take a type off the Router: nothing takes that name any more. */
+export function dropName(id: string): void {
+  set((s) => ({ draft: s.draft ? routeId(s.draft, id, { kind: "unset" }) : s.draft, err: null, pending: s.pending.filter((p) => p !== id) }));
+  toast("ok", `${id} removed — undo brings it back`);
+}
+
+/** Say which nodes are picked out together; the same ones again changes nothing. */
+export function selectMany(many: Picked[]): void {
+  const was = useEdit.getState().many;
+  if (was.length !== many.length || many.some((m, i) => m.node !== was[i]!.node || m.x !== was[i]!.x || m.y !== was[i]!.y)) set({ many });
+}
+/** Take out every rule and action picked out, as one change. */
+export function removeMany(): void {
+  const gone = wholes(useEdit.getState().many);
+  if (!gone.length) return;
+  change((d) => gone.reduce<Doc>((doc, g) => removed(doc, SECTION[g.kind], g.id), d));
+  set({ sel: null, many: [] });
+  toast("ok", `${gone.length} deleted — undo brings them back`);
+}
+// What was last copied from several nodes at once: each as it stood, with the node it was drawn as and where.
+let copiedMany: Copied[] = [];
+/** Remember every rule and action picked out; false when none of them is one. */
+export function copyMany(): boolean {
+  const { draft, many } = useEdit.getState();
+  const got = wholes(many).flatMap((g) => { const entry = obj(draft?.[SECTION[g.kind]])[g.id]; return isObj(entry) ? [{ ...g, entry }] : []; });
+  if (!got.length) return false;
+  copiedMany = got;
+  copiedOne = null;
+  return true;
+}
+/** Put in everything last copied together, and pick the copies out so they can be moved as one. */
+function pasteMany(): void {
+  const { draft } = useEdit.getState();
+  if (!draft) return;
+  const { doc, made } = pastedAll(draft, copiedMany);
+  set({ draft: doc, err: null, sel: null, many: made, focus: { node: made[0]!.node } });
+  toast("ok", `${made.length} added`);
+}
+
+// What was last copied: a rule or an action as it stood, so it can be put in again after it has changed or gone.
+let copiedOne: { kind: "flow" | "action"; id: string; entry: Doc } | null = null;
+/** Remember a rule or an action to paste; false when there is none by that name. */
+export function copy(sel: EditSel): boolean {
+  const entry = sel && obj(useEdit.getState().draft?.[SECTION[sel.kind]])[sel.id];
+  if (!sel || !isObj(entry)) return false;
+  copiedOne = { ...sel, entry };
+  copiedMany = [];
+  return true;
+}
+/** Put in what was last copied, under a free name, and open it. */
+export function paste(): void {
+  const { draft } = useEdit.getState();
+  if (copiedMany.length) { pasteMany(); return; }
+  if (!draft || !copiedOne) return;
+  const { kind } = copiedOne;
+  const { doc, name } = added(draft, SECTION[kind], copiedOne.id, copiedOne.entry);
+  set({ draft: doc, err: null, sel: { kind, id: name }, focus: { node: `${kind}:${name}` } });
+  toast("ok", kind === "flow" ? `${name} added — give it the names it takes` : `${name} added`);
+}
+/** A second one of a rule or an action, beside the first. */
+export const duplicate = (sel: EditSel) => { if (copy(sel)) paste(); };
+
+export const change = (fn: (d: Doc) => Doc) => set((s) => ({ draft: s.draft ? fn(s.draft) : s.draft, err: null }));
+
+/** What is known right now about names and the places a line can go, or null before the node has reported. */
+export function facts(): Facts | null {
+  const { draft } = useEdit.getState();
+  const data = useStore.getState().data;
+  return draft && data ? factsOf(draft, data) : null;
+}
+
+/**
+ * Draw a line from an outlet to somewhere. What the outlet is, and so what the line changes, is
+ * its node kind's to say; a line that what is known says cannot work is refused here, in a sentence.
+ */
+export function wire(from: { node: string; handle: string | null }, to: Landing): void {
+  const { draft } = useEdit.getState();
+  const start = nodeOf(from.node);
+  const out = draft && start.kind.outlet?.(draft, start.id, from.handle);
+  if (!draft || !out) return;
+  let next: Doc | null;
+  if (to.kind === "action") {
+    if (!out.also) { toast("bad", "An action runs from a line of a rule: put this through a rule first, then draw the line's dot to the action."); return; }
+    next = out.also(to.action);
+  } else {
+    const known = facts();
+    // A name drawn straight to a model that is not chat becomes a type for the paths that model answers on.
+    const typed = known && out.name !== undefined && to.kind === "model" && known.kind(to.model) === "paths" ? known.paths(to.model) : [];
+    const no = typed.length ? null : known && refusal(out.when, to, known, out.paths);
+    if (no) { toast("bad", no); return; }
+    next = typed.length && to.kind === "model" ? routeTyped(draft, out.name!, to.model, typed) : out.send(to);
+  }
+  if (next) set((s) => ({ draft: next, err: null, pending: s.pending.filter((p) => p !== out.name) }));
+}
+
+/** A line let go over a node: whatever that node is as somewhere to end one. */
+export function connect(from: { node: string; handle: string | null }, node: string): void {
+  const end = nodeOf(node);
+  const to = end.kind.lands?.(end.id);
+  if (to) wire(from, to);
+}
+
+/** Have a caller go where everyone else does again. */
+export const follow = (caller: string) => change((d) => followed(d, caller));
+
+/** A name clients will ask for that nothing serves: listed on the node until it is sent somewhere. */
+export const addName = (id: string) => set((s) => (id && !s.pending.includes(id) ? { pending: [...s.pending, id] } : {}));
+
+/** Keep a node where it was dragged to. */
+export function place(id: string, at: { x: number; y: number }): void {
+  set((s) => ({ draft: s.draft ? placed(s.draft, id, at) : s.draft }));
+}
+
+/** Ask the node where a request would go under the draft's flows, as it stands right now. */
+export async function tryRequest(trial: Trial | null): Promise<void> {
+  set({ trial });
+  const { draft } = useEdit.getState();
+  if (!trial || !draft) { set({ tried: null }); return; }
+  try {
+    const tried = await request<Tried>("POST", "/flows/try", {
+      model: trial.model, images: trial.images, tools: trial.tools, tokens: trial.long ? 50_000 : 200, flows: draft.flows ?? {}, actions: draft.actions ?? {},
+      ...(trial.caller ? { caller: trial.caller } : {}), ...(trial.lane ? { lane: trial.lane } : {}),
+      headers: Object.fromEntries((trial.pretend ?? []).filter((p) => p.startsWith("hdr:")).map((p) => { const cut = p.indexOf("="); return [p.slice(4, cut), p.slice(cut + 1)]; })),
+      pretend: {
+        ...Object.fromEntries(["idle", "used", "busy", "warm", "held"].map((k) => [k, (trial.pretend ?? []).filter((p) => p.startsWith(`${k}:`)).map((p) => p.slice(k.length + 1))])),
+        ...Object.fromEntries(["full", "unready"].map((k) => [k, (trial.pretend ?? []).filter((p) => p.startsWith(`${k}:`)).map((p) => p.slice(k.length + 1))])),
+        ...((trial.pretend ?? []).some((p) => p.startsWith("now:")) ? { now: (trial.pretend ?? []).find((p) => p.startsWith("now:"))!.slice(4) } : {}),
+      },
+    });
+    if (useEdit.getState().trial === trial) set({ tried });
+  } catch (e) {
+    if (useEdit.getState().trial === trial) set({ tried: { target: "error", model: trial.model, reason: "", path: [], error: said(e) } });
+  }
+}
+
+/** Dry-run the draft, show the diff, and write only on confirm. */
+export async function review(): Promise<void> {
+  // The file may have moved since the draft was read: carry the draft over first, so the save is against what is there.
+  await loadDraft();
+  const { file, err } = useEdit.getState();
+  const draft = whole(useEdit.getState());
+  if (!file?.doc || !draft || err) return;
+  const body = { baseHash: file.hash, ops: opsOf(file.doc, draft) };
+  const fail = (e: unknown) => set({ plan: null, err: { message: said(e), path: e instanceof RequestError ? e.path : null } });
+  try {
+    const dry = await request<{ text: string; restartPending: string[] }>("PATCH", "/config", { ...body, dryRun: true });
+    set({
+      err: null,
+      plan: {
+        before: file.text, after: dry.text, restartPending: dry.restartPending, notes: problems(draft, facts() ?? undefined), naming: true, verb: "publish", summary: summary(file.doc, draft),
+        commit: async (name) => {
+          try {
+            const out = await request<{ restartPending: string[] }>("PATCH", "/config", { ...body, ...(name ? { name } : {}) });
+            toast("ok", out.restartPending.length ? `published — restart to apply ${out.restartPending.join(", ")}` : "published: the draft is now what runs");
+            stepping = true;
+            // Published: nothing is left to carry over.
+            set({ file: null, draft: null, pending: [] });
+            stepping = false;
+            await forget();
+            await loadDraft();
+          } catch (e) {
+            fail(e);
+          }
+        },
+      },
+    });
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** A version of the file that was published: when, under what name, and the hash it is asked for by. */
+export type Version = { at: string; name: string; hash: string };
+export const versions = async (): Promise<Version[]> => (await request<{ versions: Version[] }>("GET", "/config/versions")).versions;
+
+/** Show what going back to a version would change in the file, and write it only on confirm. */
+export async function goBack(v: Version): Promise<void> {
+  const { file } = useEdit.getState();
+  if (!file) return;
+  const fail = (e: unknown) => set({ plan: null, err: { message: said(e), path: null } });
+  try {
+    const dry = await request<{ text: string; restartPending: string[] }>("POST", "/config/versions", { hash: v.hash, dryRun: true });
+    set({
+      err: null,
+      plan: {
+        before: file.text, after: dry.text, restartPending: dry.restartPending, verb: "go back to this",
+        notes: dirty(useEdit.getState()) ? ["Your draft stays: it is carried over to the file as it will be then, where it still fits."] : [],
+        commit: async () => {
+          try {
+            await request("POST", "/config/versions", { hash: v.hash });
+            toast("ok", `back to ${v.name || "that version"}`);
+            set({ plan: null });
+            await loadDraft();
+          } catch (e) {
+            fail(e);
+          }
+        },
+      },
+    });
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** Show another router's rulebook, or with null the rules everyone else goes by. Undo starts afresh there. */
+export function showRouter(router: string | null): void {
+  stepping = true;
+  set((s) => ({ ...show(whole(s), router), sel: null, pending: [], trial: null, tried: null }));
+  stepping = false;
+}
+
+/** A new router, starting from the rules being shown or from one that refuses everything, and show it. */
+export function addRouter(name: string, copy: boolean): void {
+  const s = useEdit.getState();
+  const full = whole(s);
+  if (!full || !s.draft) return;
+  const flows = copy ? s.draft.flows : { "anything-else": { inputs: ["*"], steps: [{ to: { refuse: "that is not something this router offers" } }] } };
+  set({ ...show(put(full, "routers", name, { flows }), name), sel: null, pending: [] });
+  toast("ok", `router ${name} added — choose who uses it`);
+}
+
+/** Take a router away, with the places kept for its map and where its callers stood in the topology. */
+export function removeRouter(name: string): void {
+  const full = whole(useEdit.getState());
+  if (!full) return;
+  const { [name]: _, ...others } = obj(full.routers);
+  const layout = Object.fromEntries(Object.entries(obj(full.layout)).filter(([id]) => !id.startsWith(`routing@${name}/`) && id !== BAYS + name));
+  // Whoever went by it goes where everyone else does.
+  const callers = Object.fromEntries(Object.entries(obj(full.callers)).filter(([, r]) => r !== name));
+  const { routers: _r, layout: _l, callers: _c, ...rest } = full;
+  set({ ...show({ ...rest, ...(Object.keys(callers).length ? { callers } : {}), ...(Object.keys(others).length ? { routers: others } : {}), ...(Object.keys(layout).length ? { layout } : {}) }, null), sel: null, pending: [] });
+  toast("ok", `router ${name} deleted — undo brings it back`);
+}

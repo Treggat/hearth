@@ -18,13 +18,18 @@ const forgetKey = (): void => {
   try { localStorage.removeItem(KEY_STORE); } catch { /* private mode */ }
 };
 
-export type Page = "topology" | "models" | "queue" | "logs" | "config";
-export type Sel = { kind: "self" | "peer" | "backend" | "resource"; id: string } | null;
+export const PAGE_IDS = ["topology", "routing", "models", "lending", "keys", "queue", "logs", "config"] as const;
+export type Page = (typeof PAGE_IDS)[number];
+/** The page the address names; anything else is the first one. */
+export const pageOf = (): Page => PAGE_IDS.find((p) => p === location.hash.slice(1)) ?? "topology";
+export type Sel = { kind: "self" | "peer" | "backend" | "resource" | "machine"; id: string } | null;
 type Toast = { tone: "ok" | "bad"; text: string; id: number } | null;
 
 interface State {
   data: UiData | null;
   live: boolean;
+  /** The stream is not delivering and /ui/data is being asked instead. */
+  polling: boolean;
   dead: boolean;
   /** The data stream refused this address and this browser holds no session: the login card shows. */
   loginRequired: boolean;
@@ -35,16 +40,20 @@ interface State {
   toast: Toast;
   /** A pending key request from a write, resolved by the key dialog. */
   askKey: ((key: string | null) => void) | null;
+  /** A key just minted or rotated: its plaintext, to be shown once and then let go. */
+  fresh: { label: string; key: string; rotated?: boolean } | null;
 }
 
 export const useStore = create<State>(() => ({
   data: null,
   live: false,
+  polling: false,
   dead: false,
   loginRequired: false,
   setupRequired: false,
-  page: (location.hash.slice(1) as Page) || "topology",
+  page: pageOf(),
   sel: null,
+  fresh: null,
   toast: null,
   askKey: null,
 }));
@@ -67,18 +76,49 @@ export function toast(tone: "ok" | "bad", text: string): void {
 /** Open the stream, falling back to polling if no snapshot arrives; reconnects are the browser's. */
 let es: EventSource | null = null;
 let poll: number | null = null;
+let fallback: number | null = null;
 
 function disconnect(): void {
   es?.close();
   es = null;
+  if (fallback !== null) clearTimeout(fallback);
+  fallback = null;
   if (poll !== null) {
     clearInterval(poll);
     poll = null;
+    useStore.setState({ polling: false });
+  }
+}
+
+// A tab nobody is looking at gives its stream back and takes it up again when it is looked at: a browser
+// allows a handful of connections to one site, and a stream per open tab would leave none for anything else.
+let wanted = false;
+document.addEventListener("visibilitychange", () => {
+  if (!wanted) return;
+  if (document.hidden) disconnect();
+  else if (es === null) connect();
+});
+
+/** A node restarted into another build serves another page: take it, rather than draw new data with old code. */
+function take(next: UiData): void {
+  const was = useStore.getState().data?.build;
+  if (was !== undefined && next.build !== undefined && was !== next.build) { location.reload(); return; }
+  useStore.setState({ data: next, dead: false });
+}
+
+/** Ask the node for the page's data now: what a save changed shows at once, stream or no stream. */
+export async function refresh(): Promise<void> {
+  try {
+    const r = await fetch("/ui/data", { cache: "no-store" });
+    if (r.ok) take((await r.json()) as UiData);
+  } catch {
+    // The stream, or the next look at the node, says what became of it.
   }
 }
 
 export function connect(): void {
   disconnect();
+  wanted = true;
   let gotSnapshot = false;
   const load = async () => {
     try {
@@ -90,19 +130,23 @@ export function connect(): void {
         return;
       }
       if (!r.ok) throw new Error(String(r.status));
-      useStore.setState({ data: (await r.json()) as UiData, dead: false, loginRequired: false });
+      take((await r.json()) as UiData);
+      useStore.setState({ loginRequired: false });
     } catch {
       useStore.setState({ dead: true });
     }
   };
   // An immediate probe, so a login is offered at once rather than after the 4s fallback.
   void load();
+  // Opened in the background, a tab has what it needs to draw and takes its stream when it is first looked at.
+  if (document.hidden) return;
   es = new EventSource("/ui/events");
   es.addEventListener("snapshot", (e) => {
     gotSnapshot = true;
     if (poll !== null) clearInterval(poll);
     poll = null;
-    useStore.setState({ data: JSON.parse((e as MessageEvent).data) as UiData, live: true, dead: false });
+    take(JSON.parse((e as MessageEvent).data) as UiData);
+    useStore.setState({ live: true, polling: false });
   });
   es.addEventListener("patch", (e) => {
     const cur = useStore.getState().data;
@@ -115,11 +159,23 @@ export function connect(): void {
     }
     useStore.setState({ data: next, live: true });
   });
-  es.onerror = () => useStore.setState({ live: false });
-  setTimeout(() => {
-    if (gotSnapshot || poll !== null) return;
+  const startPoll = (): void => {
+    if (poll !== null) return;
     void load();
     poll = window.setInterval(() => { if (!document.hidden) void load(); }, 3000);
+    useStore.setState({ polling: true });
+  };
+  const stream = es;
+  es.onerror = () => {
+    useStore.setState({ live: false });
+    // A refused stream is closed for good and the browser will not try it again: ask the node
+    // directly, which is also what finds out that this browser has been signed out.
+    if (stream.readyState === EventSource.CLOSED) startPoll();
+    else void load();
+  };
+  fallback = window.setTimeout(() => {
+    fallback = null;
+    if (!gotSnapshot) startPoll();
   }, 4000);
 }
 
@@ -152,6 +208,64 @@ export async function logout(): Promise<void> {
   location.reload();
 }
 
+/** Ask a model to be resident: the same request chat makes, minus the generation. */
+export async function warm(model: string): Promise<void> {
+  try {
+    const d = await request<{ note?: string }>("POST", "/v1/warm", { model });
+    toast("ok", d.note ?? `${model} is warm`);
+  } catch (e) {
+    toast("bad", (e as Error).message);
+  }
+}
+
+/** Drop a model off the card that serves it; the server declines what it must not. */
+export async function evict(model: string): Promise<void> {
+  try {
+    const d = await request<{ backend: string; via: "model" | "card" }>("POST", "/v1/evict", { model });
+    toast("ok", `${model} is off ${d.backend}${d.via === "card" ? " (whole card)" : ""}`);
+  } catch (e) {
+    toast("bad", (e as Error).message);
+  }
+}
+
+/** Mint a key into hearth.yaml. The plaintext comes back once, in this result. */
+export async function mintKey(label: string, models: string[] | null, more: { expires?: string; limits?: { requestsPerMinute?: number; tokensPerDay?: number; dollarsPerDay?: number } } = {}): Promise<string | null> {
+  try {
+    const d = await request<{ key: string }>("POST", "/keys/mint", { label, ...(models !== null && models.length > 0 ? { models } : {}), ...more });
+    useStore.setState({ fresh: { label, key: d.key } });
+    toast("ok", `key for ${label} minted — it is shown once`);
+    return d.key;
+  } catch (e) {
+    toast("bad", (e as Error).message);
+    return null;
+  }
+}
+
+/** Give a key a new secret and keep the rest of it; the old secret stops authenticating at once. */
+export async function rotateKey(label: string): Promise<string | null> {
+  try {
+    const d = await request<{ key: string }>("POST", "/keys/rotate", { label });
+    useStore.setState({ fresh: { label, key: d.key, rotated: true } });
+    toast("ok", `${label} rotated — the new key is shown once`);
+    return d.key;
+  } catch (e) {
+    toast("bad", (e as Error).message);
+    return null;
+  }
+}
+/** Let go of the key that was being shown. */
+export const doneWithKey = () => useStore.setState({ fresh: null });
+
+/** Revoke a key by label; it stops authenticating at once. */
+export async function revokeKey(label: string): Promise<void> {
+  try {
+    await request("POST", "/keys/revoke", { label });
+    toast("ok", `${label} revoked`);
+  } catch (e) {
+    toast("bad", (e as Error).message);
+  }
+}
+
 function askForKey(): Promise<string | null> {
   return new Promise((resolve) => useStore.setState({ askKey: resolve }));
 }
@@ -182,6 +296,11 @@ export async function request<T = Record<string, unknown>>(method: string, path:
   }
   const d = (await r.json().catch(() => ({}))) as Record<string, unknown>;
   if (r.status === 401) {
+    // With no key in play the session is what was refused: the next look at the node offers the login.
+    if (key === "") {
+      connect();
+      throw new RequestError("this browser is no longer signed in", null);
+    }
     forgetKey();
     throw new RequestError("key rejected — try again to re-enter it", null);
   }
