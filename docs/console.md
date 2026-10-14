@@ -73,6 +73,15 @@ directly:
   model without pausing the rest, or lend one the file never listed. A model no
   backend here serves is refused — advertising it would 404 every request, and
   the peer's operator cannot tell that from a broken link.
+- **the Lending page**: the limits a new peer starts with, then one row per
+  peer with its own [limits](sharing.md#limits-per-peer) to change in place
+  (the models it may run, tokens a day, jobs at once, requests an hour), a
+  switch that stops lending to it alone, what it used today, and what was lent
+  and borrowed over the month kept. A peer's name opens its use by model and
+  by day. A limit a peer does not have of its own is drawn dim, and one it
+  has can be put back to the node's. Each change is written to `hearth.yaml`
+  and applies at once. The same counts are on each peer in Topology, and the
+  Models page names the peers a model is lent to by a list of their own.
 - **link / unlink** on a peer's model map, which writes both halves at once: the
   mapping and a flow that uses it. Unlinking takes every step that sent the
   model to that peer, and the flow with them once it has nowhere left to send
