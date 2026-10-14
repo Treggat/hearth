@@ -594,7 +594,7 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
   // With its callers known, this node is the frame they stand in, boxed by the router they go by: one line a router, however many callers.
   // Those with a router of their own stand to the left; whoever goes by the default one stands over where they all meet.
   const ranks = Object.keys(who?.routers ?? {});
-  // In the order they were dragged into; one never moved stands after those that were, the default router's last.
+  // In the order they were dragged into, and one never moved after those that were. With none moved, the default router's is last.
   const bays = (who ? ordered(d.layout, [...ranks.slice().reverse(), DEFAULT], BAYS) : []).flatMap((key) => {
     const name = key === DEFAULT ? null : key;
     const callers = who!.callers.filter((c) => c.router === name);
@@ -857,7 +857,8 @@ export function Topology() {
           const key = (x: Node) => x.id.slice(4) || DEFAULT;
           // Its leading edge decides, so a wide box held back by the frame's edge still gets past a narrow one at the end.
           const right = n.position.x > (row.find((x) => x.id === n.id)?.position.x ?? 0);
-          const edge = n.position.x + (right ? Number(n.style?.width ?? 0) : 0);          change((d) => movedBay(d, row.map(key), key(n), edge, Object.fromEntries(row.map((x) => [key(x), middle(x)]))));
+          const edge = n.position.x + (right ? Number(n.style?.width ?? 0) : 0);
+          change((d) => movedBay(d, row.map(key), key(n), edge, Object.fromEntries(row.map((x) => [key(x), middle(x)]))));
         }
         setNodes((now) => held(laid.nodes, now, null));
       }}
