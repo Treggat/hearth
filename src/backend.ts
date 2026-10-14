@@ -77,6 +77,8 @@ export class BackendState {
      * what it serves, so a sidecar pinned beside a swapping model is nobody's resident but its own.
      */
     private readonly mine: (id: string) => boolean = () => true,
+    /** `mine` is exactly this backend's declared ids, so an unload drops those one by one and never clears the URL. */
+    private readonly scoped = false,
   ) {
     this.k = KINDS[kind];
     this.useEvents = this.k.events;
@@ -135,9 +137,20 @@ export class BackendState {
 
   /**
    * Clear the card for another backend; a no-op for a kind that cannot. A down backend is a
-   * no-op; a refusal throws so the job does not load on top.
+   * no-op; a refusal throws so the job does not load on top. A scoped backend drops only its
+   * own loaded models, so a sibling on the same URL keeps its weights.
    */
   async unload(): Promise<void> {
+    if (this.scoped && this.k.unloadModel) {
+      const dropped: string[] = [];
+      for (const wire of [...this.loadedIds]) {
+        if (await this.k.unloadModel(this.url, wire, this.log)) dropped.push(wire);
+      }
+      // Anything not dropped stays resident, so the caller sees it and does not load on top.
+      this.loadedIds = this.loadedIds.filter((m) => !dropped.includes(m));
+      this.lastUpdateAt = Date.now();
+      return;
+    }
     if (!this.k.unload || !(await this.k.unload(this.url, this.log))) return;
     // The event stream may take a moment to say so; scoring the next job against an evicted model is worse.
     this.loadedIds = [];

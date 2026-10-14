@@ -49,6 +49,9 @@ function fake(running: () => { model: string; state: string }[]) {
 let reported: { model: string; state: string }[] = [];
 const backend = fake(() => reported);
 await backend.listen();
+// Its own URL: on a shared one, an id this backend does not declare is its sibling's.
+const blind = fake(() => []);
+await blind.listen();
 
 const node = createNode(
   parseV1({
@@ -65,7 +68,7 @@ const node = createNode(
       // can assert the difference between "cold" and "we cannot see".
       {
         name: "blind",
-        url: backend.url(),
+        url: blind.url(),
         kind: "none",
         concurrency: 1,
         serves: ["mystery"],
@@ -146,4 +149,5 @@ async function loaded(): Promise<string[]> {
 node.server.closeAllConnections();
 node.server.close();
 backend.close();
+blind.close();
 console.log("residency.test.ts ok");

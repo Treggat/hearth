@@ -106,7 +106,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `backends.<name>` | — | a server hearth fronts, with its own queue. At least one. See below |
 | `backends.<name>.url` | — | the OpenAI-compatible server |
 | `backends.<name>.kind` | `llama-swap` | where warm state comes from: `llama-swap`, `ollama`, `single`, `none` |
-| `backends.<name>.serves` | discover | model ids this backend serves. Declaring replaces discovery and acts as an allowlist |
+| `backends.<name>.serves` | discover | model ids this backend serves. Declaring replaces discovery and acts as an allowlist; on a URL shared with another backend, only these count as its loaded models |
 | `backends.<name>.concurrency` | `backendDefaults` | jobs at once on this backend |
 | `backends.<name>.firstByteMs` / `.idleMs` | `backendDefaults` | per-backend deadlines. A sidecar that renders a clip before it answers at all needs a longer one than a chat server |
 | `backends.<name>.activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
@@ -883,6 +883,13 @@ backends:
     resources: [gpu1]
     resident: { yield: false }      # llama-swap has no yield path, so it is never asked
 ```
+
+Leave out `resident` and the two take turns on the card instead, like any two backends
+that share a resource. On a shared URL each backend counts only its own models as
+loaded: the one that declares `serves` sees just those ids, the other sees everything
+else. So a turn for `card` evicts `rerank` only while the reranker itself is loaded, and
+then drops it alone with `POST /api/models/unload/<id>`, leaving the seat's weights in
+place. Evicting `card`, which declares nothing, still clears the whole llama-swap.
 
 ### Backends that don't speak the OpenAI API
 

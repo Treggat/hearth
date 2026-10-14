@@ -58,7 +58,7 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
     url: { type: "text", desc: "The OpenAI-compatible server hearth fronts." },
     kind: { type: "enum", options: ["llama-swap", "ollama", "single", "none"], desc: "Where warm state comes from.", def: "llama-swap" },
     resources: { type: "refs", ref: "resources", desc: "Hardware this backend uses. Backends on one exclusive card take turns." },
-    serves: { type: "list", desc: "Model ids this backend serves. Declaring replaces discovery and acts as an allowlist." },
+    serves: { type: "list", desc: "Model ids this backend serves. Declaring replaces discovery and acts as an allowlist; on a URL shared with another backend, only these count as its loaded models." },
     concurrency: { type: "number", min: 1, desc: "Jobs at once on this backend.", def: "backendDefaults" },
     firstByteMs: ms("How long this backend may take to start answering: a sidecar that works before answering needs longer.", "backendDefaults"),
     idleMs: ms("How long this backend may go silent mid-answer.", "backendDefaults"),

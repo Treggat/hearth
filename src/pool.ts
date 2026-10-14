@@ -76,7 +76,8 @@ export class BackendPool {
   ) {
     this.arbiter.onRelease(() => this.scheduleResume());
     for (const b of cfg.backends) {
-      const state = new BackendState(b.url, b.kind, log, this.mineOn(b));
+      const seen = this.mineOn(b);
+      const state = new BackendState(b.url, b.kind, log, seen.mine, seen.scoped);
       const slot: BackendSlot = {
         name: b.name,
         cfg: b,
@@ -129,14 +130,18 @@ export class BackendPool {
   }
 
   /**
-   * What a backend sees of a URL it shares with another: everything except the ids a sibling
-   * declares it `serves`. Alone on its URL, or beside siblings that declare nothing, everything.
+   * What a backend sees of a URL it shares with another: its own `serves` if it declares them,
+   * else everything except the ids a sibling declares. Alone on its URL, everything.
    */
-  private mineOn(b: BackendConfig): ((id: string) => boolean) | undefined {
-    const theirs = new Set(
-      this.cfg.backends.filter((o) => o.name !== b.name && o.url === b.url).flatMap((o) => o.serves),
-    );
-    return theirs.size === 0 ? undefined : (id) => !theirs.has(id);
+  private mineOn(b: BackendConfig): { mine?: (id: string) => boolean; scoped: boolean } {
+    const siblings = this.cfg.backends.filter((o) => o.name !== b.name && o.url === b.url);
+    if (siblings.length === 0) return { scoped: false };
+    if (b.serves.length) {
+      const own = new Set(b.serves);
+      return { mine: (id) => own.has(id), scoped: true };
+    }
+    const theirs = new Set(siblings.flatMap((o) => o.serves));
+    return theirs.size === 0 ? { scoped: false } : { mine: (id) => !theirs.has(id), scoped: false };
   }
 
   /**
