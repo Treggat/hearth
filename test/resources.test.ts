@@ -285,15 +285,18 @@ function pool(concurrency = 1) {
 // --- end to end: the overlapping backend is unloaded before we load ---------
 {
   let unloaded = 0;
+  let running = [{ model: "resident", state: "ready" }];
   const backend = createServer((req, res) => {
-    if (req.url === "/api/models/unload") {
+    // One URL shared by both backends, so the neighbour drops its own model by id.
+    if (req.url === "/api/models/unload/resident") {
       unloaded++;
+      running = [];
       res.end("ok");
       return;
     }
     if (req.url === "/running") {
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ running: [{ model: "resident", state: "ready" }] }));
+      res.end(JSON.stringify({ running }));
       return;
     }
     if (req.url === "/v1/models") {
@@ -357,6 +360,63 @@ function pool(concurrency = 1) {
   const b = new BackendState(url, "llama-swap", silentLogger);
   await assert.rejects(b.unload(), /405/, "a refused unload throws");
   refusing.close();
+}
+
+// --- a neighbour still loading, alone on its URL, is cleared by the global unload
+// A loading model holds the card, so it is evicted; once the unload lands it is
+// gone, and the job runs rather than failing on a model that is no longer there.
+{
+  let running = [{ model: "warming", state: "starting" }];
+  let unloads = 0;
+  const neighbour = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/api/models/unload") {
+      unloads++;
+      running = [];
+      return void res.end("ok");
+    }
+    if (req.url === "/running") return void res.end(JSON.stringify({ running }));
+    res.end(JSON.stringify({ data: [{ id: "warming" }] }));
+  });
+  const spanning = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/running") return void res.end(JSON.stringify({ running: [] }));
+    if (req.url === "/v1/models") return void res.end(JSON.stringify({ data: [{ id: "big" }] }));
+    res.end(JSON.stringify({ choices: [{ message: { content: "hi" } }] }));
+  });
+  const at = async (s: ReturnType<typeof createServer>) => {
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+  };
+  const node = createNode(
+    parseV1({
+      name: "loading",
+      backends: [
+        { name: "cards", url: await at(neighbour), kind: "llama-swap", resources: ["gpu0"] },
+        { name: "spanning", url: await at(spanning), kind: "llama-swap", serves: ["big"], resources: ["gpu0"] },
+      ],
+    }),
+    silentLogger,
+  );
+  await new Promise<void>((r) => node.server.listen(0, "127.0.0.1", r));
+  await Promise.all(node.pool.all().map((b) => b.state.refresh()));
+  assert.deepEqual(node.pool.get("cards")!.state.loading(), ["warming"]);
+
+  const r = await fetch(`http://127.0.0.1:${(node.server.address() as AddressInfo).port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "big", messages: [{ role: "user", content: "x" }] }),
+  });
+  await r.text();
+  assert.equal(unloads, 1, "the loading neighbour was unloaded");
+  assert.equal(r.status, 200, "and the job ran once it was gone");
+  assert.deepEqual(node.pool.get("cards")!.state.loading(), []);
+
+  node.server.closeAllConnections();
+  node.server.close();
+  neighbour.closeAllConnections();
+  neighbour.close();
+  spanning.close();
 }
 
 // --- a neighbour whose unload never lands is still on the card ------------

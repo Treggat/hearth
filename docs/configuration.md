@@ -24,7 +24,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `backends.<name>.server` | this machine | the `servers` entry this backend runs on. See [Backends on another machine](backends.md#backends-on-another-machine) |
 | `backends.<name>.port` | — | with `server` and no `url`: the backend is `http://<server host>:<port>` |
 | `backends.<name>.kind` | `llama-swap` | where warm state comes from: `llama-swap`, `ollama`, `single`, `none` |
-| `backends.<name>.serves` | discover | model ids this backend serves. Declaring replaces discovery and acts as an allowlist |
+| `backends.<name>.serves` | discover | model ids this backend serves. Declaring replaces discovery and acts as an allowlist; on a URL shared with another backend, only these count as its loaded models |
 | `backends.<name>.concurrency` | `backendDefaults` | jobs at once on this backend |
 | `backends.<name>.firstByteMs` / `.idleMs` | `backendDefaults` | per-backend deadlines. A sidecar that renders a clip before it answers at all needs a longer one than a chat server |
 | `backends.<name>.activity` | none | `{ path, running, queued? }` — where a backend reports its OWN busy state, so one hearth forwards to but does not schedule still lights while it works. See below |
