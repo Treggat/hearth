@@ -65,7 +65,9 @@ token, and both apply at once. Neither person ever sees the token.
   `url` does. Join only with a code from someone you would add as a peer by hand.
 - The borrower's node name must be one the lender has no peer under yet.
   `hearth join --as <name>` picks the name the lender is kept under on the
-  borrower's side.
+  borrower's side. A name the borrower already borrows from is refused before
+  the code is spent; a peer the borrower only lends to keeps its entry and
+  gains the `url` and `token` to borrow back, so the two link both ways.
 - Both commands ask the node that is running, on its `listen` port. If it sets
   `apiKeys`, give one as `HEARTH_KEY`.
 - The tokens are written into each `hearth.yaml` as they are, the way minted api

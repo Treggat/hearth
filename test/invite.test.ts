@@ -97,6 +97,22 @@ const third = (await lender.post("/peers/invite", { url: lender.url })).body.cod
 assert.equal((await borrower.post("/peers/join", { code: third, as: "lender" })).status, 409, "joining as a name already in use is refused");
 assert.equal((await lender.post("/peer/join", { secret: secretOf(third), name: "fourth" })).status, 200, "before the lender is ever asked, so its code is unspent");
 
+// Without `as`, the inviter's own name is checked the same way, before its code is spent.
+const fifth = (await lender.post("/peers/invite", { url: lender.url })).body.code as string;
+const clash = await borrower.post("/peers/join", { code: fifth });
+assert.equal(clash.status, 409, "the inviter's name is already a peer this node borrows from");
+assert.equal((await lender.post("/peer/join", { secret: secretOf(fifth), name: "sixth" })).status, 200, "and the code is still unspent");
+assert.deepEqual(loadConfig(borrower.path).peers.map((p) => [p.name, p.token]), [["lender", token]], "the peer it has is untouched");
+
+// A node that already lends to the inviter keeps that, and gains the way to borrow back.
+const friend = await boot("friend", "peers:\n  lender: { accept: friend-lends-to-lender }\n");
+const seventh = (await lender.post("/peers/invite", { url: lender.url })).body.code as string;
+assert.equal((await friend.post("/peers/join", { code: seventh })).status, 200);
+const onFriend = loadConfig(friend.path);
+assert.equal(onFriend.peerTokens.lender, "friend-lends-to-lender", "what it lends the inviter stays as it was");
+assert.deepEqual(onFriend.peers.map((p) => [p.name, p.url, p.token]), [["lender", lender.url, loadConfig(lender.path).peerTokens.friend]], "and the same entry now borrows from it");
+await friend.node.close();
+
 await lender.node.close();
 await borrower.node.close();
 backend.close();

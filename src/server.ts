@@ -1931,6 +1931,16 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
   }
 
+  /** The name a node gives on its health check, or null when it does not say. */
+  async function inviterName(url: string): Promise<string | null> {
+    try {
+      const v = (JSON.parse(await (await send(`${url}/healthz`, { headersTimeoutMs: 15_000 })).text()) as { name?: unknown }).name;
+      return typeof v === "string" && v !== "" ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Redeem an invite: ask the inviter to take this node as a peer, then add the inviter as one to borrow from. */
   async function routeJoin(c: Call): Promise<void> {
     try {
@@ -1948,7 +1958,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       if (!/^https?:\/\/[^/?#]+$/.test(u) || s === "") throw new Refusal(400, "that is not an invite code: it starts with hearth-invite:");
       const as = typeof body.as === "string" ? body.as.trim() : "";
       if (as !== "" && !PEER_NAME.test(as)) throw new Refusal(400, "as must be 1-40 letters, digits, '.', '_' or '-'");
-      if (as !== "" && cfg.peers.some((p) => p.name === as)) throw new Refusal(409, `you already have a peer called ${as}`);
+      const borrowing = (name: string): boolean => cfg.peers.some((p) => p.name === name);
+      // Without `as`, the inviter's name from its health check, so a clash is refused before the code is spent.
+      const expected = as !== "" ? as : await inviterName(u);
+      if (expected !== null && borrowing(expected)) throw new Refusal(409, `you already borrow from a peer called ${expected}: join again with as`);
       const up = await send(`${u}/peer/join`, { method: "POST", json: { secret: s, name: cfg.name }, headersTimeoutMs: 15_000 });
       const said = await up.text();
       let answer: { name?: unknown; token?: unknown; error?: unknown } = {};
@@ -1965,8 +1978,13 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       if (typeof answer.token !== "string" || typeof answer.name !== "string") throw new Refusal(502, "the inviter answered something that is not a join");
       const name = as || answer.name;
       if (!PEER_NAME.test(name)) throw new Refusal(502, `the inviter's name ${JSON.stringify(name)} cannot be a peer name here: join again with as`);
+      if (borrowing(name)) throw new Refusal(409, `the inviter added you, but you already borrow from a peer called ${name}: add peers.<another name> with url ${u} and token ${answer.token} by hand`);
+      // A peer this node only lends to keeps its entry and gains the url and token beside it.
+      const ops = name in cfg.peerTokens
+        ? [{ path: ["peers", name, "url"], value: u }, { path: ["peers", name, "token"], value: answer.token }]
+        : [{ path: ["peers", name], value: { url: u, token: answer.token } }];
       try {
-        config.patch({ ops: [{ path: ["peers", name], value: { url: u, token: answer.token } }] });
+        config.patch({ ops });
       } catch (e) {
         // The inviter already took us, so the token is all that is missing here: say where it goes.
         throw new Refusal(500, `the inviter added you, but saving them here failed (${e instanceof Error ? e.message : String(e)}): add peers.${name} with url ${u} and token ${answer.token} by hand`);
