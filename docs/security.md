@@ -17,6 +17,9 @@ The defaults assume a private network: Tailscale, WireGuard, a LAN you trust.
   that is not a hearth you chose to trust. It is used only where your config
   names it, and its `key` never reaches the console or a client.
 - Peer tokens are separate from api keys, so peer traffic is attributable.
+- A peer's token can be bound to its tailnet machine with `tailnet`, so a copy of
+  the token is useless anywhere else: see
+  [Binding a peer to its machine](sharing.md#binding-a-peer-to-its-machine).
 
 ## Secrets stay in the file
 

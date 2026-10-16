@@ -118,6 +118,38 @@ few steps of a [flow](routing.md#flows):
 | whichever would start it soonest | `- to: { fastest: [big-model, { peer: friend }] }`. Ties stay home |
 | a peer or nothing | `- to: { peer: friend }` then `- to: { refuse: "not run here" }` |
 
+## Binding a peer to its machine
+
+A peer's `accept` token is a shared secret: whoever holds a copy can borrow as
+that peer. When both nodes are on a tailnet, `tailnet` ties the token to the
+peer's machine as well:
+
+```yaml
+peers:
+  friend:
+    accept: env:HEARTH_FROM_FRIEND
+    tailnet: nExampleStableID    # their machine, as `tailscale whois <their 100.x address>` prints it
+```
+
+On each request with that token, hearth asks this machine's tailscaled which
+tailnet node is calling and lets the request in only when it is that one. A copy
+of the token used from anywhere else gets a 403, and the log line
+`peer.wrong_machine` names the machine that tried.
+
+- Match on the stable node ID (`StableID` in `tailscale whois --json`). It
+  survives renames, which the machine name does not.
+- The check needs the peer to reach you over the tailnet. A connection to your
+  LAN address has no tailnet identity, so it is refused for a bound peer.
+- hearth reads tailscaled's local API at `tailscaleSocket`. Tailscale running in
+  the same container, or the host's socket mounted into it, both work. If the
+  socket cannot be asked, a bound peer is refused rather than let in on its
+  token alone.
+- A peer without `tailnet` is checked by its token only, as before.
+- This does not make a proxy in front of hearth safe. A proxied request arrives
+  from loopback, which no tailnet node owns, so a bound peer is refused and an
+  anonymous caller is still promoted to local. See
+  [Do not put a proxy in front of it](security.md#do-not-put-a-proxy-in-front-of-it).
+
 ## Knowing what a borrowed model can take
 
 A model on your own box is one you chose and can go and look up. A model someone
