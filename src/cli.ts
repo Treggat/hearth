@@ -21,6 +21,7 @@ import { writeFileAtomic } from "./configfile.js";
 import { LEVELS, createLogger, type Level } from "./log.js";
 import { hashPassword } from "./login.js";
 import { migrateDoc, routedMarker, unguarded, v1Marker } from "./migrate.js";
+import { bugReport } from "./report.js";
 import { createNode } from "./server.js";
 import { getJson } from "./upstream.js";
 import { parseDocument } from "yaml";
@@ -167,6 +168,8 @@ const USAGE = `usage: hearth [command] [--config path]
                                url is where they reach this node. Good for 10 minutes
   join <code> [--as <name>]    redeem another node's invite: they lend to you, and are added as a
                                peer named after their node, or as <name>
+  report                       write hearth-report-<date>.md for a bug report: version, the config
+                               with secrets out, and the running node's health, network and logs
 
   -c, --config <path>          the config file (default: ${DEFAULT_CONFIG})
       --check                  with serve: load the config, say whether it is valid, and exit
@@ -202,8 +205,9 @@ async function main(): Promise<void> {
     console.log(USAGE);
     return;
   }
+  const version = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
   if (values.version) {
-    console.log((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
+    console.log(version);
     return;
   }
 
@@ -349,8 +353,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "report") {
+    const file = `hearth-report-${new Date().toISOString().slice(0, 10)}.md`;
+    writeFileSync(file, await bugReport(configPath, version));
+    console.log(`wrote ${file}. Secrets from the config are replaced; read it before attaching it to an issue.`);
+    return;
+  }
+
   if (command !== "serve") {
-    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator | hearth migrate`);
+    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator | hearth migrate | hearth report`);
     process.exit(1);
   }
 
