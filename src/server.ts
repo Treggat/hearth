@@ -25,7 +25,7 @@ import { decide, mayLeave, resolve, variantsOf, type LocalLoad, type World } fro
 import { QueueFullError } from "./scheduler.js";
 import { DAY_MS, History } from "./history.js";
 import { KEEP_DAYS, meter, Usage, withoutUsage, type Meter } from "./usage.js";
-import { closedWhy, termsFor } from "./lending.js";
+import { closedWhy, limitsFor, spentWhy, termsFor } from "./lending.js";
 import { Answers } from "./answers.js";
 import { fitOutput, needsOf, NOTE_MAX, unfit, type ModelStats } from "./stats.js";
 import { CONSOLE_CSP, CONSOLE_HTML } from "./ui.js";
@@ -186,15 +186,19 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   const usage = new Usage();
   /** The same, for what this node ran on each peer. */
   const borrowed = new Usage();
-  /** Why `peer` is turned away right now under its limits, or null. */
-  const closedTo = (peer: string): string | null => closedWhy(termsFor(cfg, peer), usage.total(`peer:${peer}`, 1));
+  /** Why `peer` is turned away from everything right now, or null. */
+  const closedTo = (peer: string): string | null => closedWhy(termsFor(cfg, peer));
+  /** Why `peer` is turned away from one model right now under that model's limits, or null. */
+  const spentOn = (peer: string, model: string): string | null =>
+    spentWhy(model, limitsFor(termsFor(cfg, peer), model), usage.byModel(`peer:${peer}`, 1)[model]);
 
   /**
    * What we lend right now, to one peer or (unnamed) by the node's own list: nothing while lending
-   * is paused, and nothing to a peer that has reached its limit. Every share gate reads this.
+   * is paused, nothing to a peer lent nothing, and no model whose day it has used. Every share gate reads this.
    */
   const shared = (peer?: string): readonly string[] =>
-    peer === undefined ? controls.share(cfg.share) : closedTo(peer) !== null ? [] : controls.share(termsFor(cfg, peer).models);
+    peer === undefined ? controls.share(cfg.share)
+      : closedTo(peer) !== null ? [] : controls.share(termsFor(cfg, peer).models).filter((m) => spentOn(peer, m) === null);
   /** Answers kept for the models that say so. */
   const answers = new Answers();
   const history = new History(() => {
@@ -235,10 +239,12 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return false;
   }
 
-  /** Jobs one caller may hold per lane; a peer's is its own limit. */
-  const capFor = (peer: string | null) =>
-    callerCap(peer, { scheduler: cfg.scheduler, peerMaxConcurrent: peer !== null ? termsFor(cfg, peer).maxConcurrent : cfg.peerMaxConcurrent });
-  const peerOverLimit = (name: string) => overBudget(peerHits, name, termsFor(cfg, name).rateLimit);
+  /** Jobs one caller may hold per lane; a peer's is its limit for the model, counted over that model's jobs alone. */
+  const capFor = (peer: string | null, model: string): { maxPerCaller?: number; capModel?: boolean } => {
+    const cap = callerCap(peer, { scheduler: cfg.scheduler, peerMaxConcurrent: peer !== null ? limitsFor(termsFor(cfg, peer), model).maxConcurrent : cfg.peerMaxConcurrent });
+    return peer !== null ? { maxPerCaller: cap, capModel: true } : { maxPerCaller: cap };
+  };
+  const peerOverLimit = (name: string, model: string) => overBudget(peerHits, JSON.stringify([name, model]), limitsFor(termsFor(cfg, name), model).rateLimit);
   const controlOverLimit = (name: string) => overBudget(controlHits, name, CONTROL_LIMIT_PER_HOUR);
 
   /** Is this a name some flow takes, here or in a router's rulebook? */
@@ -248,8 +254,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   /** The gates every model request passes before it is queued; throws the Refusal. */
   function admit(c: Call, model: string): void {
     // Said in its own words: a peer told only "does not share" cannot tell a spent day from a model it was never lent.
-    const why = c.peer !== null && controls.lendingOn && !termsFor(cfg, c.peer).off ? closedTo(c.peer) : null;
-    if (why !== null) throw new Refusal(429, `${cfg.name} is not lending to you right now: ${why}`, "rate_limit_error");
+    const lent = c.peer !== null && controls.lendingOn && !termsFor(cfg, c.peer).off;
+    const why = lent && controls.share(termsFor(cfg, c.peer!).models).includes(model) ? spentOn(c.peer!, model) : null;
+    if (why !== null) throw new Refusal(429, `${cfg.name} is not lending you ${model} right now: ${why}`, "rate_limit_error");
     const refused = admitModel({ model, peer: c.peer, scope: c.models }, {
       name: cfg.name,
       shared: () => (c.peer !== null ? shared(c.peer) : shared()),
@@ -260,6 +267,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         : null,
     });
     if (refused) throw refused;
+    // Counted only once the model is known to be lent, so a refused ask spends none of a model's hour.
+    if (c.peer !== null && peerOverLimit(c.peer, model)) throw new Refusal(429, `rate capped for ${model}`, "rate_limit_error");
     withinLimits(c.caller);
   }
 
@@ -300,11 +309,6 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       }
       asked.set(caller, [...recent, now]);
     }
-  }
-
-  /** A peer's hourly budget, spent before its body is even read. */
-  function admitPeer(c: Call): void {
-    if (c.peer !== null && peerOverLimit(c.peer)) throw new Refusal(429, "rate capped", "rate_limit_error");
   }
 
   /**
@@ -1481,7 +1485,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     for (const m of lent) {
       // Per-model stats, absent until loaded; silence is not a claim of no limit.
       const stats = pool.statsFor(m);
-      models[m] = { ...pool.capacityFor(m), ...(stats ? { stats } : {}) };
+      // The borrower is shown what it is held to here, and how much of today it has used.
+      const ran = usage.byModel(`peer:${who}`, 1)[m];
+      const terms = { ...limitsFor(termsFor(cfg, who), m), usedToday: ran ? ran.in + ran.out : 0 };
+      models[m] = { ...pool.capacityFor(m), ...(stats ? { stats } : {}), terms };
     }
     json(res, 200, {
       ...agg,
@@ -1812,8 +1819,25 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       lent: { today: usage.total(`peer:${peer}`, 1), month: usage.total(`peer:${peer}`, KEEP_DAYS) },
       borrowed: { today: borrowed.total(peer, 1), month: borrowed.total(peer, KEEP_DAYS) },
       // Only a peer with a token can be lent to, so only one has limits to be held to.
-      ...(peer in cfg.peerTokens ? { terms: termsFor(cfg, peer), own: Object.keys(cfg.peerTerms[peer] ?? {}).filter((k) => k !== "off"), closed: controls.lendingOn ? closedTo(peer) : "lending is paused" } : {}),
+      ...(peer in cfg.peerTokens ? {
+        terms: termsFor(cfg, peer),
+        own: Object.keys(cfg.peerTerms[peer] ?? {}).filter((k) => k !== "off" && k !== "limits"),
+        closed: controls.lendingOn ? closedTo(peer) : "lending is paused",
+        lentToday: Object.fromEntries(Object.entries(usage.byModel(`peer:${peer}`, 1)).map(([m, r]) => [m, r.in + r.out])),
+      } : {}),
+      ...receivedFrom(peer),
     }));
+
+  /** What this node borrows from `peer`, with the limits it reported for each model on its last reading. */
+  const receivedFrom = (peer: string): Pick<LedgerRow, "received"> => {
+    const p = cfg.peers.find((x) => x.name === peer);
+    if (!p) return {};
+    const models = peers.get(peer)?.capacity?.models;
+    return { received: Object.fromEntries(Object.entries(p.models).map(([mine, theirs]) => {
+      const terms = models?.[theirs]?.terms;
+      return [mine, { theirs, ...(terms ? { terms } : {}) }];
+    })) };
+  };
 
   /** One caller's tokens for each day kept; a day with none is absent. */
   const tokensByDay = (book: Usage, caller: string): Record<string, number> =>
@@ -2077,7 +2101,6 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   async function routeWarm(c: Call): Promise<void> {
     try {
       // A warm spends the GPU, so it meets the same gates as chat.
-      admitPeer(c);
       const body = await readJson(c.req);
       const model = typeof body.model === "string" ? body.model : "";
       admit(c, model);
@@ -2182,7 +2205,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     let startedAt = 0;
     try {
       await slot.scheduler.submit(
-        { lane: WARM_LANE, model, caller, maxPerCaller: capFor(fromPeer), signal: ctrl.signal },
+        { lane: WARM_LANE, model, caller, ...capFor(fromPeer, model), signal: ctrl.signal },
         async () => {
           startedAt = Date.now();
           // A health probe on the model's upstream loads it without generating, within the backend deadline.
@@ -2316,7 +2339,6 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   async function routeChat(c: Call): Promise<void> {
     try {
-      admitPeer(c);
       const payload = await readJson(c.req);
       const model = typeof payload.model === "string" ? payload.model : "";
       admit(c, model);
@@ -2388,7 +2410,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     try {
       await serving.scheduler.submit(
         // Peers are capped per backend, whether or not apiKeys are set.
-        { lane, model, caller, maxPerCaller: capFor(fromPeer), signal: ctrl.signal, tokens: pool.poolTokens(model, needsOf(payload, cfg.models[model]?.videoTokens)) },
+        { lane, model, caller, ...capFor(fromPeer, model), signal: ctrl.signal, tokens: pool.poolTokens(model, needsOf(payload, cfg.models[model]?.videoTokens)) },
         async () => {
           t.startedAt = Date.now();
           await serving.state.ensureFresh();
