@@ -1,6 +1,6 @@
 /** The Lending page: what peers may take, each one's own limits, and what was lent and borrowed. */
 import { ChevronRight, Pencil, Plus, Trash2, Undo2, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Menu } from "./editor.js";
 import { choose } from "./editStore.js";
@@ -162,9 +162,10 @@ const limitsOf = (t: LendTerms, model: string): ModelLimits => ({ tokensPerDay: 
 function Today({ used, limit }: { used: number; limit: number }) {
   return (
     <div className="tabular">
-      {short(used)} <span className="text-dim">{limit > 0 ? `of ${short(limit)}` : "· no limit"}</span>
+      <span className={used > 0 ? "text-fg" : "text-dim"}>{short(used)}</span>
+      <span className="text-dim"> {limit > 0 ? `of ${short(limit)}` : "· no limit"}</span>
       {limit > 0 && (
-        <div aria-hidden className="mt-1.5 h-1 w-24 rounded-full bg-muted">
+        <div aria-hidden className="mt-1.5 h-1 w-full max-w-28 rounded-full bg-muted">
           <div className={cx("h-1 rounded-full", used >= limit ? "bg-warn" : "bg-accent")} style={{ width: `${Math.min(100, (used / limit) * 100)}%` }} />
         </div>
       )}
@@ -172,13 +173,52 @@ function Today({ used, limit }: { used: number; limit: number }) {
   );
 }
 
-const sub = "text-[11px] font-medium uppercase tracking-wide text-dim";
-const th = "px-2 py-1.5 font-medium";
-
 /** Tokens over the days kept, or a dash for a model not run. */
 function Month({ u }: { u: Used | undefined }) {
   if (!u) return <span className="text-dim">—</span>;
   return <span title={`${u.requests} requests`}>{short(tokens(u))}{u.failed > 0 && <span className="text-bad"> · {u.failed} failed</span>}</span>;
+}
+
+/** One side of a peer, lent or received: its colour, name, count and what it says, with an action at the right. */
+function Side({ tone, name, count, note, action, children }: { tone: "accent" | "info"; name: string; count: number; note: ReactNode; action?: ReactNode; children: ReactNode }) {
+  return (
+    <section className="border-t border-line/60 pt-4 first:border-0 first:pt-0">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span aria-hidden className={cx("size-2.5 rounded-sm", tone === "accent" ? "bg-accent" : "bg-info")} />
+        <h3 className="text-[11px] font-semibold uppercase tracking-wide">{name}</h3>
+        <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] tabular text-dim">{count} {count === 1 ? "model" : "models"}</span>
+        <span className="text-[12px] text-dim">{note}</span>
+        {action && <div className="ml-auto flex items-center gap-1">{action}</div>}
+      </div>
+      <div className="mt-2">{children}</div>
+    </section>
+  );
+}
+
+/** The same columns on both sides, so lent and received line up one above the other. */
+function Cols({ action }: { action?: boolean }) {
+  return (
+    <colgroup>
+      <col />
+      <col className="w-[120px]" /><col className="w-[88px]" /><col className="w-[96px]" />
+      <col className="w-[128px]" /><col className="w-[64px]" />
+      {action && <col className="w-[36px]" />}
+    </colgroup>
+  );
+}
+
+function Head({ days, action }: { days: number; action?: boolean }) {
+  const th = "px-2 py-2 font-medium";
+  return (
+    <thead className="text-[11px] text-dim">
+      <tr className="border-b border-line/60">
+        <th className="py-2 pr-2 font-medium">model</th>
+        <th className={th}>tokens a day</th><th className={th}>jobs at once</th><th className={th}>req / hour</th>
+        <th className={th}>used today</th><th className={cx(th, "text-right")}>{days} days</th>
+        {action && <th />}
+      </tr>
+    </thead>
+  );
 }
 
 /** What this node lends a peer, model by model, each with its own limits. */
@@ -190,95 +230,94 @@ function Lent({ peer, t, own, today, month, days, lendable }: { peer: string; t:
     { path: at("models"), value: t.models.filter((x) => x !== m) },
     ...(t.limits?.[m] ? [{ path: Object.keys(t.limits).length > 1 ? at("limits", m) : at("limits"), delete: true }] : []),
   ], `holding ${m} from ${peer}`);
-  const cell = (m: string, key: keyof ModelLimits, label: string, min: number, width: string) => {
+  const cell = (m: string, key: keyof ModelLimits, label: string, min: number) => {
     const mine = t.limits?.[m]?.[key] !== undefined;
     // The last of a model's own limits takes its entry with it, and the last entry the whole map, so none is left empty.
-    const ownKeys = Object.keys(t.limits?.[m] ?? {}).length;
-    const back = ownKeys > 1 ? at("limits", m, key) : Object.keys(t.limits ?? {}).length > 1 ? at("limits", m) : at("limits");
+    const back = Object.keys(t.limits?.[m] ?? {}).length > 1 ? at("limits", m, key) : Object.keys(t.limits ?? {}).length > 1 ? at("limits", m) : at("limits");
     return (
-      <td className="px-2 py-2"><div className="flex items-center gap-1">
+      <td className="px-2 py-1.5"><div className="relative">
         <Num label={`${peer}, ${m}: ${label}`} min={min} none={key === "tokensPerDay" ? "no limit" : undefined} disabled={t.off} value={limitsOf(t, m)[key]}
-             className={cx(width, !mine && "text-dim")} title={mine ? undefined : "this peer's limit"} onSave={(n) => void save(at("limits", m, key), n, "saved")} />
-        {mine && <Back peer={peer} what={`${m} ${label}`} path={back} to="this peer's limit" />}
+             title={mine ? `${m}'s own limit` : "this peer's limit: type to give this model its own"}
+             className={cx("h-7 w-full", mine ? "pr-7 font-medium text-fg" : "border-dashed text-dim hover:border-solid")}
+             onSave={(n) => void save(at("limits", m, key), n, `${m}: ${label} saved`)} />
+        {mine && (
+          <div className="absolute inset-y-0 right-0.5 flex items-center">
+            <Back peer={peer} what={`${m} ${label}`} path={back} to="this peer's limit" />
+          </div>
+        )}
       </div></td>
     );
   };
+  const listNote = own.includes("models")
+    ? <span className="inline-flex items-center gap-1">its own list <Back peer={peer} what="models" path={at("models")} /></span>
+    : "the list for every peer";
   return (
-    <div>
-      <div className="flex flex-wrap items-center gap-2">
-        <span className={sub}>lent</span>
-        {own.includes("models") ? <Back peer={peer} what="models" path={at("models")} /> : <span className="text-[12px] text-dim">the list for every peer</span>}
-        {rest.length > 0 && (
-          <button type="button" disabled={t.off} aria-label={`${peer}: lend another model`}
-                  onClick={(e) => choose(e, rest.map((m) => ({ label: m, value: m, mono: true })), (m) => void save(at("models"), [...t.models, m], `lending ${m} to ${peer}`))}
-                  className="ml-auto inline-flex h-7 items-center gap-1 rounded-md border border-dashed border-line px-2 text-[12px] text-dim hover:text-fg focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50"><Plus size={13} />lend a model</button>
-        )}
-      </div>
-      {t.models.length === 0 ? <p className="mt-2 text-dim">Nothing is lent to {peer}.</p> : (
-        <div className="overflow-x-auto"><table className={cx("mt-1 w-full min-w-[640px] text-left", t.off && "opacity-60")}>
-          <thead className="text-[11px] text-dim">
-            <tr><th className="py-1.5 font-medium">model</th><th className={th}>tokens a day</th><th className={th}>jobs at once</th><th className={th}>req / hour</th><th className={th}>used today</th><th className={cx(th, "text-right")}>{days} days</th><th /></tr>
-          </thead>
+    <Side tone="accent" name="lent" count={t.models.length}
+          note={<>{listNote} · <span className="border-b border-dashed border-dim">dashed</span> limits are this peer's, solid ones the model's own</>}
+          action={rest.length > 0 && (
+            <button type="button" disabled={t.off} aria-label={`${peer}: lend another model`}
+                    onClick={(e) => choose(e, rest.map((m) => ({ label: m, value: m, mono: true })), (m) => void save(at("models"), [...t.models, m], `lending ${m} to ${peer}`))}
+                    className="inline-flex h-7 items-center gap-1 rounded-md border border-line px-2 text-[12px] text-dim hover:border-accent hover:text-fg focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50"><Plus size={13} />lend a model</button>
+          )}>
+      {t.models.length === 0 ? <p className="text-dim">Nothing is lent to {peer}.</p> : (
+        <div className="overflow-x-auto"><table className={cx("w-full min-w-[720px] max-w-[1000px] table-fixed text-left", t.off && "opacity-60")}>
+          <Cols action /><Head days={days} action />
           <tbody>
             {t.models.map((m) => (
-              <tr key={m} className="border-t border-line/60 align-top">
-                <td className={cx("py-2 pr-2", mono)}>{m}</td>
-                {cell(m, "tokensPerDay", "tokens a day", 0, "w-28")}
-                {cell(m, "maxConcurrent", "jobs at once", 1, "w-14")}
-                {cell(m, "rateLimit", "requests an hour", 1, "w-20")}
-                <td className="px-2 py-2"><Today used={today[m] ?? 0} limit={limitsOf(t, m).tokensPerDay} /></td>
-                <td className="tabular px-2 py-2 text-right"><Month u={month[m]} /></td>
-                <td className="py-2 pl-1 text-right">
+              <tr key={m} className="group border-b border-line/40 last:border-0 hover:bg-muted/40">
+                <td className={cx("truncate py-1.5 pr-2", mono)} title={m}>{m}</td>
+                {cell(m, "tokensPerDay", "tokens a day", 0)}
+                {cell(m, "maxConcurrent", "jobs at once", 1)}
+                {cell(m, "rateLimit", "requests an hour", 1)}
+                <td className="px-2 py-1.5"><Today used={today[m] ?? 0} limit={limitsOf(t, m).tokensPerDay} /></td>
+                <td className="tabular px-2 py-1.5 text-right"><Month u={month[m]} /></td>
+                <td className="py-1.5 text-right">
                   <button type="button" disabled={t.off} aria-label={`${peer}: stop lending ${m}`} title="stop lending it" onClick={() => stop(m)}
-                          className="inline-flex size-6 items-center justify-center rounded-md text-dim hover:text-bad focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50"><X size={13} /></button>
+                          className="inline-flex size-7 items-center justify-center rounded-md text-dim opacity-60 group-hover:opacity-100 hover:bg-bad/10 hover:text-bad focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-30"><X size={13} /></button>
                 </td>
               </tr>
             ))}
           </tbody>
         </table></div>
       )}
-    </div>
+    </Side>
   );
 }
 
 /** What this node borrows from a peer, model by model, with the limits that peer holds it to. */
 function Received({ peer, received, month, days }: { peer: string; received: NonNullable<Row["received"]>; month: Record<string, Used>; days: number }) {
   const models = Object.entries(received);
+  const stated = models.filter(([, r]) => r.terms).length;
   const n = (v: number, none?: string) => (v === 0 && none ? <span className="text-dim">{none}</span> : v.toLocaleString("en-US"));
+  const dash = <span className="text-dim" title={`${peer} did not state it`}>—</span>;
   return (
-    <div>
-      <div className="flex flex-wrap items-baseline gap-2">
-        <span className={sub}>received</span>
-        <span className="text-[12px] text-dim">the limits {peer} holds this node to, as of its last reading</span>
-      </div>
-      {models.length === 0 ? <p className="mt-2 text-dim">Nothing is borrowed from {peer}: map a model under its <span className={mono}>models</span> in Config.</p> : (
-        <div className="overflow-x-auto"><table className="mt-1 w-full min-w-[640px] text-left">
-          <thead className="text-[11px] text-dim">
-            <tr><th className="py-1.5 font-medium">model</th><th className={th}>tokens a day</th><th className={th}>jobs at once</th><th className={th}>req / hour</th><th className={th}>used today</th><th className={cx(th, "text-right")}>{days} days</th></tr>
-          </thead>
+    <Side tone="info" name="received" count={models.length}
+          note={models.length === 0 ? null : stated === 0
+            ? <>{peer} does not state its limits: it runs a hearth from before they were shared, or has not been reached</>
+            : <>the limits {peer} holds this node to, as of its last reading</>}>
+      {models.length === 0 ? <p className="text-dim">Nothing is borrowed from {peer}: map a model under its <span className={mono}>models</span> in Config.</p> : (
+        <div className="overflow-x-auto"><table className="w-full min-w-[720px] max-w-[1000px] table-fixed text-left">
+          <Cols action /><Head days={days} action />
           <tbody>
             {models.map(([m, { theirs, terms }]) => (
-              <tr key={m} className="border-t border-line/60 align-top">
-                <td className={cx("py-2 pr-2", mono)}>{m}{theirs !== m && <span className="text-dim"> → {theirs}</span>}</td>
-                {terms ? (
-                  <>
-                    <td className="tabular px-2 py-2">{n(terms.tokensPerDay, "no limit")}</td>
-                    <td className="tabular px-2 py-2">{n(terms.maxConcurrent)}</td>
-                    <td className="tabular px-2 py-2">{n(terms.rateLimit)}</td>
-                    <td className="px-2 py-2"><Today used={terms.usedToday} limit={terms.tokensPerDay} /></td>
-                  </>
-                ) : <td colSpan={4} className="px-2 py-2 text-dim">not stated: {peer} is not lending it now, has not been reached, or runs a hearth that does not say</td>}
+              <tr key={m} className="border-b border-line/40 last:border-0 hover:bg-muted/40">
+                <td className={cx("truncate py-2 pr-2", mono)} title={theirs !== m ? `${m}, which they call ${theirs}` : m}>{m}{theirs !== m && <span className="text-dim"> → {theirs}</span>}</td>
+                <td className="tabular px-2 py-2">{terms ? n(terms.tokensPerDay, "no limit") : dash}</td>
+                <td className="tabular px-2 py-2">{terms ? n(terms.maxConcurrent) : dash}</td>
+                <td className="tabular px-2 py-2">{terms ? n(terms.rateLimit) : dash}</td>
+                <td className="px-2 py-2">{terms ? <Today used={terms.usedToday} limit={terms.tokensPerDay} /> : dash}</td>
                 <td className="tabular px-2 py-2 text-right"><Month u={month[m]} /></td>
+                <td />
               </tr>
             ))}
           </tbody>
         </table></div>
       )}
-    </div>
+    </Side>
   );
 }
 
-/** One peer, opened: each model lent and received with its limits, and its use by day. */
+/** One peer, opened: each model lent and received with its limits, and its use by day when there is any. */
 function PeerDetail({ peer, lendable }: { peer: string; lendable: string[] }) {
   const [got, setGot] = useState<{ days: number; row: Detail } | null>(null);
   const box = useRef<HTMLDivElement>(null);
@@ -298,27 +337,41 @@ function PeerDetail({ peer, lendable }: { peer: string; lendable: string[] }) {
   }, [peer, moved]);
   if (!got || !live) return null;
   const { row, days } = got;
+  const anyDay = (d: Record<string, number>) => Object.values(d).some((v) => v > 0);
+  const lentDays = anyDay(row.byDay.lent);
+  const borrowedDays = anyDay(row.byDay.borrowed);
+  const stat = (tone: string, label: string, n: number) => (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1 text-[12px]">
+      <span aria-hidden className={cx("size-2 rounded-sm", tone)} />
+      <span className="tabular font-medium">{short(n)}</span><span className="text-dim">{label}</span>
+    </span>
+  );
   return (
-    <div ref={box} className="pb-2"><Card className="mt-4 p-4">
-      <div className="flex flex-wrap items-baseline gap-3">
+    <div ref={box} className="pb-2"><Card className="mt-4 p-5">
+      <div className="flex flex-wrap items-center gap-3">
         <h2 className="text-base font-semibold">{peer}</h2>
-        <span className="text-dim">ran {short(tokens(row.lent.month))} tokens here in {days} days; you ran {short(tokens(row.borrowed.month))} there</span>
+        {stat("bg-accent", "it ran here", tokens(row.lent.month))}
+        {stat("bg-info", "you ran there", tokens(row.borrowed.month))}
+        <span className="text-[12px] text-dim">tokens, last {days} days</span>
       </div>
-      <div className="mt-4 flex flex-col gap-6">
+      <div className="mt-5 flex flex-col gap-5">
         {live.terms !== undefined
           ? <Lent peer={peer} t={live.terms} own={live.own ?? []} today={live.lentToday ?? {}} month={row.byModel.lent} days={days} lendable={lendable} />
-          : <p className="text-dim"><span className={sub}>lent</span> nothing: it has no <span className={mono}>accept</span> token, so it cannot borrow here.</p>}
+          : <Side tone="accent" name="lent" count={0} note={<>it has no <span className={mono}>accept</span> token, so it cannot borrow here</>}>{null}</Side>}
         {live.received !== undefined
           ? <Received peer={peer} received={live.received} month={row.byModel.borrowed} days={days} />
-          : <p className="text-dim"><span className={sub}>received</span> nothing: it has no <span className={mono}>url</span>, so this node cannot borrow from it.</p>}
-        <div>
-          <div className="flex items-center gap-4 text-[11px] text-dim">
-            <span className="font-medium uppercase tracking-wide">each day</span>
-            <span className="flex items-center gap-1.5"><span aria-hidden className="size-2.5 rounded-sm bg-accent" />lent</span>
-            <span className="flex items-center gap-1.5"><span aria-hidden className="size-2.5 rounded-sm bg-info" />borrowed</span>
-          </div>
-          <div className="mt-2"><Days lent={row.byDay.lent} borrowed={row.byDay.borrowed} days={days} /></div>
-        </div>
+          : <Side tone="info" name="received" count={0} note={<>it has no <span className={mono}>url</span>, so this node cannot borrow from it</>}>{null}</Side>}
+        {/* Drawn only once there is a day to draw, and keyed only for what it shows. */}
+        {(lentDays || borrowedDays) && (
+          <section className="border-t border-line/60 pt-4">
+            <div className="flex items-center gap-4 text-[11px] text-dim">
+              <span className="font-semibold uppercase tracking-wide text-fg">each day</span>
+              {lentDays && <span className="flex items-center gap-1.5"><span aria-hidden className="size-2.5 rounded-sm bg-accent" />lent</span>}
+              {borrowedDays && <span className="flex items-center gap-1.5"><span aria-hidden className="size-2.5 rounded-sm bg-info" />borrowed</span>}
+            </div>
+            <div className="mt-2"><Days lent={row.byDay.lent} borrowed={row.byDay.borrowed} days={days} /></div>
+          </section>
+        )}
       </div>
       {live.terms !== undefined && <Machine peer={peer} />}
     </Card></div>
