@@ -33,6 +33,7 @@ import { createViews, type CallerUse, type KeyInfo, type LedgerRow, type Spent }
 import { multipartField, replaceMultipartField } from "./multipart.js";
 import { relayAnthropic, toAnthropic } from "./anthropic.js";
 import { tailscaleWhois } from "./tailscale.js";
+import { chatOf, MessagesResponse } from "./messages.js";
 import { troubleSays } from "./backend.js";
 import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
 
@@ -1012,6 +1013,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         t.startedAt = Date.now();
         // The peer's id, with the route's params still applied.
         const body = pool.outboundBody(model, payload, decision.theirModel);
+        const over = peers.sent(peer.name, decision.theirModel);
         try {
           const up = await send(`${peer.url}/v1/chat/completions`, {
             json: body,
@@ -1026,8 +1028,11 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
             const detail = await up.text();
             throw new PeerStatusError(peer.name, up.status, detail.slice(0, 200));
           }
+          peers.served(peer.name);
           await pipeThrough(up, res);
+          over();
         } catch (e) {
+          over();
           if (res.headersSent) throw e;
           // Where the flow sends it with peers out of the picture; only somewhere here will do.
           const home = resolve(asked, { ...world, noPeers: true });
@@ -1287,6 +1292,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       handler: routeModels },
     { path: "/v1/chat/completions", methods: ["POST"], auth: "either", envelope: "openai",
       scoped: true, handler: routeChat },
+    // The Messages API, for clients that speak only that; peers borrow over chat completions.
+    { path: "/v1/messages", methods: ["POST"], auth: "local", envelope: "openai", scoped: true,
+      handler: routeMessages },
 
     // Login and logout take no credential by definition; cross-origin POSTs are refused above.
     { path: "/login", methods: ["POST"], auth: "open", handler: routeLogin },
@@ -2131,6 +2139,21 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       await chat(c, model, payload);
     } catch (e) {
       fail(c.res, e);
+    }
+  }
+
+  /** A Messages request served as a chat completion; everything written goes out in Messages shapes. */
+  async function routeMessages(c: Call): Promise<void> {
+    const out = new MessagesResponse(c.res);
+    const m: Call = { ...c, res: out as unknown as ServerResponse };
+    try {
+      const body = await readJson(c.req);
+      out.model = typeof body.model === "string" ? body.model : "";
+      admit(m, out.model);
+      refuseDegraded(out.model);
+      await chat(m, out.model, chatOf(body));
+    } catch (e) {
+      fail(m.res, e);
     }
   }
 

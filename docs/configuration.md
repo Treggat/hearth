@@ -98,7 +98,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `borrowing.firstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |
 | `borrowing.freshMs` | `4000` | how long a good peer reading is reused before a routing decision asks again |
 | `borrowing.downMs` | `30000` | how long a failed probe is remembered, so an outage doesn't make every local request pay the timeout |
-| `borrowing.pollMs` / `.staleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand |
+| `borrowing.pollMs` / `.staleMs` | `60000` / `60000` | background floor that warms the cache. The real mechanism is on-demand. A peer that answered one of our requests within `staleMs` stays up |
 | `borrowing.coldPenalty` | `2` | what a model load is worth to `fastest`, in queued-jobs-equivalent |
 | `apiKeys` | `[]` | keys allowed on `/v1/*`. Empty means loopback only. Setting it means loopback needs a key too, including any local tool you point at this. An entry may be `{ key, label }` to name a caller, and may carry `models`, `expires` and `limits` — see below |
 | `operator` | unset | the console login, `{user, passHash}`. Written by the console's first-run setup or `hearth set-operator`; applies live; see [The console](console.md#the-console) |
@@ -141,7 +141,7 @@ it stays a hash.
 
 A key can also be **scoped** with `models:`. Every key above is a full local
 caller — chat on anything, the passthrough, `/v1/warm`, `/control`. A scoped
-key gets `POST /v1/chat/completions` for exactly the ids it names and a
+key gets `POST /v1/chat/completions` and `POST /v1/messages` for exactly the ids it names and a
 `/v1/models` filtered to them, and every other route answers 403:
 
 ```yaml
