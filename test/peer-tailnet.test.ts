@@ -8,12 +8,13 @@
  *     npx tsx test/peer-tailnet.test.ts
  */
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ConfigError, parseConfig } from "../src/config.js";
+import { ConfigError, loadConfig, parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 import { tailscaleWhois } from "../src/tailscale.js";
@@ -104,5 +105,35 @@ const chat = await fetch(`${url}/v1/chat/completions`, {
 assert.equal(chat.status, 403, "the check covers work a peer sends, not only the peer protocol");
 
 await node.close();
+
+// --- a peer added by a live edit is bound from its first request -----------------
+// The token applies without a restart, so the binding must too, or the new peer gets in from anywhere.
+{
+  const path = join(mkdtempSync(join(tmpdir(), "hearth-tailnet-")), "hearth.yaml");
+  const yaml = `name: lender
+tailscaleSocket: ${JSON.stringify(socket)}
+backends:
+  gpu: {url: "http://127.0.0.1:9", kind: none, serves: [my-model]}
+flows:
+  anything-else: {inputs: ["*"], steps: [{to: {asked: true}}]}
+peers:
+  other: {accept: other-token}
+`;
+  writeFileSync(path, yaml);
+  const live = createNode(loadConfig(path), silentLogger);
+  await new Promise<void>((r) => live.server.listen(0, "127.0.0.1", r));
+  const at = `http://127.0.0.1:${(live.server.address() as AddressInfo).port}`;
+  const edit = await fetch(`${at}/config`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: `${yaml}  friend: {accept: friend-token, tailnet: n-friend}\n` }),
+  });
+  assert.deepEqual(((await edit.json()) as { restartPending: string[] }).restartPending, [], "the binding needs no restart");
+  answer = "n-somewhere-else";
+  assert.equal((await fetch(`${at}/peer/hello`, { headers: { Authorization: "Bearer friend-token" } })).status, 403, "a peer added live is checked from its first request");
+  answer = "n-friend";
+  assert.equal((await fetch(`${at}/peer/hello`, { headers: { Authorization: "Bearer friend-token" } })).status, 200);
+  await live.close();
+}
 tailscaled.close();
 console.log("peer-tailnet.test.ts ok");
