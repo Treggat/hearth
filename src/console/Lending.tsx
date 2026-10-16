@@ -226,7 +226,8 @@ function Rename({ peer, taken, onClose, onDone }: { peer: string; taken: string[
   const name = to.trim();
   const problem = name === "" ? "needs a name" : name !== peer && taken.includes(name) ? `a peer named ${name} already exists` : null;
   const go = async () => {
-    if (problem || name === peer) return onClose();
+    if (problem) return;
+    if (name === peer) return onClose();
     setBusy(true);
     const ok = await edit([{ path: ["peers", peer], rename: name }], `${peer} is now ${name}`);
     setBusy(false);
