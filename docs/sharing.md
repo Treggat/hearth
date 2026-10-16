@@ -38,6 +38,38 @@ models:
 One entry per friend holds both directions: add `accept` to yours and `url` with
 a `token` to theirs, and each of you can borrow from the other.
 
+## Joining with an invite code
+
+Instead of making a token and sending it over chat, the lender can hand out a
+code that sets both entries up:
+
+```bash
+# on the lender: the address the borrower reaches you at
+hearth invite --url http://100.x.y.z:4141
+
+# on the borrower, with the code it printed
+hearth join hearth-invite:…
+```
+
+The lender's node adds `peers.<borrower's name>` with a fresh `accept`, the
+borrower's adds `peers.<lender's name>` with the lender's `url` and that same
+token, and both apply at once. Neither person ever sees the token.
+
+- An invite lends one way: the borrower may run what the lender's `lending`
+  allows, and the lender borrows nothing back. Inviting the other way links the
+  reverse.
+- The code works once and for 10 minutes, and lives only in the running node, so
+  a restart voids it. Anyone holding the code in that window can join with it,
+  so send it the way you would send a short-lived password.
+- The borrower's node name must be one the lender has no peer under yet.
+  `hearth join --as <name>` picks the name the lender is kept under on the
+  borrower's side.
+- Both commands ask the node that is running, on its `listen` port. If it sets
+  `apiKeys`, give one as `HEARTH_KEY`.
+- The tokens are written into each `hearth.yaml` as they are, the way minted api
+  keys are. To keep one in the environment instead, move it to a variable and
+  write `env:NAME` in its place.
+
 Both blocks can also be edited from `/ui` or `curl` while it runs, which is
 usually how they get written in the first place. Each change is live at once and
 written into the config:

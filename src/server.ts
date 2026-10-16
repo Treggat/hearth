@@ -1248,6 +1248,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     { path: "/healthz", auth: "open", handler: routeHealthz },
 
     { path: ["/peer/hello", "/peer/state"], auth: "peer", handler: routePeer },
+    // No credential yet: a one-time invite secret in the body is the whole gate.
+    { path: "/peer/join", methods: ["POST"], auth: "open", handler: routePeerJoin },
 
     // Local only: /control changes state, so a peer must never reach it.
     { path: "/network", auth: "local", handler: routeNetwork },
@@ -1263,6 +1265,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
     // Mint and revoke write the config file, and the node follows it at once.
     { path: ["/keys/mint", "/keys/revoke", "/keys/rotate"], methods: ["POST"], auth: "local", handler: routeKeys },
+    // Invite a node to borrow from this one, or redeem another node's invite.
+    { path: "/peers/invite", methods: ["POST"], auth: "local", handler: routeInvite },
+    { path: "/peers/join", methods: ["POST"], auth: "local", handler: routeJoin },
     { path: "/usage", methods: ["GET"], auth: "local", handler: routeUsage },
     { path: "/backends/probe", methods: ["POST"], auth: "local", handler: routeProbe },
 
@@ -1860,6 +1865,111 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       keySeen.delete("key:" + label);
       log.info("keys.revoked", { label, caller: c.caller });
       json(c.res, 200, { label, revoked: true, restartPending: commit.restartPending });
+    } catch (e) {
+      failConfig(c.res, e);
+    }
+  }
+
+  /** Open invites by secret: each lets one node join as a peer that may borrow from this one, once, until it expires. */
+  const invites = new Map<string, number>();
+  const INVITE_TTL_MS = 10 * 60_000;
+  const PEER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
+  const INVITE_PREFIX = "hearth-invite:";
+
+  /**
+   * Make an invite: a code holding this node's address and a one-time secret. Whoever redeems it
+   * becomes a peer that may borrow from this node on what `lending` allows, no more. Held in
+   * memory only, so a restart voids every open code.
+   */
+  async function routeInvite(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const url = (typeof body.url === "string" ? body.url.trim() : "").replace(/\/+$/, "");
+      if (!/^https?:\/\/[^/?#]+$/.test(url)) {
+        throw new Refusal(400, "url must be the address your friend reaches this node at, as http://host:port");
+      }
+      const now = Date.now();
+      for (const [s, until] of invites) if (until <= now) invites.delete(s);
+      const secret = randomBytes(24).toString("base64url");
+      invites.set(secret, now + INVITE_TTL_MS);
+      const code = INVITE_PREFIX + Buffer.from(JSON.stringify({ u: url, s: secret })).toString("base64url");
+      log.info("peers.invited", { caller: c.caller, url, expiresInSec: INVITE_TTL_MS / 1000 });
+      json(c.res, 200, { code, expiresAt: new Date(now + INVITE_TTL_MS).toISOString() });
+    } catch (e) {
+      fail(c.res, e);
+    }
+  }
+
+  /**
+   * The inviter's half of a join, the one write a caller with no credential can make: a live
+   * invite secret, spent on first use, adds the caller as a peer under the name it gives and
+   * answers with the token it is to present from then on.
+   */
+  async function routePeerJoin(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const secret = typeof body.secret === "string" ? body.secret : "";
+      const until = invites.get(secret);
+      if (until === undefined || until <= Date.now()) {
+        invites.delete(secret);
+        throw new Refusal(403, "this invite is not valid here: it was used, it expired, or this node restarted since");
+      }
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      if (!PEER_NAME.test(name)) throw new Refusal(400, "name must be 1-40 letters, digits, '.', '_' or '-'");
+      const taken = name in cfg.peerTokens || cfg.peers.some((p) => p.name === name);
+      if (taken) throw new Refusal(409, `this node already has a peer called ${name}`);
+      // Spent before the write, so a second try with the same secret cannot race this one.
+      invites.delete(secret);
+      const token = "hpeer_" + randomBytes(24).toString("hex");
+      config.patch({ ops: [{ path: ["peers", name], value: { accept: token } }] });
+      log.info("peers.joined", { peer: name, ip: c.req.socket.remoteAddress ?? "?" });
+      json(c.res, 200, { name: cfg.name, token });
+    } catch (e) {
+      failConfig(c.res, e);
+    }
+  }
+
+  /** Redeem an invite: ask the inviter to take this node as a peer, then add the inviter as one to borrow from. */
+  async function routeJoin(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const code = typeof body.code === "string" ? body.code.trim() : "";
+      let u = "";
+      let s = "";
+      try {
+        if (!code.startsWith(INVITE_PREFIX)) throw new Error();
+        const d = JSON.parse(Buffer.from(code.slice(INVITE_PREFIX.length), "base64url").toString()) as { u?: unknown; s?: unknown };
+        if (typeof d.u === "string" && typeof d.s === "string") [u, s] = [d.u, d.s];
+      } catch {
+        // Answered below, the same as a code with a field missing.
+      }
+      if (!/^https?:\/\/[^/?#]+$/.test(u) || s === "") throw new Refusal(400, "that is not an invite code: it starts with hearth-invite:");
+      const as = typeof body.as === "string" ? body.as.trim() : "";
+      if (as !== "" && !PEER_NAME.test(as)) throw new Refusal(400, "as must be 1-40 letters, digits, '.', '_' or '-'");
+      if (as !== "" && cfg.peers.some((p) => p.name === as)) throw new Refusal(409, `you already have a peer called ${as}`);
+      const up = await send(`${u}/peer/join`, { method: "POST", json: { secret: s, name: cfg.name }, headersTimeoutMs: 15_000 });
+      const said = await up.text();
+      let answer: { name?: unknown; token?: unknown; error?: unknown } = {};
+      try {
+        answer = JSON.parse(said) as typeof answer;
+      } catch {
+        // Not hearth on the other end; refused below with its status.
+      }
+      if (!up.ok) {
+        const why = typeof answer.error === "object" && answer.error !== null ? (answer.error as { message?: unknown }).message : answer.error;
+        throw new Refusal(502, `the inviter refused: ${typeof why === "string" ? why : `it answered ${up.status}`}`);
+      }
+      if (typeof answer.token !== "string" || typeof answer.name !== "string") throw new Refusal(502, "the inviter answered something that is not a join");
+      const name = as || answer.name;
+      if (!PEER_NAME.test(name)) throw new Refusal(502, `the inviter's name ${JSON.stringify(name)} cannot be a peer name here: join again with as`);
+      try {
+        config.patch({ ops: [{ path: ["peers", name], value: { url: u, token: answer.token } }] });
+      } catch (e) {
+        // The inviter already took us, so the token is all that is missing here: say where it goes.
+        throw new Refusal(500, `the inviter added you, but saving them here failed (${e instanceof Error ? e.message : String(e)}): add peers.${name} with url ${u} and token ${answer.token} by hand`);
+      }
+      log.info("peers.joined_as_borrower", { peer: name, url: u, caller: c.caller });
+      json(c.res, 200, { peer: name, url: u });
     } catch (e) {
       failConfig(c.res, e);
     }
