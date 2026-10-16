@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { addPlace, applyOps, copiedRouter, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, movedBay, BAYS, restacked, unstacked, STACK, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, callerChoices, paneChoices } from "../src/console/draft.js";
+import { addPlace, applyOps, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, movedBay, movedHardware, BAYS, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, callerChoices, paneChoices, copiedRouter, restacked, unstacked, STACK } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -504,6 +504,30 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual(opsOf(doc(), pointStep(doc(), "pick", 1, { kind: "model", model: "other" })!), [{ path: ["flows", "pick", "steps", 1, "to"], value: "other" }]);
   const { servers: _, ...without } = doc();
   assert.deepEqual(opsOf(doc(), without), [{ path: ["servers"], delete: true }]);
+}
+
+// --- hardware dragged onto another machine takes what sits in it along -----------------------------
+{
+  let two = put(put(put(doc(), "servers", "other", { host: "10.0.0.6" }), "resources", "gpu2", { kind: "gpu" }), "resources", "cpu", { kind: "cpu", shared: true });
+  two = put(two, "backends", "also", { url: "http://127.0.0.1:8081", kind: "none", serves: ["more"], resources: ["gpu2", "gpu0"] });
+  two = put(two, "backends", "small", { url: "http://127.0.0.1:8082", kind: "none", serves: ["tiny"], resources: ["cpu"] });
+  two = put(two, "backends", "spill", { url: "http://127.0.0.1:8083", kind: "none", serves: ["huge"], resources: ["gpu2", "cpu"] });
+  const b = (d: Doc, n: string) => (d.backends as Record<string, Doc>)[n]!;
+  // Every backend here that uses gpu0 goes with it, though "also" sits in gpu2; so gpu2 goes too, and "spill" on it.
+  // The one on another machine stays.
+  const out = movedHardware(two, "gpu0", "", "other");
+  assert.deepEqual([b(out, "near").server, b(out, "also").server, b(out, "spill").server, b(out, "small").server, b(out, "far")], ["other", "other", "other", undefined, b(two, "far")]);
+  assert.doesNotThrow(() => parseConfig(out));
+  // Shared hardware takes only what sits in it: "spill" uses cpu but sits in gpu2.
+  const cpu = movedHardware(two, "cpu", "", "other");
+  assert.deepEqual([b(cpu, "small").server, b(cpu, "spill").server], ["other", undefined]);
+  assert.doesNotThrow(() => parseConfig(cpu));
+  // Back to this machine: the server goes, and one reached by port alone is given a url to reach it by.
+  const home = movedHardware(two, "gpu1", "box", "");
+  assert.deepEqual([b(home, "far").server, b(home, "far").port, b(home, "far").url], [undefined, undefined, "http://127.0.0.1:7860"]);
+  assert.doesNotThrow(() => parseConfig(home));
+  // Let go on the machine it is on, or hardware nothing sits in, nothing is written.
+  assert.deepEqual([movedHardware(two, "gpu0", "", ""), movedHardware(two, "gpu0", "box", "other")], [two, two]);
 }
 
 console.log("draft.test.ts ok");
