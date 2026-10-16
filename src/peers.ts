@@ -128,7 +128,7 @@ export class PeerRegistry {
       backoffUntil: null,
       lastFailAt: null,
     });
-    for (const m of [this.readAt, this.servedAt, this.caps]) m.delete(p.name);
+    for (const m of [this.readAt, this.servedAt, this.caps, this.open]) m.delete(p.name);
   }
 
   /**
@@ -154,7 +154,8 @@ export class PeerRegistry {
       this.inFlight.delete(name);
       if (this.started) void this.probe(name);
     }
-    if (this.started) this.start();
+    // Only a node that had no peers to poll has no timer yet; one already polling picks the edit up as it goes.
+    if (this.started && this.timer === null) this.start();
   }
 
   config(name: string): PeerConfig | undefined {
