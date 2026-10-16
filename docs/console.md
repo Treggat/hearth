@@ -27,6 +27,11 @@ Seven pages, and ⌘K (Ctrl+K) jumps between them and to anything on Topology:
   a new key is shown once over the page. **Drag a box of callers** along the
   row to stand it somewhere else among the others; the order joins the draft
   and is kept with the layout.
+  **Recent requests** down the left lists what this node asked for, running
+  ones first, then the last twelve that ended, each with who asked, where it
+  ran and how long it took. Point at one and the backend or peer that ran it
+  lights up on the map; click it for that box's settings. The rail folds away
+  with its arrow, and the browser remembers.
   A right-click on the empty part of the picture offers what the strip over it
   does, where the pointer is: a new backend, hardware, machine or provider, the
   published versions, and fitting the picture in view.
@@ -106,6 +111,11 @@ finishes what is in flight, then exits with status `75` so a supervisor that
 restarts on failure (systemd's `Restart=on-failure`) brings it straight back,
 and the page reconnects. Without such a supervisor it only stops.
 
+**endpoints** in the header lists the addresses to point an app at (the
+OpenAI-compatible `/v1` and the Messages API base), each with a copy button,
+says whether the node wants a key, and shows a setup to paste for curl or
+Claude Code.
+
 ### Editing on the graph
 
 The **Routing** page is a map of the routing you have set up, and it is where
@@ -168,7 +178,10 @@ line; **+ type** brings one onto the map.
   names the line that decided. **pretend…** lists the state your rules test
   that cannot be arranged on demand (a model idle or just used, full, loaded,
   needing a swap, its hardware held, a line at its limit, a time of day, a
-  caller, a lane) so each line can be tried.
+  caller, a lane) so each line can be tried. **send it** then runs one small
+  real request for that name and says where the node ran it, how long it took
+  and what came back, with a note when that is not where the rules pointed. It
+  is offered only for the rules the node runs now, with nothing pretended.
 - **A model's box carries the hardware it runs on** as a small tag, and so does
   each model in the list of places to send a line, so two copies of one model
   (one on a card, one on the CPU) are told apart at a glance.
