@@ -13,7 +13,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type React
 
 import type { Backend, Node as NetNode, Resource, UiData } from "./types.js";
 import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
-import { BAYS, bayRoom, callersIn, draftView, EVERYONE, list, movedBay, movedHardware, obj, ordered, put, routerFor, usersOf, withCaller, callerChoices, paneChoices } from "./draft.js";
+import { BAYS, bayRoom, callersIn, draftView, EVERYONE, list, movedBay, movedHardware, obj, ordered, put, routerFor, usersOf, withCaller, callerChoices, paneChoices, restacked, STACK, unstacked } from "./draft.js";
 import { change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit, addRouter, askAt } from "./editStore.js";
 import { Menu, VersionsButton, openVersions } from "./editor.js";
 import { control, go, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
@@ -81,9 +81,6 @@ const BayNode = memo(function BayNode({ data }: NodeProps<Node<Bay>>) {
   );
 });
 
-// The chip that was just dragged, so the click that ends the drag does not also open it.
-let dragged: string | null = null;
-
 /** Where a backend let go over each frame is put, by the frame's id; filled as the picture is laid out. */
 const drops = new Map<string, { resource?: string; server: string }>();
 
@@ -95,14 +92,32 @@ function moved(doc: Record<string, unknown>, backend: string, to: { resource?: s
   // The card it sat in is the first exclusive one it names, else the first; that is the one a move replaces.
   const home = had.find((r) => !shared(r)) ?? had[0];
   const resources = to.resource === undefined ? had : [to.resource, ...had.filter((r) => r !== home && r !== to.resource)];
-  return put(doc, "backends", backend, { ...b, ...(resources.length ? { resources } : {}), ...(to.server ? { server: to.server } : {}) });
+  const out = put(doc, "backends", backend, { ...b, ...(resources.length ? { resources } : {}), ...(to.server ? { server: to.server } : {}) });
+  // In other hardware it stands after those placed there, not at the place it had in the old one.
+  return to.resource !== undefined && to.resource !== home ? unstacked(out, backend) : out;
 }
 
-/** Put a backend on whatever hardware or machine is under a point of the page, in the draft. */
+/** The backends drawn in each piece of hardware, in the order drawn, by the frame's id; filled as the picture is laid out. */
+const stacks = new Map<string, string[]>();
+
+/**
+ * Put a backend on whatever hardware or machine is under a point of the page, in the draft. Let go in
+ * the hardware it is already in, it takes the place it was let go at among the others there.
+ */
 function dropBackend(backend: string, x: number, y: number): void {
   const under = document.elementsFromPoint(x, y).map((el) => el.closest(".react-flow__node")?.getAttribute("data-id") ?? "").find((id) => drops.has(id));
   const to = under ? drops.get(under) : undefined;
-  if (to && useEdit.getState().draft) change((d) => moved(d, backend, to));
+  if (!to || !useEdit.getState().draft) return;
+  const names = stacks.get(under!) ?? [];
+  if (!names.includes(backend)) { change((d) => moved(d, backend, to)); return; }
+  // Cards stand in a column, chips in rows of two read left to right: it goes after every other the point has passed.
+  const at = names.filter((n) => n !== backend).filter((n) => {
+    const chip = document.querySelector(`[data-chip="${CSS.escape(n)}"]`);
+    const r = (chip ?? document.querySelector(`.react-flow__node[data-id="backend:${CSS.escape(n)}"]`))?.getBoundingClientRect();
+    if (!r) return false;
+    return chip ? r.bottom < y || (r.top <= y && r.left + r.width / 2 < x) : r.top + r.height / 2 < y;
+  }).length;
+  change((d) => restacked(d, names, backend, at));
 }
 
 /** Put hardware, and what runs on it, on whatever machine is under a point of the page, in the draft. */
@@ -230,15 +245,22 @@ const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
       {data.chips && (
         <div className="grid grid-cols-2 gap-1.5 px-3 pt-2">
           {data.chips.map((c) => (
-            <button key={c.name} title={c.sub}
-                    // A chip is dragged like a card: let go over other hardware or another machine, it is put there. A press that does not move is a click.
+            <button key={c.name} title={c.sub} data-chip={c.name}
+                    // A chip is dragged like a card: let go over other hardware or another machine it is put there, among the other chips it moves to that place. A press that does not move is a click.
                     onPointerDown={(e) => {
                       if (data.drop === undefined) return;
                       const [x0, y0] = [e.clientX, e.clientY];
-                      const drop = (ev: PointerEvent) => { if (Math.hypot(ev.clientX - x0, ev.clientY - y0) > 8) { dragged = c.name; dropBackend(c.name, ev.clientX, ev.clientY); } };
+                      const drop = (ev: PointerEvent) => {
+                        if (Math.hypot(ev.clientX - x0, ev.clientY - y0) <= 8) return;
+                        // The click a drag ends in, on this chip or on whatever holds both ends, opens nothing.
+                        const eat = (e: MouseEvent) => e.stopPropagation();
+                        addEventListener("click", eat, { capture: true, once: true });
+                        setTimeout(() => removeEventListener("click", eat, { capture: true }), 0);
+                        dropBackend(c.name, ev.clientX, ev.clientY);
+                      };
                       document.addEventListener("pointerup", drop, { once: true });
                     }}
-                    onClick={(e) => { e.stopPropagation(); if (dragged === c.name) { dragged = null; return; } select({ kind: "backend", id: c.name }); }}
+                    onClick={(e) => { e.stopPropagation(); select({ kind: "backend", id: c.name }); }}
                     className={cx("nodrag nopan flex h-8 items-center gap-1.5 rounded-lg border bg-panel px-2 text-left text-[11px] transition-colors", data.drop !== undefined && "cursor-grab",
                       data.picked === c.name ? "border-accent" : c.busy ? "border-accent/50" : "border-line hover:border-dim/40")}>
               <Dot tone={c.tone} pulse={c.busy} />
@@ -461,6 +483,7 @@ type Who = { /** Machines the draft names, with or without anything on them yet.
 
 function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = null) {
   drops.clear();
+  stacks.clear();
   const self = d.net.nodes.find((n) => n.self)!;
   const peers = d.net.nodes.filter((n) => !n.self);
   const is = (kind: string, id: string) => sel?.kind === kind && sel.id === id;
@@ -509,7 +532,8 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
       const group = key === "" ? undefined : `resource:${frame ? `${machine}/` : ""}${key}`;
       const r: Resource | undefined = resources.find((x) => x.name === key);
       const cards: Node[] = [];
-      const mine = members.filter((m) => homeOf(m) === key);
+      // In the order they were dragged into, and one never moved after those that were.
+      const mine = ordered(d.layout, members.filter((m) => homeOf(m) === key).map((m) => m.name), STACK).map((n) => members.find((m) => m.name === n)!);
       // Many small backends read as chips behind one line; a few big ones keep a card and a line each.
       const chips = group !== undefined && mine.length > 3;
       const width = chips ? 2 * 150 + 6 + 24 : W + PAD * 2;
@@ -531,7 +555,7 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
         edges.push({ id: `e:backend:${b.name}`, source: hub, target: `backend:${b.name}`, type: "flow", data: { jobs: run, pulses: pulsesFor(`e:backend:${b.name}`, run, who ? 2 : 1) } });
       });
       if (group) {
-        if (who) drops.set(group, { resource: key, server: machine });
+        if (who) { drops.set(group, { resource: key, server: machine }); stacks.set(group, mine.map((b) => b.name)); }
         const all = mine.flatMap((b) => runningIds.get(b.name) ?? []);
         if (chips) edges.push({ id: `e:${group}`, source: hub, target: group, type: "flow", data: { jobs: all, pulses: pulsesFor(`e:${group}`, all, who ? 2 : 1) } });
         inside.push({
@@ -833,7 +857,7 @@ export function Topology() {
       </button>
       <VersionsButton />
       {/* The hint gives way to whatever the strip has to say, so it stays one row. */}
-      {!isDirty && waiting.length === 0 && <span className="truncate text-[11px] text-dim max-xl:hidden">Click anything for its settings. Drag a backend onto hardware, hardware onto a machine, or a caller onto a router.</span>}
+      {!isDirty && waiting.length === 0 && <span className="truncate text-[11px] text-dim max-xl:hidden">Click anything for its settings. Drag a backend onto hardware or to another place in it, hardware onto a machine, or a caller onto a router.</span>}
       <div className="ml-auto flex items-center gap-2">
         {/* What is published but not running yet stays said until the restart that applies it. */}
         {waiting.length > 0 && !isDirty && (

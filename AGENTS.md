@@ -9,6 +9,8 @@ comment is read by strangers. Write for them.
 - `src/scheduler.ts`, `src/pool.ts`, `src/resources.ts`: admission, per-backend
   queues, shared hardware
 - `src/route.ts`, `src/peers.ts`: local vs peer routing, peer health
+- `src/tailscale.ts`: asks the local tailscaled which tailnet machine a
+  caller is, for peers bound with `tailnet`
 - `src/actions.ts`: what a flow step can set off beside routing; one entry
   per kind
 - `src/config.ts`, `src/fields.ts`, `src/configfile.ts`: parsing, the settings
@@ -16,6 +18,12 @@ comment is read by strangers. Write for them.
 - `src/kinds.ts`: what each backend `kind` supports
 - `src/anthropic.ts`: a backend that speaks the Messages API: the request and
   the answer rewritten each way
+- `src/messages.ts`: the `/v1/messages` door, the same rewrite the other way
+  round, for a client that speaks the Messages API
+- `src/report.ts`: `hearth report`, the one-file bug report with secrets
+  scrubbed
+- `src/updates.ts`: the daily npm check behind the console's "newer hearth"
+  notice (`updateCheck`)
 - `src/console/`: the React status page and config editor (built to `dist/`).
   The Lending page is `Lending.tsx`. The routing map is `Routing.tsx` (layout),
   `flowNodes.tsx` (one view per kind of node) and `draft.ts` (`NODES`: what

@@ -372,7 +372,10 @@ export const RANK = "routing/order:";
 /** Where the callers of a router stand among the others in the topology, kept the same way; the default router's are `default`. */
 export const BAYS = "topology/order:";
 
-const isOrder = (id: string): boolean => id.startsWith(RANK) || id.startsWith(BAYS);
+/** Where a backend stands among the others in the hardware it uses, kept the same way, by backend name. */
+export const STACK = "topology/backend:";
+
+const isOrder = (id: string): boolean => id.startsWith(RANK) || id.startsWith(BAYS) || id.startsWith(STACK);
 
 /** `names` in the order they were put in: ranked ones first by rank, then the rest as they come. `under` is whose order it is. */
 export function ordered(layout: Record<string, { x: number; y: number }> | undefined, names: string[], under = RANK): string[] {
@@ -415,6 +418,20 @@ export function movedHardware(doc: Doc, resource: string, from: string, to: stri
     return put(d, "backends", name, { ...rest, ...(local ? { url: `http://127.0.0.1:${String(port)}` } : port !== undefined ? { port } : {}), ...(to ? { server: to } : {}) });
   }, doc);
 }
+
+/**
+ * Put backend `name` `at` that place among the others in `names`, the order its hardware shows them in
+ * now (0 is first). Put where it already stands, nothing changes.
+ */
+export function restacked(doc: Doc, names: string[], name: string, at: number): Doc {
+  const next = names.filter((n) => n !== name);
+  next.splice(Math.max(0, Math.min(at, next.length)), 0, name);
+  if (!names.includes(name) || next.every((n, i) => n === names[i])) return doc;
+  return next.reduce<Doc>((d, n, k) => put(d, "layout", STACK + n, { x: 0, y: k }), doc);
+}
+
+/** A backend's place among the others in its hardware forgotten, so wherever it goes it stands after those placed there. */
+export const unstacked = (doc: Doc, name: string): Doc => (STACK + name in obj(doc.layout) ? put(doc, "layout", STACK + name, undefined) : doc);
 
 /** Move a type `by` places in the list `names`, which is the order they are shown in now. */
 export function movedName(doc: Doc, names: string[], name: string, by: number): Doc {
@@ -608,6 +625,20 @@ export function unscoped(view: Doc, whole: Doc, router: string | null): Doc {
     routers: { ...obj(view.routers), [router]: { ...obj(obj(view.routers)[router]), flows: view.flows } },
     ...(Object.keys(layout).length ? { layout } : {}),
   };
+}
+
+/**
+ * `full` with a new router `name` whose rules are the ones `view` shows, and whose map is drawn
+ * as that one's is: each place `view` keeps as `routing/...` is kept again as `routing@<name>/...`.
+ */
+export function copiedRouter(view: Doc, full: Doc, name: string): Doc {
+  const pre = `routing@${name}/`;
+  const layout = {
+    ...Object.fromEntries(Object.entries(obj(full.layout)).filter(([id]) => !id.startsWith(pre))),
+    ...Object.fromEntries(Object.entries(obj(view.layout)).flatMap(([id, at]) => (id.startsWith("routing/") ? [[pre + id.slice(8), at]] : []))),
+  };
+  const { layout: _, ...rest } = put(full, "routers", name, { flows: view.flows });
+  return { ...rest, ...(Object.keys(layout).length ? { layout } : {}) };
 }
 
 /** The caller that stands for everyone `callers:` does not name. */

@@ -38,6 +38,42 @@ models:
 One entry per friend holds both directions: add `accept` to yours and `url` with
 a `token` to theirs, and each of you can borrow from the other.
 
+## Joining with an invite code
+
+Instead of making a token and sending it over chat, the lender can hand out a
+code that sets both entries up:
+
+```bash
+# on the lender: the address the borrower reaches you at
+hearth invite --url http://100.x.y.z:4141
+
+# on the borrower, with the code it printed
+hearth join hearth-invite:…
+```
+
+The lender's node adds `peers.<borrower's name>` with a fresh `accept`, the
+borrower's adds `peers.<lender's name>` with the lender's `url` and that same
+token, and both apply at once. Neither person ever sees the token.
+
+- An invite lends one way: the borrower may run what the lender's `lending`
+  allows, and the lender borrows nothing back. Inviting the other way links the
+  reverse.
+- The code works once and for 10 minutes, and lives only in the running node, so
+  a restart voids it. Anyone holding the code in that window can join with it,
+  so send it the way you would send a short-lived password.
+- A code names the address your node contacts when you join, the way a peer's
+  `url` does. Join only with a code from someone you would add as a peer by hand.
+- The borrower's node name must be one the lender has no peer under yet.
+  `hearth join --as <name>` picks the name the lender is kept under on the
+  borrower's side. A name the borrower already borrows from is refused before
+  the code is spent; a peer the borrower only lends to keeps its entry and
+  gains the `url` and `token` to borrow back, so the two link both ways.
+- Both commands ask the node that is running, on its `listen` port. If it sets
+  `apiKeys`, give one as `HEARTH_KEY`.
+- The tokens are written into each `hearth.yaml` as they are, the way minted api
+  keys are. To keep one in the environment instead, move it to a variable and
+  write `env:NAME` in its place.
+
 Both blocks can also be edited from `/ui` or `curl` while it runs, which is
 usually how they get written in the first place. Each change is live at once and
 written into the config:
@@ -57,8 +93,16 @@ curl -X POST localhost:4141/control -H 'content-type: application/json' \
 ```
 
 `GET /control` reports the current state and where edits are saved. Adding a
-**peer** is an edit to `peers:` and applies on restart: a token and a URL are a
-trust decision, and the map is only what you do with one you already have.
+**peer** is an edit to `peers:`, from the console's config editor, `PATCH /config`
+or the file itself, and applies without a restart:
+
+- A new peer starts out down and is asked for its state at once.
+- A changed `url` or `token` starts that peer over: what was read from the old
+  address says nothing about the new one, so it is down until the new one
+  answers.
+- A removed peer is forgotten. Requests already sent to it finish.
+- Only `borrowing.pollMs`, how often every peer is asked in the background,
+  still waits for a restart.
 
 ## Limits per peer
 
@@ -117,6 +161,38 @@ few steps of a [flow](routing.md#flows):
 | home until the queue is deep, then a peer | `- when: { queuedUnder: 2 }` with `to: big-model`, then the peer, then `big-model` |
 | whichever would start it soonest | `- to: { fastest: [big-model, { peer: friend }] }`. Ties stay home |
 | a peer or nothing | `- to: { peer: friend }` then `- to: { refuse: "not run here" }` |
+
+## Binding a peer to its machine
+
+A peer's `accept` token is a shared secret: whoever holds a copy can borrow as
+that peer. When both nodes are on a tailnet, `tailnet` ties the token to the
+peer's machine as well:
+
+```yaml
+peers:
+  friend:
+    accept: env:HEARTH_FROM_FRIEND
+    tailnet: nExampleStableID    # their machine, as `tailscale whois <their 100.x address>` prints it
+```
+
+On each request with that token, hearth asks this machine's tailscaled which
+tailnet node is calling and lets the request in only when it is that one. A copy
+of the token used from anywhere else gets a 403, and the log line
+`peer.wrong_machine` names the machine that tried.
+
+- Match on the stable node ID (`StableID` in `tailscale whois --json`). It
+  survives renames, which the machine name does not.
+- The check needs the peer to reach you over the tailnet. A connection to your
+  LAN address has no tailnet identity, so it is refused for a bound peer.
+- hearth reads tailscaled's local API at `tailscaleSocket`. Tailscale running in
+  the same container, or the host's socket mounted into it, both work. If the
+  socket cannot be asked, a bound peer is refused rather than let in on its
+  token alone.
+- A peer without `tailnet` is checked by its token only, as before.
+- This does not make a proxy in front of hearth safe. A proxied request arrives
+  from loopback, which no tailnet node owns, so a bound peer is refused and an
+  anonymous caller is still promoted to local. See
+  [Do not put a proxy in front of it](security.md#do-not-put-a-proxy-in-front-of-it).
 
 ## Knowing what a borrowed model can take
 

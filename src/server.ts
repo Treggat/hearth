@@ -32,6 +32,8 @@ import { CONSOLE_CSP, CONSOLE_HTML } from "./ui.js";
 import { createViews, type CallerUse, type KeyInfo, type LedgerRow, type Spent } from "./views.js";
 import { multipartField, replaceMultipartField } from "./multipart.js";
 import { relayAnthropic, toAnthropic } from "./anthropic.js";
+import { tailscaleWhois } from "./tailscale.js";
+import { chatOf, MessagesResponse } from "./messages.js";
 import { troubleSays } from "./backend.js";
 import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
 
@@ -147,6 +149,8 @@ export interface HearthNode {
   onRestart: (() => void) | null;
   /** The node's logger: stdout, plus the console's Logs page. */
   log: Logger;
+  /** A newer published hearth, for the console to mention; set by `hearth serve`. */
+  update: string | null;
 }
 
 export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
@@ -166,9 +170,13 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   const controls = new Controls();
   // hearth.yaml as the only config state: edits write the file and apply live.
   // Deferred: the sidecar migration below applies before the stream state further down exists.
-  const config = new ConfigFile(cfg, log, () => queueMicrotask(() => void broadcast()));
-  if (cfg.stateFile) config.migrateSidecar(cfg.stateFile);
   const peers = new PeerRegistry(cfg, log, controls);
+  // Peers apply live, so the registry follows every edit before the status surfaces hear of it.
+  const config = new ConfigFile(cfg, log, () => {
+    peers.sync();
+    queueMicrotask(() => void broadcast());
+  });
+  if (cfg.stateFile) config.migrateSidecar(cfg.stateFile);
 
   /** The opt-in canary, or null when `canary:` is not configured. */
   const canary = createCanary(cfg, pool, log);
@@ -1011,6 +1019,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         t.startedAt = Date.now();
         // The peer's id, with the route's params still applied.
         const body = pool.outboundBody(model, payload, decision.theirModel);
+        const over = peers.sent(peer.name, decision.theirModel);
         try {
           const up = await send(`${peer.url}/v1/chat/completions`, {
             json: body,
@@ -1025,8 +1034,11 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
             const detail = await up.text();
             throw new PeerStatusError(peer.name, up.status, detail.slice(0, 200));
           }
+          peers.served(peer.name);
           await pipeThrough(up, res);
+          over();
         } catch (e) {
+          over();
           if (res.headersSent) throw e;
           // Where the flow sends it with peers out of the picture; only somewhere here will do.
           const home = resolve(asked, { ...world, noPeers: true });
@@ -1232,6 +1244,28 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return { ...base, peer: null, caller: asLocal!.caller, models: asLocal!.models };
   }
 
+  const whois = tailscaleWhois(cfg.tailscaleSocket);
+
+  /**
+   * A peer bound with `tailnet` is let in only from that machine, so its token alone is not enough.
+   * Fails closed: a node that cannot ask tailscaled refuses the peer rather than trusting the token.
+   */
+  async function fromPeerMachine(peer: string, req: IncomingMessage, res: ServerResponse, env: Envelope): Promise<boolean> {
+    const want = cfg.peerTailnet[peer];
+    if (want === undefined) return true;
+    const ip = req.socket.remoteAddress ?? "";
+    try {
+      const node = await whois(ip, req.socket.remotePort ?? 0);
+      if (node?.id === want) return true;
+      log.warn("peer.wrong_machine", { peer, ip, node: node?.name ?? null });
+      refuse(res, 403, `the token for ${peer} is honoured only from its own machine`, env);
+    } catch (e) {
+      log.warn("peer.machine_unchecked", { peer, ip, error: e instanceof Error ? e.message : String(e) });
+      refuse(res, 403, `cannot check which machine is calling as ${peer}`, env);
+    }
+    return false;
+  }
+
   /** Every path this node answers, in order, with its `auth` beside it. The passthrough is last and takes the rest. */
   const ROUTES: Route[] = [
     // Unauthenticated on purpose, and on a port that may be bound wide, so it
@@ -1239,6 +1273,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     { path: "/healthz", auth: "open", handler: routeHealthz },
 
     { path: ["/peer/hello", "/peer/state"], auth: "peer", handler: routePeer },
+    // No credential yet: a one-time invite secret in the body is the whole gate.
+    { path: "/peer/join", methods: ["POST"], auth: "open", handler: routePeerJoin },
 
     // Local only: /control changes state, so a peer must never reach it.
     { path: "/network", auth: "local", handler: routeNetwork },
@@ -1254,6 +1290,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
     // Mint and revoke write the config file, and the node follows it at once.
     { path: ["/keys/mint", "/keys/revoke", "/keys/rotate"], methods: ["POST"], auth: "local", handler: routeKeys },
+    // Invite a node to borrow from this one, or redeem another node's invite.
+    { path: "/peers/invite", methods: ["POST"], auth: "local", handler: routeInvite },
+    { path: "/peers/join", methods: ["POST"], auth: "local", handler: routeJoin },
     { path: "/usage", methods: ["GET"], auth: "local", handler: routeUsage },
     { path: "/backends/probe", methods: ["POST"], auth: "local", handler: routeProbe },
 
@@ -1264,6 +1303,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       handler: routeModels },
     { path: "/v1/chat/completions", methods: ["POST"], auth: "either", envelope: "openai",
       scoped: true, handler: routeChat },
+    // The Messages API, for clients that speak only that; peers borrow over chat completions.
+    { path: "/v1/messages", methods: ["POST"], auth: "local", envelope: "openai", scoped: true,
+      handler: routeMessages },
 
     // Login and logout take no credential by definition; cross-origin POSTs are refused above.
     { path: "/login", methods: ["POST"], auth: "open", handler: routeLogin },
@@ -1323,6 +1365,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       if (!claims(r, path, req.method)) continue;
       const c = authorize(r, req, res);
       if (c === null) return;
+      if (c.peer !== null && !(await fromPeerMachine(c.peer, req, res, r.envelope ?? "plain"))) return;
       await r.handler(c);
       return;
     }
@@ -1853,6 +1896,130 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     }
   }
 
+  /** Open invites by secret: each lets one node join as a peer that may borrow from this one, once, until it expires. */
+  const invites = new Map<string, number>();
+  const INVITE_TTL_MS = 10 * 60_000;
+  const PEER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
+  const INVITE_PREFIX = "hearth-invite:";
+
+  /**
+   * Make an invite: a code holding this node's address and a one-time secret. Whoever redeems it
+   * becomes a peer that may borrow from this node on what `lending` allows, no more. Held in
+   * memory only, so a restart voids every open code.
+   */
+  async function routeInvite(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const url = (typeof body.url === "string" ? body.url.trim() : "").replace(/\/+$/, "");
+      if (!/^https?:\/\/[^/?#]+$/.test(url)) {
+        throw new Refusal(400, "url must be the address your friend reaches this node at, as http://host:port");
+      }
+      const now = Date.now();
+      for (const [s, until] of invites) if (until <= now) invites.delete(s);
+      const secret = randomBytes(24).toString("base64url");
+      invites.set(secret, now + INVITE_TTL_MS);
+      const code = INVITE_PREFIX + Buffer.from(JSON.stringify({ u: url, s: secret })).toString("base64url");
+      log.info("peers.invited", { caller: c.caller, url, expiresInSec: INVITE_TTL_MS / 1000 });
+      json(c.res, 200, { code, expiresAt: new Date(now + INVITE_TTL_MS).toISOString() });
+    } catch (e) {
+      fail(c.res, e);
+    }
+  }
+
+  /**
+   * The inviter's half of a join, the one write a caller with no credential can make: a live
+   * invite secret, spent on first use, adds the caller as a peer under the name it gives and
+   * answers with the token it is to present from then on.
+   */
+  async function routePeerJoin(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const secret = typeof body.secret === "string" ? body.secret : "";
+      const until = invites.get(secret);
+      if (until === undefined || until <= Date.now()) {
+        invites.delete(secret);
+        throw new Refusal(403, "this invite is not valid here: it was used, it expired, or this node restarted since");
+      }
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      if (!PEER_NAME.test(name)) throw new Refusal(400, "name must be 1-40 letters, digits, '.', '_' or '-'");
+      const taken = name in cfg.peerTokens || cfg.peers.some((p) => p.name === name);
+      if (taken) throw new Refusal(409, `this node already has a peer called ${name}`);
+      // Spent before the write, so a second try with the same secret cannot race this one.
+      invites.delete(secret);
+      const token = "hpeer_" + randomBytes(24).toString("hex");
+      config.patch({ ops: [{ path: ["peers", name], value: { accept: token } }] });
+      log.info("peers.joined", { peer: name, ip: c.req.socket.remoteAddress ?? "?" });
+      json(c.res, 200, { name: cfg.name, token });
+    } catch (e) {
+      failConfig(c.res, e);
+    }
+  }
+
+  /** The name a node gives on its health check, or null when it does not say. */
+  async function inviterName(url: string): Promise<string | null> {
+    try {
+      const v = (JSON.parse(await (await send(`${url}/healthz`, { headersTimeoutMs: 15_000 })).text()) as { name?: unknown }).name;
+      return typeof v === "string" && v !== "" ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Redeem an invite: ask the inviter to take this node as a peer, then add the inviter as one to borrow from. */
+  async function routeJoin(c: Call): Promise<void> {
+    try {
+      const body = await readJson(c.req);
+      const code = typeof body.code === "string" ? body.code.trim() : "";
+      let u = "";
+      let s = "";
+      try {
+        if (!code.startsWith(INVITE_PREFIX)) throw new Error();
+        const d = JSON.parse(Buffer.from(code.slice(INVITE_PREFIX.length), "base64url").toString()) as { u?: unknown; s?: unknown };
+        if (typeof d.u === "string" && typeof d.s === "string") [u, s] = [d.u, d.s];
+      } catch {
+        // Answered below, the same as a code with a field missing.
+      }
+      if (!/^https?:\/\/[^/?#]+$/.test(u) || s === "") throw new Refusal(400, "that is not an invite code: it starts with hearth-invite:");
+      const as = typeof body.as === "string" ? body.as.trim() : "";
+      if (as !== "" && !PEER_NAME.test(as)) throw new Refusal(400, "as must be 1-40 letters, digits, '.', '_' or '-'");
+      const borrowing = (name: string): boolean => cfg.peers.some((p) => p.name === name);
+      // Without `as`, the inviter's name from its health check, so a clash is refused before the code is spent.
+      const expected = as !== "" ? as : await inviterName(u);
+      if (expected !== null && borrowing(expected)) throw new Refusal(409, `you already borrow from a peer called ${expected}: join again with as`);
+      const up = await send(`${u}/peer/join`, { method: "POST", json: { secret: s, name: cfg.name }, headersTimeoutMs: 15_000 });
+      const said = await up.text();
+      let answer: { name?: unknown; token?: unknown; error?: unknown } = {};
+      try {
+        answer = JSON.parse(said) as typeof answer;
+      } catch {
+        // Not hearth on the other end; refused below with its status.
+      }
+      if (!up.ok) {
+        // The code chose this address, so only a short hearth-shaped reason is passed on, never a body.
+        const why = typeof answer.error === "object" && answer.error !== null ? (answer.error as { message?: unknown }).message : answer.error;
+        throw new Refusal(502, `the inviter refused: ${typeof why === "string" ? why.slice(0, 200) : `it answered ${up.status}`}`);
+      }
+      if (typeof answer.token !== "string" || typeof answer.name !== "string") throw new Refusal(502, "the inviter answered something that is not a join");
+      const name = as || answer.name;
+      if (!PEER_NAME.test(name)) throw new Refusal(502, `the inviter's name ${JSON.stringify(name)} cannot be a peer name here: join again with as`);
+      if (borrowing(name)) throw new Refusal(409, `the inviter added you, but you already borrow from a peer called ${name}: add peers.<another name> with url ${u} and token ${answer.token} by hand`);
+      // A peer this node only lends to keeps its entry and gains the url and token beside it.
+      const ops = name in cfg.peerTokens
+        ? [{ path: ["peers", name, "url"], value: u }, { path: ["peers", name, "token"], value: answer.token }]
+        : [{ path: ["peers", name], value: { url: u, token: answer.token } }];
+      try {
+        config.patch({ ops });
+      } catch (e) {
+        // The inviter already took us, so the token is all that is missing here: say where it goes.
+        throw new Refusal(500, `the inviter added you, but saving them here failed (${e instanceof Error ? e.message : String(e)}): add peers.${name} with url ${u} and token ${answer.token} by hand`);
+      }
+      log.info("peers.joined_as_borrower", { peer: name, url: u, caller: c.caller });
+      json(c.res, 200, { peer: name, url: u });
+    } catch (e) {
+      failConfig(c.res, e);
+    }
+  }
+
   // Ask a model to be resident without generating. Queued like any job, since loading one evicts
   // another; best-effort, and nothing reserves it.
   async function routeWarm(c: Call): Promise<void> {
@@ -2107,6 +2274,21 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       await chat(c, model, payload);
     } catch (e) {
       fail(c.res, e);
+    }
+  }
+
+  /** A Messages request served as a chat completion; everything written goes out in Messages shapes. */
+  async function routeMessages(c: Call): Promise<void> {
+    const out = new MessagesResponse(c.res);
+    const m: Call = { ...c, res: out as unknown as ServerResponse };
+    try {
+      const body = await readJson(c.req);
+      out.model = typeof body.model === "string" ? body.model : "";
+      admit(m, out.model);
+      refuseDegraded(out.model);
+      await chat(m, out.model, chatOf(body));
+    } catch (e) {
+      fail(m.res, e);
     }
   }
 
@@ -2733,6 +2915,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     others: othersView,
     ledger: ledgerView,
     lendDefaults: () => ({ tokensPerDay: cfg.lendTokensPerDay, maxConcurrent: cfg.peerMaxConcurrent, rateLimit: cfg.peerRateLimit }),
+    update: () => node.update,
   });
 
   /** Expired sessions, swept like any other in-memory state; unref'd so it never holds the process. */
@@ -2776,6 +2959,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   const node: HearthNode = {
     onRestart: null,
+    update: null,
     log,
     server,
     pool,

@@ -21,6 +21,8 @@ import { writeFileAtomic } from "./configfile.js";
 import { LEVELS, createLogger, type Level } from "./log.js";
 import { hashPassword } from "./login.js";
 import { migrateDoc, routedMarker, unguarded, v1Marker } from "./migrate.js";
+import { bugReport } from "./report.js";
+import { watchUpdates } from "./updates.js";
 import { createNode } from "./server.js";
 import { getJson } from "./upstream.js";
 import { parseDocument } from "yaml";
@@ -48,7 +50,9 @@ function starterConfig(backendUrl: string, found: boolean): string {
   return `# hearth: a queue in front of your inference server.
 #
 # Everything runs locally until you add a peer or a cloud backend AND a flow
-# sends something to it. Nothing leaves this machine by default.
+# sends something to it. No prompt leaves this machine by default; the one
+# outside request is a daily check with npm for a newer hearth, and
+# updateCheck: false turns that off.
 #
 # Every setting: https://github.com/Vcvzgbzz/hearth/blob/main/docs/configuration.md
 version: ${CONFIG_VERSION}
@@ -163,10 +167,18 @@ const USAGE = `usage: hearth [command] [--config path]
   init                         probe for a local inference server and write hearth.yaml
   set-operator <user> <pass>   set the console login
   migrate                      rewrite an older hearth.yaml in the current layout, keeping a backup
+  invite --url <url>           print a one-time code that lets another node borrow from this one;
+                               url is where they reach this node. Good for 10 minutes
+  join <code> [--as <name>]    redeem another node's invite: they lend to you, and are added as a
+                               peer named after their node, or as <name>
+  report                       write hearth-report-<date>.md for a bug report: version, the config
+                               with secrets out, and the running node's health, network and logs
 
   -c, --config <path>          the config file (default: ${DEFAULT_CONFIG})
       --check                  with serve: load the config, say whether it is valid, and exit
       --log <level>            debug, info, warn or error
+                               invite and join ask the running node, with HEARTH_KEY as its key
+                               when it sets apiKeys
   -v, --version
   -h, --help
 `;
@@ -180,6 +192,8 @@ async function main(): Promise<void> {
         config: { type: "string", short: "c" },
         check: { type: "boolean", default: false },
         log: { type: "string" },
+        url: { type: "string" },
+        as: { type: "string" },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -194,8 +208,9 @@ async function main(): Promise<void> {
     console.log(USAGE);
     return;
   }
+  const { name: pkg, version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
   if (values.version) {
-    console.log((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
+    console.log(version);
     return;
   }
 
@@ -215,6 +230,55 @@ async function main(): Promise<void> {
         ? `wrote ${configPath}, pointing at ${found}`
         : `wrote ${configPath}, but nothing answered on ${PROBE_PORTS.join(", ")}, so set backend.url yourself`,
     );
+    return;
+  }
+
+  if (command === "invite" || command === "join") {
+    if (command === "invite" && !values.url) {
+      console.error("usage: hearth invite --url http://<address they reach you at>:<port> [--config path]");
+      process.exit(1);
+    }
+    if (command === "join" && !positionals[1]) {
+      console.error("usage: hearth join <code> [--as <name>] [--config path]");
+      process.exit(1);
+    }
+    let cfg;
+    try {
+      cfg = loadConfig(configPath);
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    // The running node holds open invites and applies the peer it writes, so ask it rather than edit the file.
+    const host = cfg.listen.host === "0.0.0.0" || cfg.listen.host === "::" ? "127.0.0.1" : cfg.listen.host;
+    const at = `http://${host.includes(":") ? `[${host}]` : host}:${cfg.listen.port}`;
+    const key = process.env.HEARTH_KEY ?? "";
+    const body = command === "invite" ? { url: values.url } : { code: positionals[1], ...(values.as ? { as: values.as } : {}) };
+    let r: Response;
+    try {
+      r = await fetch(`${at}/peers/${command}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      console.error(`hearth is not answering at ${at}: start it with hearth serve first`);
+      process.exit(1);
+    }
+    const out = (await r.json().catch(() => ({}))) as { code?: string; expiresAt?: string; peer?: string; url?: string; error?: unknown };
+    if (!r.ok) {
+      const why = typeof out.error === "object" && out.error !== null ? (out.error as { message?: unknown }).message : out.error;
+      console.error(r.status === 401 ? "hearth wants a key here: set HEARTH_KEY to one of its apiKeys" : `refused: ${typeof why === "string" ? why : r.status}`);
+      process.exit(1);
+    }
+    if (command === "invite") {
+      console.log(out.code);
+      console.log(`\nsend this to the node that will borrow from you; it works once, until ${new Date(out.expiresAt ?? "").toLocaleTimeString()}.`);
+      console.log("they run: hearth join <code>. What they may run is what lending allows.");
+    } else {
+      console.log(`joined: ${out.peer} at ${out.url} is now a peer you can borrow from.`);
+      console.log(`map their models to yours under peers.${out.peer}.models to use them.`);
+    }
     return;
   }
 
@@ -292,8 +356,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "report") {
+    const file = `hearth-report-${new Date().toISOString().slice(0, 10)}.md`;
+    writeFileSync(file, await bugReport(configPath, version));
+    console.log(`wrote ${file}. Secrets from the config are replaced; read it before attaching it to an issue.`);
+    return;
+  }
+
   if (command !== "serve") {
-    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator | hearth migrate`);
+    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator | hearth migrate | hearth report`);
     process.exit(1);
   }
 
@@ -325,6 +396,7 @@ async function main(): Promise<void> {
   const log = node.log;
 
   node.start();
+  watchUpdates({ name: pkg, current: version, enabled: () => cfg.updateCheck, found: (latest) => { node.update = latest; }, log });
   node.server.listen(cfg.listen.port, cfg.listen.host, () => {
     log.info("listening", {
       name: cfg.name,

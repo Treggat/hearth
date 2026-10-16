@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 
 import { parseConfig } from "../src/config.js";
-import { addPlace, applyOps, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, movedBay, movedHardware, BAYS, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, callerChoices, paneChoices } from "../src/console/draft.js";
+import { addPlace, applyOps, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, movedBay, movedHardware, BAYS, tidied, arranged, TEMPLATES, restOf, withDo, withRest, type Doc, type Landing, type To, callerChoices, paneChoices, copiedRouter, restacked, unstacked, STACK } from "../src/console/draft.js";
 import type { UiData } from "../src/console/types.js";
 
 const doc = (): Doc => ({
@@ -396,6 +396,17 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual([movedBay(doc(), row, "b", 250, at), movedBay(doc(), row, "c", 0, at)], [doc(), doc()]);
   assert.deepEqual([ordered(last.layout as never, ["auto", "image"]), arranged(last), ordered(tidied(last).layout as never, row, BAYS)], [["image", "auto"], false, ["b", "default", "a"]]);
   assert.doesNotThrow(() => parseConfig(withRest(last, "asked")));
+
+  // A backend put at another place in its hardware keeps it in the layout, beside the bays' order, and through a tidy-up.
+  const stack = ["a", "b", "c"];
+  const up = restacked(last, stack, "c", 0);
+  assert.deepEqual(ordered(up.layout as never, stack, STACK), ["c", "a", "b"]);
+  assert.deepEqual(ordered(restacked(doc(), stack, "a", 9).layout as never, stack, STACK), ["b", "c", "a"]);
+  assert.deepEqual([ordered(up.layout as never, row, BAYS), arranged(up), ordered(tidied(up).layout as never, stack, STACK)], [["b", "default", "a"], false, ["c", "a", "b"]]);
+  // Put where it stands, or not one of them, nothing is written; forgotten, it stands after those placed.
+  assert.deepEqual([restacked(doc(), stack, "b", 1), restacked(doc(), stack, "z", 0), unstacked(doc(), "a")], [doc(), doc(), doc()]);
+  assert.deepEqual(ordered(unstacked(up, "c").layout as never, stack, STACK), ["a", "b", "c"]);
+  assert.doesNotThrow(() => parseConfig(withRest(up, "asked")));
 }
 
 // --- boxes that fit together ------------------------------------------------------------------------
@@ -437,6 +448,15 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.deepEqual([(edited.routers as Record<string, Doc>).direct!.flows, edited.flows, (edited.routers as Record<string, Doc>).other, edited.layout],
     [{ ...own, only: { inputs: ["auto"], steps: [{ to: "other" }] } }, full.flows, (full.routers as Doc).other, { ...(full.layout as object), "routing@direct/flow:only": { x: 9, y: 9 } }]);
   assert.doesNotThrow(() => parseConfig(edited));
+  // A router started from the rules shown has those rules and their places on the map, under its own name.
+  const copied = copiedRouter(view, { ...full, layout: { ...(full.layout as object), "routing@twin/flow:gone": { x: 7, y: 7 } } }, "twin");
+  assert.deepEqual([(copied.routers as Record<string, Doc>).twin, copied.layout],
+    [{ flows: own }, { ...(full.layout as object), "routing@twin/flow:only": { x: 3, y: 3 } }]);
+  const map = (d: Doc) => Object.fromEntries(Object.entries(d.layout as Doc).filter(([id]) => id.startsWith("routing/")));
+  assert.deepEqual(map(scoped(copied, "twin")), map(view));
+  const fromDefault = copiedRouter(scoped(full, null), full, "twin");
+  assert.deepEqual([(fromDefault.routers as Record<string, Doc>).twin, map(scoped(fromDefault, "twin"))], [{ flows: full.flows }, { "routing/flow:pick": { x: 2, y: 2 } }]);
+  assert.doesNotThrow(() => parseConfig(copied));
   // Everyone not named is a caller of its own; the rest go where it does unless they are sent somewhere else.
   assert.deepEqual(callersIn(full), ["*", "local", "app"]);
   assert.deepEqual([routerFor(full, "local"), routerFor(full, "app"), usersOf(full, "direct"), usersOf(full, null)], [{ router: "direct", own: true }, { router: null, own: false }, ["local"], ["*", "app"]]);

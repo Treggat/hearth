@@ -4,6 +4,7 @@
 [![CI](https://github.com/Vcvzgbzz/hearth/actions/workflows/test.yml/badge.svg)](https://github.com/Vcvzgbzz/hearth/actions/workflows/test.yml)
 [![Node](https://img.shields.io/node/v/@vcvzgbzz/hearth)](package.json)
 [![License: MIT](https://img.shields.io/github/license/Vcvzgbzz/hearth)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/xH4p2FTpqn)
 
 A queue in front of your local inference server, and optionally a way to lend
 the spare capacity to someone you trust.
@@ -38,7 +39,8 @@ cap, and a preference for whatever model is already loaded.
 
 **Speaks OpenAI.** `/v1/chat/completions` and `/v1/models`, streaming included.
 Bodies pass through byte-for-byte, so tool calls, vision parts and whatever gets
-invented next month keep working.
+invented next month keep working. `/v1/messages` answers Messages API clients,
+such as Claude Code, from the same models.
 
 **Federates, if you want it to.** Point a model at a peer and those requests run
 on their machine. They never take a local slot, because they never touch the
@@ -119,7 +121,9 @@ Better to know this before you deploy it than after.
 
 The defaults assume a private network. hearth binds to `127.0.0.1`; with no
 `apiKeys`, loopback is the only thing trusted; lending is opt-in per model; and
-nothing leaves the machine unless your config names a peer or a cloud backend.
+no prompt leaves the machine unless your config names a peer or a cloud backend.
+The one request hearth makes on its own is a daily check with npm for a newer
+version, which `updateCheck: false` turns off.
 Do not put a reverse proxy in front of it. [Security](docs/security.md) has the
 whole of it, and is worth reading before you widen `listen`. Found a
 vulnerability? Report it privately: see [`SECURITY.md`](SECURITY.md).
@@ -134,7 +138,8 @@ npm run build
 ```
 
 [Development](docs/development.md) covers embedding it and how the tests are
-laid out. To contribute, start with [`CONTRIBUTING.md`](CONTRIBUTING.md);
+laid out. Questions, setups and release news are on [Discord](https://discord.gg/xH4p2FTpqn).
+To contribute, start with [`CONTRIBUTING.md`](CONTRIBUTING.md);
 [`AGENTS.md`](AGENTS.md) has the full rules for commits, comments and pull
 requests, for people and AI agents alike.
 
