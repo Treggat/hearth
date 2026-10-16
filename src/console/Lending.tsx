@@ -1,5 +1,5 @@
 /** The Lending page: what peers may take, each one's own limits, and what was lent and borrowed. */
-import { ChevronRight, Plus, Undo2, X } from "lucide-react";
+import { ChevronRight, Pencil, Plus, Trash2, Undo2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { Menu } from "./editor.js";
@@ -16,15 +16,22 @@ type Detail = Row & { byModel: { lent: Record<string, Used>; borrowed: Record<st
 
 const tokens = (u: Used): number => u.in + u.out;
 
-/** Write one setting into hearth.yaml, or with no value take it out; it applies at once. */
-async function save(path: Path, value: unknown, done: string): Promise<void> {
+/** Apply edits to hearth.yaml at once; true when they were written. */
+async function edit(ops: Record<string, unknown>[], done: string): Promise<boolean> {
   try {
-    await request("PATCH", "/config", { ops: [value === undefined ? { path, delete: true } : { path, value }] });
+    await request("PATCH", "/config", { ops });
     toast("ok", done);
     await refresh();
+    return true;
   } catch (e) {
     toast("bad", e instanceof Error ? e.message : String(e));
+    return false;
   }
+}
+
+/** Write one setting into hearth.yaml, or with no value take it out; it applies at once. */
+async function save(path: Path, value: unknown, done: string): Promise<void> {
+  await edit([value === undefined ? { path, delete: true } : { path, value }], done);
 }
 
 /** A /control change, shown at once. */
@@ -212,6 +219,59 @@ function PeerDetail({ peer }: { peer: string }) {
   );
 }
 
+/** A new name for a peer. Only this node uses it; the peer is told nothing. */
+function Rename({ peer, taken, onClose, onDone }: { peer: string; taken: string[]; onClose: () => void; onDone: (to: string) => void }) {
+  const [to, setTo] = useState(peer);
+  const [busy, setBusy] = useState(false);
+  const name = to.trim();
+  const problem = name === "" ? "needs a name" : name !== peer && taken.includes(name) ? `a peer named ${name} already exists` : null;
+  const go = async () => {
+    if (problem) return;
+    if (name === peer) return onClose();
+    setBusy(true);
+    const ok = await edit([{ path: ["peers", peer], rename: name }], `${peer} is now ${name}`);
+    setBusy(false);
+    if (ok) onDone(name);
+  };
+  return (
+    <Dialog title={`Rename ${peer}`} size="sm" onClose={onClose}>
+      <form className="flex flex-col gap-2 p-4" onSubmit={(e) => { e.preventDefault(); void go(); }}>
+        <input autoFocus aria-label="new name" value={to} onChange={(e) => setTo(e.target.value)} onFocus={(e) => e.currentTarget.select()}
+               className={cx("h-8 rounded-md border bg-bg px-2 focus-visible:outline-2 focus-visible:outline-accent", mono, problem ? "border-bad" : "border-line")} />
+        <p className="text-[12px] text-dim">The name is this node's own; the peer is not told. A rule that names it has to be changed with it, or the rename is refused.</p>
+        {problem && <p className="text-[12px] text-bad">{problem}</p>}
+      </form>
+      <div className="flex justify-end gap-2 border-t border-line px-4 py-3">
+        <Button onClick={onClose}>cancel</Button>
+        <Button tone="primary" disabled={busy || problem !== null} onClick={() => void go()}>rename</Button>
+      </div>
+    </Dialog>
+  );
+}
+
+/** Take a peer out of hearth.yaml, with its address, tokens and limits. */
+function Remove({ peer, onClose, onDone }: { peer: string; onClose: () => void; onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const go = async () => {
+    setBusy(true);
+    const ok = await edit([{ path: ["peers", peer], delete: true }], `removed ${peer}`);
+    setBusy(false);
+    if (ok) onDone();
+  };
+  return (
+    <Dialog title={`Remove ${peer}?`} size="sm" onClose={onClose}>
+      <p className="p-4 text-[12px] text-dim">
+        Its entry leaves hearth.yaml: its address, both tokens and its limits. It can no longer borrow here and you can no longer borrow there.
+        A rule that names it has to go first, or the removal is refused. Adding it back takes a new invite or its tokens again.
+      </p>
+      <div className="flex justify-end gap-2 border-t border-line px-4 py-3">
+        <Button onClick={onClose}>cancel</Button>
+        <Button tone="primary" disabled={busy} onClick={() => void go()}>remove</Button>
+      </div>
+    </Dialog>
+  );
+}
+
 const ADDRESS_KEY = "hearth.inviteUrl";
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -316,6 +376,7 @@ export function Lending() {
   const defaults = d.lendDefaults ?? { tokensPerDay: 0, maxConcurrent: 2, rateLimit: 600 };
   const [open, setOpen] = useState<string | null>(null);
   const [pairing, setPairing] = useState<"invite" | "join" | null>(null);
+  const [changing, setChanging] = useState<{ peer: string; how: "rename" | "remove" } | null>(null);
   // A provider's model spends its key, and a name a flow takes is a rule a peer's work never goes through: neither is offered.
   const self = d.net.nodes.find((n) => n.self)!;
   const hosted = new Set((self.backends ?? []).filter((b) => b.cloud).flatMap((b) => b.serves ?? []));
@@ -386,6 +447,12 @@ export function Lending() {
                               className="inline-flex items-center gap-1 font-semibold hover:underline focus-visible:outline-2 focus-visible:outline-accent">
                         <ChevronRight size={14} className={cx("text-dim transition-transform", open === r.peer && "rotate-90")} />{r.peer}
                       </button>
+                      <span className="ml-2 inline-flex items-center gap-1 align-middle">
+                        <button type="button" aria-label={`rename ${r.peer}`} title="rename this peer" onClick={() => setChanging({ peer: r.peer, how: "rename" })}
+                                className="inline-flex size-6 items-center justify-center rounded-md text-dim hover:text-fg focus-visible:outline-2 focus-visible:outline-accent"><Pencil size={13} /></button>
+                        <button type="button" aria-label={`remove ${r.peer}`} title="remove this peer" onClick={() => setChanging({ peer: r.peer, how: "remove" })}
+                                className="inline-flex size-6 items-center justify-center rounded-md text-dim hover:text-bad focus-visible:outline-2 focus-visible:outline-accent"><Trash2 size={13} /></button>
+                      </span>
                     </td>
                     {t === undefined ? <td colSpan={6} className="px-2 py-3 text-dim">cannot borrow: it has no <span className={mono}>accept</span> token</td> : (
                       <>
@@ -438,6 +505,14 @@ export function Lending() {
       {open !== null && <PeerDetail peer={open} />}
       {pairing === "invite" && <Invite onClose={() => setPairing(null)} />}
       {pairing === "join" && <Join onClose={() => setPairing(null)} />}
+      {changing?.how === "rename" && (
+        <Rename peer={changing.peer} taken={rows.map((r) => r.peer)} onClose={() => setChanging(null)}
+                onDone={(to) => { if (open === changing.peer) setOpen(to); setChanging(null); }} />
+      )}
+      {changing?.how === "remove" && (
+        <Remove peer={changing.peer} onClose={() => setChanging(null)}
+                onDone={() => { if (open === changing.peer) setOpen(null); setChanging(null); }} />
+      )}
       <Menu />
     </div>
   );
