@@ -49,7 +49,21 @@ export interface PeerCapacity {
      *  or one that predates this field — both mean "no claim", never "no
      *  limit". See unfit(). */
     stats?: ModelStats;
+    /** What they hold us to on that model, and how much of today we have used. Absent from a peer that predates it. */
+    terms?: LentTerms;
   }>;
+}
+
+/** One model's limits as the lender states them to the borrower; 0 tokens a day is no limit. */
+export interface LentTerms { tokensPerDay: number; maxConcurrent: number; rateLimit: number; usedToday: number }
+
+/** Their terms if every field is a sane number, else none: half a claim would be shown as if it were whole. */
+function cleanTerms(v: unknown): LentTerms | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const r = v as Record<string, unknown>;
+  const keys = ["tokensPerDay", "maxConcurrent", "rateLimit", "usedToday"] as const;
+  if (!keys.every((k) => typeof r[k] === "number" && Number.isFinite(r[k]) && (r[k] as number) >= 0)) return undefined;
+  return Object.fromEntries(keys.map((k) => [k, r[k]])) as unknown as LentTerms;
 }
 
 /** What routing needs to score one model. Per-model where the peer offers it,
@@ -272,7 +286,10 @@ export class PeerRegistry {
         // arriving as a string would be compared against a number and silently
         // decide where somebody's prompt runs.
         for (const entry of Object.values(cap.models)) {
-          if (entry && typeof entry === "object") entry.stats = cleanStats(entry.stats);
+          if (entry && typeof entry === "object") {
+            entry.stats = cleanStats(entry.stats);
+            entry.terms = cleanTerms(entry.terms);
+          }
         }
       }
 

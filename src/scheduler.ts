@@ -73,6 +73,8 @@ export interface JobSpec {
   id?: string;
   /** Reject once this caller has this many queued-or-running in the lane. */
   maxPerCaller?: number;
+  /** Count only this caller's jobs of the same model against maxPerCaller. */
+  capModel?: boolean;
   /** Context this job holds while it runs, counted against the model's pool. */
   tokens?: number;
   /** No slot needed, this one runs off-box. */
@@ -247,12 +249,13 @@ export class Scheduler {
     return ahead;
   }
 
-  /** Queued-or-running for one caller in one lane, counting off-box. */
-  countFor(caller: string, lane: string): number {
+  /** Queued-or-running for one caller in one lane, counting off-box; with a model, only its jobs. */
+  countFor(caller: string, lane: string, model?: string): number {
+    const mine = (j: { caller: string; lane: string; model: string }) => j.caller === caller && j.lane === lane && (model === undefined || j.model === model);
     let n = 0;
-    for (const j of this.queued) if (j.caller === caller && j.lane === lane) n++;
-    for (const j of this.running) if (j.caller === caller && j.lane === lane) n++;
-    for (const j of this.offbox) if (j.caller === caller && j.lane === lane) n++;
+    for (const j of this.queued) if (mine(j)) n++;
+    for (const j of this.running) if (mine(j)) n++;
+    for (const j of this.offbox) if (mine(j)) n++;
     return n;
   }
 
@@ -663,7 +666,7 @@ export class Scheduler {
       // see it. Any check the caller did earlier is just a fast path.
       if (
         spec.maxPerCaller != null &&
-        this.countFor(job.caller, job.lane) >= spec.maxPerCaller
+        this.countFor(job.caller, job.lane, spec.capModel ? job.model : undefined) >= spec.maxPerCaller
       ) {
         job.detach?.();
         reject(new QueueFullError("caller_cap", job.lane));

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ConfigError, loadConfig, parseConfig } from "../src/config.js";
-import { closedWhy, termsFor } from "../src/lending.js";
+import { closedWhy, limitsFor, spentWhy, termsFor } from "../src/lending.js";
 import { silentLogger } from "../src/log.js";
 import { createNode } from "../src/server.js";
 
@@ -26,7 +26,7 @@ const ran = (tokens: number) => ({ requests: 1, failed: 0, in: tokens, out: 0 })
     backends: { card: { url: "http://127.0.0.1:1", kind: "none", serves: ["big", "small"] } },
     lending: { models: ["small"], tokensPerDay: 100 },
     peers: {
-      close: { accept: "a", lend: { models: ["big", "small"], tokensPerDay: 0, maxConcurrent: 4 } },
+      close: { accept: "a", lend: { models: ["big", "small"], tokensPerDay: 0, maxConcurrent: 4, limits: { big: { tokensPerDay: 10, rateLimit: 5 } } } },
       other: { accept: "b" },
     },
   });
@@ -35,12 +35,16 @@ const ran = (tokens: number) => ({ requests: 1, failed: 0, in: tokens, out: 0 })
   assert.equal(close.tokensPerDay, 0, "and its own limit, even where that is none");
   assert.equal(close.maxConcurrent, 4);
   assert.equal(close.rateLimit, 600, "what it does not restate stays the node's");
-  assert.match(closedWhy({ ...close, off: true }, ran(0))!, /lending to this peer is off/);
+  assert.match(closedWhy({ ...close, off: true })!, /lending to this peer is off/);
+  assert.equal(closedWhy(close), null);
+  assert.deepEqual(limitsFor(close, "big"), { tokensPerDay: 10, maxConcurrent: 4, rateLimit: 5 }, "a model's own limits lie over the peer's");
+  assert.deepEqual(limitsFor(close, "small"), { tokensPerDay: 0, maxConcurrent: 4, rateLimit: 600 }, "and a model without any has the peer's");
   const other = termsFor(cfg, "other");
   assert.deepEqual(other.models, ["small"], "a peer with no limits of its own gets the node's");
-  assert.equal(closedWhy(other, ran(99)), null);
-  assert.match(closedWhy(other, ran(100))!, /today's 100 tokens are used/);
-  assert.equal(closedWhy(close, ran(1_000_000)), null, "no limit is no limit");
+  assert.equal(spentWhy("small", limitsFor(other, "small"), ran(99)), null);
+  assert.match(spentWhy("small", limitsFor(other, "small"), ran(100))!, /today's 100 tokens of small are used/);
+  assert.equal(spentWhy("small", limitsFor(other, "small"), undefined), null, "a model not run today has its whole day");
+  assert.equal(spentWhy("small", limitsFor(close, "small"), ran(1_000_000)), null, "no limit is no limit");
 }
 
 {
@@ -53,6 +57,8 @@ const ran = (tokens: number) => ({ requests: 1, failed: 0, in: tokens, out: 0 })
   assert.throws(bad({ p: { accept: "a", lend: { models: ["theirs"] } } }), (e: unknown) => e instanceof ConfigError && /peers\.p\.lend\.models/.test(e.message) && /cloud/.test(e.message),
     "a provider's model is no more lendable to one peer than to all");
   assert.throws(bad({}, { tokensPerDay: -1 }), /lending\.tokensPerDay must be a whole number >= 0/);
+  assert.throws(bad({ p: { accept: "a", lend: { limits: { m: { tokenPerDay: 5 } } } } }), /peers\.p\.lend\.limits\.m\.tokenPerDay .*did you mean tokensPerDay/);
+  assert.throws(bad({ p: { accept: "a", lend: { limits: { m: { models: ["m"] } } } } }), /peers\.p\.lend\.limits\.m\.models is not a setting/, "a model's limits do not name models");
 }
 
 /* ------------------------------------------------- and from the peer's side, over HTTP */
@@ -77,7 +83,7 @@ const friend = createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
   if (req.url === "/peer/hello") return void res.end(JSON.stringify({ name: "close", protocol: 2, models: ["theirs"], lanes: ["chat"] }));
   if (req.url === "/peer/state") {
-    return void res.end(JSON.stringify({ free: 1, slots: 1, queued: {}, resident: null, loaded: [], serves: ["theirs"], models: { theirs: { free: 1, slots: 1, queued: 0, warm: true } } }));
+    return void res.end(JSON.stringify({ free: 1, slots: 1, queued: {}, resident: null, loaded: [], serves: ["theirs"], models: { theirs: { free: 1, slots: 1, queued: 0, warm: true, terms: { tokensPerDay: 5000, maxConcurrent: 1, rateLimit: 30, usedToday: 40 } } } }));
   }
   res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "theirs" } }], usage: { prompt_tokens: 30, completion_tokens: 10 } }));
 });
@@ -90,9 +96,10 @@ const node = createNode(parseConfig({
   peers: {
     close: { url: at(friend), token: "t", accept: "close-token", models: { away: "theirs" }, lend: { models: ["big", "small"] } },
     capped: { accept: "capped-token", lend: { tokensPerDay: 50 } },
+    split: { accept: "split-token", lend: { models: ["big", "small"], limits: { small: { tokensPerDay: 50, rateLimit: 1 } } } },
     shut: { accept: "shut-token", lend: { off: true } },
     brisk: { accept: "brisk-token", lend: { rateLimit: 1 } },
-    single: { accept: "single-token", lend: { maxConcurrent: 1 } },
+    single: { accept: "single-token", lend: { models: ["big", "small"], maxConcurrent: 1 } },
   },
   flows: { away: { inputs: ["away"], steps: [{ to: { peer: "close" } }, { to: { refuse: "not run here" } }] } },
 }), silentLogger);
@@ -103,7 +110,7 @@ const as = (token: string) => ({ Authorization: `Bearer ${token}`, "Content-Type
 const chat = (token: string, model: string) =>
   fetch(`${url}/v1/chat/completions`, { method: "POST", headers: as(token), body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }) });
 const serves = async (token: string): Promise<string[]> => ((await (await fetch(`${url}/peer/state`, { headers: as(token) })).json()) as { serves: string[] }).serves;
-type Ledger = { peers: { peer: string; byModel: { lent: Record<string, { requests: number }> }; byDay: { lent: Record<string, number>; borrowed: Record<string, number> }; closed?: string | null; lent: { month: { in: number; out: number } }; borrowed: { month: { in: number; out: number } } }[] };
+type Ledger = { peers: { peer: string; lentToday?: Record<string, number>; received?: Record<string, { theirs: string; terms?: Record<string, number> }>; byModel: { lent: Record<string, { requests: number }> }; byDay: { lent: Record<string, number>; borrowed: Record<string, number> }; closed?: string | null; lent: { month: { in: number; out: number } }; borrowed: { month: { in: number; out: number } } }[] };
 const ledger = async (peer: string) => ((await (await fetch(`${url}/lending`)).json()) as Ledger).peers.find((p) => p.peer === peer)!;
 
 try {
@@ -121,7 +128,18 @@ try {
   assert.equal((await chat("capped-token", "small")).status, 200);
   assert.equal((await chat("capped-token", "small")).status, 429, "the day's tokens are spent");
   assert.deepEqual(await serves("capped-token"), [], "and it is shown nothing until tomorrow");
-  assert.match((await ledger("capped")).closed!, /today's 50 tokens are used/);
+  assert.match(await (await chat("capped-token", "small")).text(), /not lending you small right now: today's 50 tokens of small are used/, "said in its own words");
+  assert.equal((await ledger("capped")).closed, null, "a spent model closes only that model");
+
+  // Each model on its own: a spent day or hour on one leaves the other lent.
+  assert.equal((await chat("split-token", "small")).status, 200);
+  assert.equal((await chat("split-token", "small")).status, 429, "small's day and hour are spent");
+  assert.deepEqual(await serves("split-token"), ["big"], "and only small leaves what it is shown");
+  assert.equal((await chat("split-token", "big")).status, 200, "big has its own day and hour");
+  assert.equal((await chat("split-token", "big")).status, 200);
+  assert.deepEqual((await ledger("split")).lentToday, { small: 60, big: 120 });
+  const told = (await (await fetch(`${url}/peer/state`, { headers: as("split-token") })).json()) as { models: Record<string, { terms: Record<string, number> }> };
+  assert.deepEqual(told.models.big!.terms, { tokensPerDay: 0, maxConcurrent: 2, rateLimit: 600, usedToday: 120 }, "the borrower is told what it is held to on each model");
 
   // How often: a peer's own requests an hour, where the node's 600 would have let the second through.
   assert.equal((await chat("brisk-token", "small")).status, 200);
@@ -134,9 +152,12 @@ try {
   await new Promise((r) => setTimeout(r, 100));
   // Raced with a clock: a second job let in would wait on the answer kept back, and never be refused.
   const second = await Promise.race([chat("single-token", "small").then((r) => r.status), new Promise<number>((r) => setTimeout(() => r(0), 3000))]);
+  // Another model has its own one job: let in, it waits on the same answer, so it is read once released.
+  const other = chat("single-token", "big");
+  await new Promise((r) => setTimeout(r, 100));
   held = null;
   release();
-  assert.deepEqual([(await first).status, second], [200, 429], "its one job is taken");
+  assert.deepEqual([(await first).status, second, (await other).status], [200, 429, 200], "its one job of small is taken, and big's is not");
 
   // What was lent and what was borrowed are counted apart, per peer.
   assert.equal((await chat("close-token", "big")).status, 200);
@@ -145,6 +166,7 @@ try {
   const row = await ledger("close");
   assert.deepEqual([row.lent.month.in + row.lent.month.out, row.borrowed.month.in + row.borrowed.month.out, row.closed], [60, 40, null]);
   assert.equal(row.byModel.lent.big?.requests, 1, "by model");
+  assert.deepEqual(row.received, { away: { theirs: "theirs", terms: { tokensPerDay: 5000, maxConcurrent: 1, rateLimit: 30, usedToday: 40 } } }, "and what the peer holds this node to, under this node's own id");
   assert.deepEqual([Object.values(row.byDay.lent), Object.values(row.byDay.borrowed)], [[60], [40]], "and by day");
   assert.equal((await fetch(`${url}/ui/lending`)).status, 200, "the page reads the same from its own route");
 

@@ -247,6 +247,6 @@ without probing for it.
   who can thrash your GPU from across the tailnet.
 
 It is also gated by `lending.models` — the same opt-in as chat, so a warm cannot
-reach a model you did not lend — and counts against `lending.rateLimit`. A peer's warm is
+reach a model you did not lend — and counts against that model's `lending.rateLimit`. A peer's warm is
 never routed onward: two nodes that each preferred the other would otherwise
 bounce one between them.

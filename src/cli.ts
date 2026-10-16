@@ -116,7 +116,7 @@ apiKeys: []
 # lowest-priority lane and is capped, so a guest can't queue ahead of you.
 lending:
   models: []
-#   tokensPerDay: 500000   # per peer, in a UTC day
+#   tokensPerDay: 500000   # per peer and model, in a UTC day
 #
 # One entry per friend. url + token to borrow from them, accept to lend to
 # them, or both. Generate a token with

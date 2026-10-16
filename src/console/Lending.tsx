@@ -6,7 +6,7 @@ import { Menu } from "./editor.js";
 import { choose } from "./editStore.js";
 import { short } from "./pages.js";
 import { control, refresh, request, toast, useStore } from "./store.js";
-import type { LendTerms, UiData, Used } from "./types.js";
+import type { LendTerms, ModelLimits, UiData, Used } from "./types.js";
 import { Button, Card, cx, Dialog, mono, Pill, Switch } from "./ui.js";
 
 type Row = NonNullable<UiData["ledger"]>[number];
@@ -85,11 +85,11 @@ function Models({ all, lent, who, onToggle, disabled }: { all: string[]; lent: r
   );
 }
 
-/** Takes one of a peer's own limits out of the file, so the node's holds it again. */
-function Back({ peer, what, path }: { peer: string; what: string; path: Path }) {
+/** Takes one of a peer's own limits out of the file, so the one it lies over holds again. */
+function Back({ peer, what, path, to = "the limit for every peer" }: { peer: string; what: string; path: Path; to?: string }) {
   return (
-    <button type="button" aria-label={`${peer}: ${what} back to the limit for every peer`} title="back to the limit for every peer"
-            onClick={() => void save(path, undefined, `${peer}: ${what} as for every peer`)}
+    <button type="button" aria-label={`${peer}: ${what} back to ${to}`} title={`back to ${to}`}
+            onClick={() => void save(path, undefined, `${peer}: ${what} back to ${to}`)}
             className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-dim hover:text-fg focus-visible:outline-2 focus-visible:outline-accent"><Undo2 size={13} /></button>
   );
 }
@@ -155,57 +155,163 @@ function Machine({ peer }: { peer: string }) {
   );
 }
 
-/** One peer's use by model each way, and by day. */
-function PeerDetail({ peer }: { peer: string }) {
+/** A model's limits under a peer's terms: the peer's three, with that model's own laid over them. */
+const limitsOf = (t: LendTerms, model: string): ModelLimits => ({ tokensPerDay: t.tokensPerDay, maxConcurrent: t.maxConcurrent, rateLimit: t.rateLimit, ...t.limits?.[model] });
+
+/** Tokens used today against a day's limit, with a bar when there is one. */
+function Today({ used, limit }: { used: number; limit: number }) {
+  return (
+    <div className="tabular">
+      {short(used)} <span className="text-dim">{limit > 0 ? `of ${short(limit)}` : "· no limit"}</span>
+      {limit > 0 && (
+        <div aria-hidden className="mt-1.5 h-1 w-24 rounded-full bg-muted">
+          <div className={cx("h-1 rounded-full", used >= limit ? "bg-warn" : "bg-accent")} style={{ width: `${Math.min(100, (used / limit) * 100)}%` }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+const sub = "text-[11px] font-medium uppercase tracking-wide text-dim";
+const th = "px-2 py-1.5 font-medium";
+
+/** Tokens over the days kept, or a dash for a model not run. */
+function Month({ u }: { u: Used | undefined }) {
+  if (!u) return <span className="text-dim">—</span>;
+  return <span title={`${u.requests} requests`}>{short(tokens(u))}{u.failed > 0 && <span className="text-bad"> · {u.failed} failed</span>}</span>;
+}
+
+/** What this node lends a peer, model by model, each with its own limits. */
+function Lent({ peer, t, own, today, month, days, lendable }: { peer: string; t: LendTerms; own: string[]; today: Record<string, number>; month: Record<string, Used>; days: number; lendable: string[] }) {
+  const at = (...k: string[]): Path => ["peers", peer, "lend", ...k];
+  const rest = lendable.filter((m) => !t.models.includes(m));
+  // Taking a model back takes its own limits with it, so none are left over for a model not lent.
+  const stop = (m: string) => void edit([
+    { path: at("models"), value: t.models.filter((x) => x !== m) },
+    ...(t.limits?.[m] ? [{ path: Object.keys(t.limits).length > 1 ? at("limits", m) : at("limits"), delete: true }] : []),
+  ], `holding ${m} from ${peer}`);
+  const cell = (m: string, key: keyof ModelLimits, label: string, min: number, width: string) => {
+    const mine = t.limits?.[m]?.[key] !== undefined;
+    // The last of a model's own limits takes its entry with it, and the last entry the whole map, so none is left empty.
+    const ownKeys = Object.keys(t.limits?.[m] ?? {}).length;
+    const back = ownKeys > 1 ? at("limits", m, key) : Object.keys(t.limits ?? {}).length > 1 ? at("limits", m) : at("limits");
+    return (
+      <td className="px-2 py-2"><div className="flex items-center gap-1">
+        <Num label={`${peer}, ${m}: ${label}`} min={min} none={key === "tokensPerDay" ? "no limit" : undefined} disabled={t.off} value={limitsOf(t, m)[key]}
+             className={cx(width, !mine && "text-dim")} title={mine ? undefined : "this peer's limit"} onSave={(n) => void save(at("limits", m, key), n, "saved")} />
+        {mine && <Back peer={peer} what={`${m} ${label}`} path={back} to="this peer's limit" />}
+      </div></td>
+    );
+  };
+  return (
+    <div>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={sub}>lent</span>
+        {own.includes("models") ? <Back peer={peer} what="models" path={at("models")} /> : <span className="text-[12px] text-dim">the list for every peer</span>}
+        {rest.length > 0 && (
+          <button type="button" disabled={t.off} aria-label={`${peer}: lend another model`}
+                  onClick={(e) => choose(e, rest.map((m) => ({ label: m, value: m, mono: true })), (m) => void save(at("models"), [...t.models, m], `lending ${m} to ${peer}`))}
+                  className="ml-auto inline-flex h-7 items-center gap-1 rounded-md border border-dashed border-line px-2 text-[12px] text-dim hover:text-fg focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50"><Plus size={13} />lend a model</button>
+        )}
+      </div>
+      {t.models.length === 0 ? <p className="mt-2 text-dim">Nothing is lent to {peer}.</p> : (
+        <div className="overflow-x-auto"><table className={cx("mt-1 w-full min-w-[640px] text-left", t.off && "opacity-60")}>
+          <thead className="text-[11px] text-dim">
+            <tr><th className="py-1.5 font-medium">model</th><th className={th}>tokens a day</th><th className={th}>jobs at once</th><th className={th}>req / hour</th><th className={th}>used today</th><th className={cx(th, "text-right")}>{days} days</th><th /></tr>
+          </thead>
+          <tbody>
+            {t.models.map((m) => (
+              <tr key={m} className="border-t border-line/60 align-top">
+                <td className={cx("py-2 pr-2", mono)}>{m}</td>
+                {cell(m, "tokensPerDay", "tokens a day", 0, "w-28")}
+                {cell(m, "maxConcurrent", "jobs at once", 1, "w-14")}
+                {cell(m, "rateLimit", "requests an hour", 1, "w-20")}
+                <td className="px-2 py-2"><Today used={today[m] ?? 0} limit={limitsOf(t, m).tokensPerDay} /></td>
+                <td className="tabular px-2 py-2 text-right"><Month u={month[m]} /></td>
+                <td className="py-2 pl-1 text-right">
+                  <button type="button" disabled={t.off} aria-label={`${peer}: stop lending ${m}`} title="stop lending it" onClick={() => stop(m)}
+                          className="inline-flex size-6 items-center justify-center rounded-md text-dim hover:text-bad focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50"><X size={13} /></button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      )}
+    </div>
+  );
+}
+
+/** What this node borrows from a peer, model by model, with the limits that peer holds it to. */
+function Received({ peer, received, month, days }: { peer: string; received: NonNullable<Row["received"]>; month: Record<string, Used>; days: number }) {
+  const models = Object.entries(received);
+  const n = (v: number, none?: string) => (v === 0 && none ? <span className="text-dim">{none}</span> : v.toLocaleString("en-US"));
+  return (
+    <div>
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span className={sub}>received</span>
+        <span className="text-[12px] text-dim">the limits {peer} holds this node to, as of its last reading</span>
+      </div>
+      {models.length === 0 ? <p className="mt-2 text-dim">Nothing is borrowed from {peer}: map a model under its <span className={mono}>models</span> in Config.</p> : (
+        <div className="overflow-x-auto"><table className="mt-1 w-full min-w-[640px] text-left">
+          <thead className="text-[11px] text-dim">
+            <tr><th className="py-1.5 font-medium">model</th><th className={th}>tokens a day</th><th className={th}>jobs at once</th><th className={th}>req / hour</th><th className={th}>used today</th><th className={cx(th, "text-right")}>{days} days</th></tr>
+          </thead>
+          <tbody>
+            {models.map(([m, { theirs, terms }]) => (
+              <tr key={m} className="border-t border-line/60 align-top">
+                <td className={cx("py-2 pr-2", mono)}>{m}{theirs !== m && <span className="text-dim"> → {theirs}</span>}</td>
+                {terms ? (
+                  <>
+                    <td className="tabular px-2 py-2">{n(terms.tokensPerDay, "no limit")}</td>
+                    <td className="tabular px-2 py-2">{n(terms.maxConcurrent)}</td>
+                    <td className="tabular px-2 py-2">{n(terms.rateLimit)}</td>
+                    <td className="px-2 py-2"><Today used={terms.usedToday} limit={terms.tokensPerDay} /></td>
+                  </>
+                ) : <td colSpan={4} className="px-2 py-2 text-dim">not stated: {peer} is not lending it now, has not been reached, or runs a hearth that does not say</td>}
+                <td className="tabular px-2 py-2 text-right"><Month u={month[m]} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      )}
+    </div>
+  );
+}
+
+/** One peer, opened: each model lent and received with its limits, and its use by day. */
+function PeerDetail({ peer, lendable }: { peer: string; lendable: string[] }) {
   const [got, setGot] = useState<{ days: number; row: Detail } | null>(null);
   const box = useRef<HTMLDivElement>(null);
   const shown = got?.row.peer;
   // It opens under the table, which can be below what is on screen.
   useEffect(() => { if (shown) box.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }); }, [shown]);
-  // Asked again as the totals move, so the breakdown never trails the row above it.
-  const moved = useStore((s) => { const r = (s.data!.ledger ?? []).find((l) => l.peer === peer); return r ? r.lent.month.requests + r.borrowed.month.requests : 0; });
+  // The limits come from the page's own stream, so an edit shows at once; the history is asked again as the totals move.
+  const live = useStore((s) => (s.data!.ledger ?? []).find((l) => l.peer === peer));
+  const moved = live ? live.lent.month.requests + live.borrowed.month.requests : 0;
   useEffect(() => {
-    let live = true;
+    let on = true;
     void fetch("/ui/lending", { cache: "no-store" }).then((r) => r.json()).then((d: { days: number; peers: Detail[] }) => {
       const row = d.peers.find((p) => p.peer === peer);
-      if (live && row) setGot({ days: d.days, row });
+      if (on && row) setGot({ days: d.days, row });
     }).catch(() => {});
-    return () => { live = false; };
+    return () => { on = false; };
   }, [peer, moved]);
-  if (!got) return null;
+  if (!got || !live) return null;
   const { row, days } = got;
-  const lines = [
-    ...Object.entries(row.byModel.lent).map(([model, u]) => ({ model, way: "lent", u })),
-    ...Object.entries(row.byModel.borrowed).map(([model, u]) => ({ model, way: "borrowed", u })),
-  ];
   return (
     <div ref={box} className="pb-2"><Card className="mt-4 p-4">
       <div className="flex flex-wrap items-baseline gap-3">
         <h2 className="text-base font-semibold">{peer}</h2>
         <span className="text-dim">ran {short(tokens(row.lent.month))} tokens here in {days} days; you ran {short(tokens(row.borrowed.month))} there</span>
       </div>
-      <div className="mt-4 flex flex-wrap gap-8">
-        <div className="min-w-0 flex-[1_1_340px]">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-dim">by model</div>
-          {lines.length === 0 ? <p className="mt-2 text-dim">Nothing lent or borrowed yet.</p> : (
-            <table className="mt-1 w-full text-left">
-              <thead className="text-[11px] text-dim">
-                <tr><th className="py-1.5 font-medium">model</th><th className="px-2 py-1.5 font-medium">direction</th><th className="px-2 py-1.5 text-right font-medium">requests</th><th className="py-1.5 text-right font-medium">tokens</th></tr>
-              </thead>
-              <tbody>
-                {lines.map((l) => (
-                  <tr key={`${l.way}:${l.model}`} className="border-t border-line/60">
-                    <td className={cx("py-2", mono)}>{l.model}</td>
-                    <td className="px-2 py-2 text-dim">{l.way}</td>
-                    <td className="tabular px-2 py-2 text-right">{l.u.requests.toLocaleString()}{l.u.failed > 0 && <span className="text-bad"> · {l.u.failed} failed</span>}</td>
-                    <td className="tabular py-2 text-right">{short(tokens(l.u))}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-        <div className="min-w-0 flex-[1_1_380px]">
+      <div className="mt-4 flex flex-col gap-6">
+        {live.terms !== undefined
+          ? <Lent peer={peer} t={live.terms} own={live.own ?? []} today={live.lentToday ?? {}} month={row.byModel.lent} days={days} lendable={lendable} />
+          : <p className="text-dim"><span className={sub}>lent</span> nothing: it has no <span className={mono}>accept</span> token, so it cannot borrow here.</p>}
+        {live.received !== undefined
+          ? <Received peer={peer} received={live.received} month={row.byModel.borrowed} days={days} />
+          : <p className="text-dim"><span className={sub}>received</span> nothing: it has no <span className={mono}>url</span>, so this node cannot borrow from it.</p>}
+        <div>
           <div className="flex items-center gap-4 text-[11px] text-dim">
             <span className="font-medium uppercase tracking-wide">each day</span>
             <span className="flex items-center gap-1.5"><span aria-hidden className="size-2.5 rounded-sm bg-accent" />lent</span>
@@ -214,7 +320,7 @@ function PeerDetail({ peer }: { peer: string }) {
           <div className="mt-2"><Days lent={row.byDay.lent} borrowed={row.byDay.borrowed} days={days} /></div>
         </div>
       </div>
-      {row.terms !== undefined && <Machine peer={peer} />}
+      {live.terms !== undefined && <Machine peer={peer} />}
     </Card></div>
   );
 }
@@ -406,26 +512,23 @@ export function Lending() {
         <div className="mt-3 flex flex-wrap items-end gap-6">
           <div><div className="mb-1 text-[12px] text-dim">may run</div>
             <Models all={lendable} lent={d.configuredShare} who="every peer" onToggle={(m, on) => void flip({ share: { [m]: on } }, on ? `lending ${m}` : `holding ${m}`)} /></div>
-          <div><div className="mb-1 text-[12px] text-dim">tokens a day</div>
-            <Num label="tokens a day, for every peer" min={0} none="no limit" value={defaults.tokensPerDay} className="w-32" onSave={(n) => void save(["lending", "tokensPerDay"], n, "saved")} /></div>
-          <div><div className="mb-1 text-[12px] text-dim">jobs at once</div>
+          <div><div className="mb-1 text-[12px] text-dim">tokens a day, each model</div>
+            <Num label="tokens a day of each model, for every peer" min={0} none="no limit" value={defaults.tokensPerDay} className="w-32" onSave={(n) => void save(["lending", "tokensPerDay"], n, "saved")} /></div>
+          <div><div className="mb-1 text-[12px] text-dim">jobs at once, each model</div>
             <Num label="jobs at once, for every peer" min={1} value={defaults.maxConcurrent} className="w-16" onSave={(n) => void save(["lending", "maxConcurrent"], n, "saved")} /></div>
-          <div><div className="mb-1 text-[12px] text-dim">requests an hour</div>
+          <div><div className="mb-1 text-[12px] text-dim">requests an hour, each model</div>
             <Num label="requests an hour, for every peer" min={1} value={defaults.rateLimit} className="w-20" onSave={(n) => void save(["lending", "rateLimit"], n, "saved")} /></div>
         </div>
       </Card>
 
       {rows.length > 0 && (
         <Card className="mt-4 overflow-x-auto">
-          <table className="w-full min-w-[1040px] text-left">
+          <table className="w-full min-w-[720px] text-left">
             <thead className="border-b border-line bg-muted/50 text-[11px] uppercase tracking-wide text-dim">
               <tr>
                 <th className="px-4 py-2 font-medium">peer</th>
                 <th className={head}>lending to it</th>
-                <th className={head}>may run</th>
-                <th className={head}>tokens a day</th>
-                <th className={head}>jobs</th>
-                <th className={head}>req / hour</th>
+                <th className={head}>models</th>
                 <th className={head}>used today</th>
                 <th className={cx(head, "text-right")}>lent</th>
                 <th className="px-4 py-2 text-right font-medium">borrowed</th>
@@ -435,15 +538,12 @@ export function Lending() {
               {rows.map((r) => {
                 const t: LendTerms | undefined = r.terms;
                 const at = (key: string): Path => ["peers", r.peer, "lend", key];
-                const used = tokens(r.lent.today);
-                // A limit the peer does not restate is the node's: drawn dim, and one of its own can be put back to it.
-                const own = (key: string) => (r.own ?? []).includes(key);
-                const num = (key: string) => ({ className: own(key) ? undefined : "text-dim", title: own(key) ? undefined : "the limit for every peer" });
-                const spent = t !== undefined && t.tokensPerDay > 0 && used >= t.tokensPerDay;
+                const lent = t ? t.models.length : 0;
+                const got = Object.keys(r.received ?? {}).length;
                 return (
                   <tr key={r.peer} className={cx("border-b border-line/60 align-top last:border-0", open === r.peer && "bg-accent/5")}>
                     <td className="px-4 py-3">
-                      <button type="button" aria-expanded={open === r.peer} title="what it used, by model and by day" onClick={() => setOpen(open === r.peer ? null : r.peer)}
+                      <button type="button" aria-expanded={open === r.peer} title="the models lent and received, with their limits" onClick={() => setOpen(open === r.peer ? null : r.peer)}
                               className="inline-flex items-center gap-1 font-semibold hover:underline focus-visible:outline-2 focus-visible:outline-accent">
                         <ChevronRight size={14} className={cx("text-dim transition-transform", open === r.peer && "rotate-90")} />{r.peer}
                       </button>
@@ -454,44 +554,22 @@ export function Lending() {
                                 className="inline-flex size-6 items-center justify-center rounded-md text-dim hover:text-bad focus-visible:outline-2 focus-visible:outline-accent"><Trash2 size={13} /></button>
                       </span>
                     </td>
-                    {t === undefined ? <td colSpan={6} className="px-2 py-3 text-dim">cannot borrow: it has no <span className={mono}>accept</span> token</td> : (
-                      <>
-                        <td className="px-2 py-3">
-                          <div className="flex items-center gap-2">
-                            <Switch label={`lend to ${r.peer}`} on={!t.off} onChange={(on) => void save(at("off"), !on, on ? `lending to ${r.peer}` : `stopped lending to ${r.peer}`)} />
-                            {r.closed == null ? <Pill tone="ok">open</Pill> : <Pill tone={t.off ? "dim" : "warn"}>{t.off ? "turned off" : "closed"}</Pill>}
-                          </div>
-                          {r.closed != null && !t.off && <div className="mt-1 text-[12px] text-warn">{r.closed}</div>}
-                        </td>
-                        <td className="px-2 py-3">
-                          <div className={cx("flex items-start gap-1", !own("models") && "text-dim")} title={own("models") ? undefined : "what every peer may run"}>
-                            <Models all={lendable} lent={t.models} who={r.peer} disabled={t.off}
-                                    onToggle={(m, on) => void save(at("models"), on ? [...t.models, m] : t.models.filter((x) => x !== m), on ? `lending ${m} to ${r.peer}` : `holding ${m} from ${r.peer}`)} />
-                            {own("models") && <Back peer={r.peer} what="models" path={at("models")} />}
-                          </div>
-                        </td>
-                        <td className="px-2 py-3"><div className="flex items-center gap-1">
-                          <Num label={`${r.peer}: tokens a day`} min={0} none="no limit" disabled={t.off} value={t.tokensPerDay} {...num("tokensPerDay")} className={cx("w-28", num("tokensPerDay").className)} onSave={(n) => void save(at("tokensPerDay"), n, "saved")} />
-                          {own("tokensPerDay") && <Back peer={r.peer} what="tokens a day" path={at("tokensPerDay")} />}
-                        </div></td>
-                        <td className="px-2 py-3"><div className="flex items-center gap-1">
-                          <Num label={`${r.peer}: jobs at once`} min={1} disabled={t.off} value={t.maxConcurrent} {...num("maxConcurrent")} className={cx("w-14", num("maxConcurrent").className)} onSave={(n) => void save(at("maxConcurrent"), n, "saved")} />
-                          {own("maxConcurrent") && <Back peer={r.peer} what="jobs at once" path={at("maxConcurrent")} />}
-                        </div></td>
-                        <td className="px-2 py-3"><div className="flex items-center gap-1">
-                          <Num label={`${r.peer}: requests an hour`} min={1} disabled={t.off} value={t.rateLimit} {...num("rateLimit")} className={cx("w-18", num("rateLimit").className)} onSave={(n) => void save(at("rateLimit"), n, "saved")} />
-                          {own("rateLimit") && <Back peer={r.peer} what="requests an hour" path={at("rateLimit")} />}
-                        </div></td>
-                        <td className="tabular px-2 py-3">
-                          {short(used)} <span className="text-dim">{t.tokensPerDay > 0 ? `of ${short(t.tokensPerDay)}` : "· no limit"}</span>
-                          {t.tokensPerDay > 0 && (
-                            <div aria-hidden className="mt-1.5 h-1 w-28 rounded-full bg-muted">
-                              <div className={cx("h-1 rounded-full", spent ? "bg-warn" : "bg-accent")} style={{ width: `${Math.min(100, (used / t.tokensPerDay) * 100)}%` }} />
-                            </div>
-                          )}
-                        </td>
-                      </>
+                    {t === undefined ? <td className="px-2 py-3 text-dim">cannot borrow: it has no <span className={mono}>accept</span> token</td> : (
+                      <td className="px-2 py-3">
+                        <div className="flex items-center gap-2">
+                          <Switch label={`lend to ${r.peer}`} on={!t.off} onChange={(on) => void save(at("off"), !on, on ? `lending to ${r.peer}` : `stopped lending to ${r.peer}`)} />
+                          {r.closed == null ? <Pill tone="ok">open</Pill> : <Pill tone={t.off ? "dim" : "warn"}>{t.off ? "turned off" : "closed"}</Pill>}
+                        </div>
+                        {r.closed != null && !t.off && <div className="mt-1 text-[12px] text-warn">{r.closed}</div>}
+                      </td>
                     )}
+                    <td className="px-2 py-3">
+                      <button type="button" onClick={() => setOpen(open === r.peer ? null : r.peer)} title="open to see and change each model's limits"
+                              className="text-left text-dim hover:text-fg focus-visible:outline-2 focus-visible:outline-accent">
+                        {t !== undefined && <span>{lent} lent</span>}{t !== undefined && r.received !== undefined && " · "}{r.received !== undefined && <span>{got} received</span>}
+                      </button>
+                    </td>
+                    <td className="tabular px-2 py-3">{t === undefined ? <span className="text-dim">—</span> : short(tokens(r.lent.today))}</td>
                     <td className="tabular px-2 py-3 text-right" title={`${r.lent.month.requests} requests`}>{short(tokens(r.lent.month))}</td>
                     <td className="tabular px-4 py-3 text-right" title={`${r.borrowed.month.requests} requests`}>{short(tokens(r.borrowed.month))}</td>
                   </tr>
@@ -502,7 +580,7 @@ export function Lending() {
         </Card>
       )}
 
-      {open !== null && <PeerDetail peer={open} />}
+      {open !== null && <PeerDetail peer={open} lendable={lendable} />}
       {pairing === "invite" && <Invite onClose={() => setPairing(null)} />}
       {pairing === "join" && <Join onClose={() => setPairing(null)} />}
       {changing?.how === "rename" && (
