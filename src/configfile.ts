@@ -20,17 +20,17 @@ import type { Logger } from "./log.js";
 
 /** Keys the running node reads per call, so a new value takes effect on the next request. */
 const LIVE_KEYS = [
-  "models", "share", "notes", "apiKeys", "apiKeyLabels", "apiKeyModels", "apiKeyRules", "peerTokens",
+  "models", "share", "notes", "apiKeys", "apiKeyLabels", "apiKeyModels", "apiKeyRules", "peerTokens", "peerTailnet",
   "peerRateLimit", "peerLane", "peerMaxConcurrent", "lendTokensPerDay", "peerTerms", "maxBodyBytes", "peerFreshMs", "peerDownMs",
   "peerStaleMs", "peerFirstByteMs", "backendFirstByteMs", "backendIdleMs", "backendRestMs", "coldPenalty", "shutdownGraceMs",
-  "operator", "layout", "flows", "routers", "callers", "actions", "modelHeader",
+  "operator", "layout", "flows", "routers", "callers", "actions", "modelHeader", "updateCheck", "peers",
 ] as const satisfies readonly (keyof HearthConfig)[];
 
 /** Restart-only internal keys whose hearth.yaml name differs, for "restart to apply …". */
 const YAML_NAME: Record<string, string> = { peerPollMs: "borrowing.pollMs" };
 
 /** Live keys that stay frozen once applied, as the fixed config is. */
-const FROZEN_LIVE = new Set<string>(["apiKeys", "apiKeyLabels", "apiKeyModels", "apiKeyRules", "peerTokens", "operator"]);
+const FROZEN_LIVE = new Set<string>(["apiKeys", "apiKeyLabels", "apiKeyModels", "apiKeyRules", "peerTokens", "peerTailnet", "operator"]);
 
 export function deepFreeze(v: unknown): void {
   if (v === null || typeof v !== "object" || Object.isFrozen(v)) return;
@@ -437,9 +437,8 @@ export class ConfigFile {
     return this.live.configPath;
   }
 
-  /** What a restart-only key compares as; for peers, everything but their model maps (those apply live). */
+  /** What a restart-only key compares as. */
   private restartView(key: string, cfg: HearthConfig): unknown {
-    if (key === "peers") return cfg.peers.map(({ models: _m, ...rest }) => rest);
     return (cfg as unknown as Record<string, unknown>)[key];
   }
 
@@ -685,11 +684,6 @@ export class ConfigFile {
       // Credentials stay frozen like the rest of the fixed config; the rest are edited in place by nothing.
       if (FROZEN_LIVE.has(k)) deepFreeze(fresh[k]);
       live[k] = fresh[k];
-    }
-    // Peer model maps apply in place on the objects the registry already holds; adding or changing a peer waits.
-    for (const p of this.live.peers) {
-      const n = next.peers.find((x) => x.name === p.name);
-      if (n && JSON.stringify(n.models) !== JSON.stringify(p.models)) p.models = n.models;
     }
     this.pending = this.restartPendingFor(next);
     this.error = null;

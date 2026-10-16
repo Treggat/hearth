@@ -17,6 +17,13 @@ The defaults assume a private network: Tailscale, WireGuard, a LAN you trust.
   that is not a hearth you chose to trust. It is used only where your config
   names it, and its `key` never reaches the console or a client.
 - Peer tokens are separate from api keys, so peer traffic is attributable.
+- A peer's token can be bound to its tailnet machine with `tailnet`, so a copy of
+  the token is useless anywhere else: see
+  [Binding a peer to its machine](sharing.md#binding-a-peer-to-its-machine).
+- `hearth serve` asks the npm registry for hearth's latest version at start
+  and once a day, so the console can say a newer one is out. The request
+  carries the package name and nothing about the node. `updateCheck: false`
+  turns it off, live.
 
 ## Secrets stay in the file
 

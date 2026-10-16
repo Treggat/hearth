@@ -602,6 +602,20 @@ export function unscoped(view: Doc, whole: Doc, router: string | null): Doc {
   };
 }
 
+/**
+ * `full` with a new router `name` whose rules are the ones `view` shows, and whose map is drawn
+ * as that one's is: each place `view` keeps as `routing/...` is kept again as `routing@<name>/...`.
+ */
+export function copiedRouter(view: Doc, full: Doc, name: string): Doc {
+  const pre = `routing@${name}/`;
+  const layout = {
+    ...Object.fromEntries(Object.entries(obj(full.layout)).filter(([id]) => !id.startsWith(pre))),
+    ...Object.fromEntries(Object.entries(obj(view.layout)).flatMap(([id, at]) => (id.startsWith("routing/") ? [[pre + id.slice(8), at]] : []))),
+  };
+  const { layout: _, ...rest } = put(full, "routers", name, { flows: view.flows });
+  return { ...rest, ...(Object.keys(layout).length ? { layout } : {}) };
+}
+
 /** The caller that stands for everyone `callers:` does not name. */
 export const EVERYONE = "*";
 

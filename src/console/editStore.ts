@@ -5,7 +5,7 @@
 import { create } from "zustand";
 
 import type { Err, File, Plan } from "./config.js";
-import { added, BAYS, followed, pastedAll, RANK, routeTyped, summary, factsOf, isObj, nodeOf, obj, opsOf, placed, problems, put, rebase, refusal, removed, renamed, retyped, routeId, scoped, TEMPLATES, unscoped, wholes, type Copied, type Doc, type Facts, type Landing, type Picked } from "./draft.js";
+import { added, BAYS, copiedRouter, followed, pastedAll, RANK, routeTyped, summary, factsOf, isObj, nodeOf, obj, opsOf, placed, problems, put, rebase, refusal, removed, renamed, retyped, routeId, scoped, TEMPLATES, unscoped, wholes, type Copied, type Doc, type Facts, type Landing, type Picked } from "./draft.js";
 import { request, RequestError, toast, useStore } from "./store.js";
 
 /** A whole draft and the router it was shown by, to go back to. */
@@ -445,8 +445,8 @@ export function addRouter(name: string, copy: boolean): void {
   const s = useEdit.getState();
   const full = whole(s);
   if (!full || !s.draft) return;
-  const flows = copy ? s.draft.flows : { "anything-else": { inputs: ["*"], steps: [{ to: { refuse: "that is not something this router offers" } }] } };
-  set({ ...show(put(full, "routers", name, { flows }), name), sel: null, pending: [] });
+  const flows = { "anything-else": { inputs: ["*"], steps: [{ to: { refuse: "that is not something this router offers" } }] } };
+  set({ ...show(copy ? copiedRouter(s.draft, full, name) : put(full, "routers", name, { flows }), name), sel: null, pending: [] });
   toast("ok", `router ${name} added — choose who uses it`);
 }
 

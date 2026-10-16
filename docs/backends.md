@@ -290,6 +290,43 @@ cannot see. It is not safe when the two disagree about placement, and it always
 costs the outer slot being held while the inner one waits. Decide which queue
 owns the card and make the other one a backstop.
 
+### Ollama's own API
+
+Many clients talk to Ollama in its own API (`/api/chat`, `/api/generate`,
+`/api/embed`) rather than in OpenAI's. Those paths reach the catch-all
+passthrough like any other, so they skip the queue until a route names them:
+
+```yaml
+backends:
+  ollama:
+    url: "http://127.0.0.1:11434"
+    kind: ollama
+    concurrency: 2
+    routes:
+      - { path: /api/chat, lane: chat }
+      - { path: /api/generate, lane: chat }
+      - /api/embed
+      - { path: /api/tags, queue: false }
+      - { path: /api/ps, queue: false }
+models:
+  my-model: { backend: ollama, concurrency: 1 }
+  my-embedder: { backend: ollama, concurrency: 1 }
+```
+
+- Each request queues as the model its body names, against that model's own
+  number, so two models run side by side and a second call to the same one
+  waits here. A name the flows send elsewhere is renamed in the body, and an
+  `as:` alias goes out as the id Ollama knows.
+- Ollama streams NDJSON by default. It is relayed as it arrives, like any other
+  routed answer.
+- A route's lane defaults to the lowest one, which suits background work.
+  Give an interactive path `lane: chat`.
+- `queue: false` on `/api/tags` and `/api/ps` sends those reads to this backend
+  instead of the first one, without taking a slot.
+- These requests count toward a key's request limits but not toward token
+  usage, the canary does not judge their answers, and they are never sent to a
+  peer: only chat goes to a peer.
+
 ### One backend, models with different ceilings
 
 llama.cpp decodes one request at a time, so one GPU means one job and the queue
