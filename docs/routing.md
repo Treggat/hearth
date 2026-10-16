@@ -290,7 +290,9 @@ draft: **+ backend**, **+ hardware** and **+ machine** add one; clicking a
 backend, a card or a machine opens its settings beside the picture; and a
 backend's card is dragged onto other hardware or another machine to say where
 it runs. Hardware and machines with nothing on them yet are drawn empty, to be
-dragged onto, and the small chips of a crowded card drag the same way.
+dragged onto, and the small chips of a crowded card drag the same way. Let go
+in the hardware it is already in, a backend takes that place among the others
+there; the order joins the draft and is kept with the layout.
 **review & publish** there lists what changes in plain words above the diff
 and says what needs a restart before anything is written; **versions** is
 beside it. What is published but not running yet stays said on the strip, with
