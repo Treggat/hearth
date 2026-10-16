@@ -21,6 +21,8 @@ import { writeFileAtomic } from "./configfile.js";
 import { LEVELS, createLogger, type Level } from "./log.js";
 import { hashPassword } from "./login.js";
 import { migrateDoc, routedMarker, unguarded, v1Marker } from "./migrate.js";
+import { bugReport } from "./report.js";
+import { watchUpdates } from "./updates.js";
 import { createNode } from "./server.js";
 import { getJson } from "./upstream.js";
 import { parseDocument } from "yaml";
@@ -48,7 +50,9 @@ function starterConfig(backendUrl: string, found: boolean): string {
   return `# hearth: a queue in front of your inference server.
 #
 # Everything runs locally until you add a peer or a cloud backend AND a flow
-# sends something to it. Nothing leaves this machine by default.
+# sends something to it. No prompt leaves this machine by default; the one
+# outside request is a daily check with npm for a newer hearth, and
+# updateCheck: false turns that off.
 #
 # Every setting: https://github.com/Vcvzgbzz/hearth/blob/main/docs/configuration.md
 version: ${CONFIG_VERSION}
@@ -163,6 +167,8 @@ const USAGE = `usage: hearth [command] [--config path]
   init                         probe for a local inference server and write hearth.yaml
   set-operator <user> <pass>   set the console login
   migrate                      rewrite an older hearth.yaml in the current layout, keeping a backup
+  report                       write hearth-report-<date>.md for a bug report: version, the config
+                               with secrets out, and the running node's health, network and logs
 
   -c, --config <path>          the config file (default: ${DEFAULT_CONFIG})
       --check                  with serve: load the config, say whether it is valid, and exit
@@ -194,8 +200,9 @@ async function main(): Promise<void> {
     console.log(USAGE);
     return;
   }
+  const { name: pkg, version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
   if (values.version) {
-    console.log((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
+    console.log(version);
     return;
   }
 
@@ -292,8 +299,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "report") {
+    const file = `hearth-report-${new Date().toISOString().slice(0, 10)}.md`;
+    writeFileSync(file, await bugReport(configPath, version));
+    console.log(`wrote ${file}. Secrets from the config are replaced; read it before attaching it to an issue.`);
+    return;
+  }
+
   if (command !== "serve") {
-    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator | hearth migrate`);
+    console.error(`unknown command "${command}". Try: hearth serve | hearth init | hearth set-operator | hearth migrate | hearth report`);
     process.exit(1);
   }
 
@@ -325,6 +339,7 @@ async function main(): Promise<void> {
   const log = node.log;
 
   node.start();
+  watchUpdates({ name: pkg, current: version, enabled: () => cfg.updateCheck, found: (latest) => { node.update = latest; }, log });
   node.server.listen(cfg.listen.port, cfg.listen.host, () => {
     log.info("listening", {
       name: cfg.name,

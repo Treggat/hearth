@@ -149,6 +149,8 @@ export interface HearthNode {
   onRestart: (() => void) | null;
   /** The node's logger: stdout, plus the console's Logs page. */
   log: Logger;
+  /** A newer published hearth, for the console to mention; set by `hearth serve`. */
+  update: string | null;
 }
 
 export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
@@ -2780,6 +2782,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     others: othersView,
     ledger: ledgerView,
     lendDefaults: () => ({ tokensPerDay: cfg.lendTokensPerDay, maxConcurrent: cfg.peerMaxConcurrent, rateLimit: cfg.peerRateLimit }),
+    update: () => node.update,
   });
 
   /** Expired sessions, swept like any other in-memory state; unref'd so it never holds the process. */
@@ -2823,6 +2826,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
 
   const node: HearthNode = {
     onRestart: null,
+    update: null,
     log,
     server,
     pool,

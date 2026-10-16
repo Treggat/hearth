@@ -23,7 +23,7 @@ const LIVE_KEYS = [
   "models", "share", "notes", "apiKeys", "apiKeyLabels", "apiKeyModels", "apiKeyRules", "peerTokens",
   "peerRateLimit", "peerLane", "peerMaxConcurrent", "lendTokensPerDay", "peerTerms", "maxBodyBytes", "peerFreshMs", "peerDownMs",
   "peerStaleMs", "peerFirstByteMs", "backendFirstByteMs", "backendIdleMs", "backendRestMs", "coldPenalty", "shutdownGraceMs",
-  "operator", "layout", "flows", "routers", "callers", "actions", "modelHeader",
+  "operator", "layout", "flows", "routers", "callers", "actions", "modelHeader", "updateCheck",
 ] as const satisfies readonly (keyof HearthConfig)[];
 
 /** Restart-only internal keys whose hearth.yaml name differs, for "restart to apply …". */
@@ -129,6 +129,17 @@ function maskSecrets(text: string, doc: Record<string, unknown>): { text: string
   // A secret with no scalar of its own in the text (an alias) is taken out wherever it is written.
   for (const [secret, standIn] of loose) masked = masked.split(secret).join(standIn);
   return { text: masked, doc: d };
+}
+
+/** A config file's text with every secret in it replaced by a stand-in; text that is not YAML comes back as it is. */
+export function maskedText(text: string): string {
+  let doc: unknown;
+  try {
+    doc = parseDocument(text).toJS();
+  } catch {
+    return text;
+  }
+  return isObj(doc) ? maskSecrets(text, doc).text : text;
 }
 
 /** A string as a YAML scalar that reads back as that string wherever it is put. */
@@ -629,13 +640,7 @@ export class ConfigFile {
 
   /** The text a console sees back: the file's secrets out, stand-ins in. */
   private masked(text: string): string {
-    let doc: unknown;
-    try {
-      doc = parseDocument(text).toJS();
-    } catch {
-      return text;
-    }
-    return isObj(doc) ? maskSecrets(text, doc).text : text;
+    return maskedText(text);
   }
 
   private applyInMemory(draft: HearthConfig): CommitResult {
