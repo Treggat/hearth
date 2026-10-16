@@ -32,6 +32,7 @@ import { CONSOLE_CSP, CONSOLE_HTML } from "./ui.js";
 import { createViews, type CallerUse, type KeyInfo, type LedgerRow, type Spent } from "./views.js";
 import { multipartField, replaceMultipartField } from "./multipart.js";
 import { relayAnthropic, toAnthropic } from "./anthropic.js";
+import { tailscaleWhois } from "./tailscale.js";
 import { chatOf, MessagesResponse } from "./messages.js";
 import { troubleSays } from "./backend.js";
 import { getJson, send, UpstreamError, type UpstreamResponse } from "./upstream.js";
@@ -1239,6 +1240,28 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return { ...base, peer: null, caller: asLocal!.caller, models: asLocal!.models };
   }
 
+  const whois = tailscaleWhois(cfg.tailscaleSocket);
+
+  /**
+   * A peer bound with `tailnet` is let in only from that machine, so its token alone is not enough.
+   * Fails closed: a node that cannot ask tailscaled refuses the peer rather than trusting the token.
+   */
+  async function fromPeerMachine(peer: string, req: IncomingMessage, res: ServerResponse, env: Envelope): Promise<boolean> {
+    const want = cfg.peerTailnet[peer];
+    if (want === undefined) return true;
+    const ip = req.socket.remoteAddress ?? "";
+    try {
+      const node = await whois(ip, req.socket.remotePort ?? 0);
+      if (node?.id === want) return true;
+      log.warn("peer.wrong_machine", { peer, ip, node: node?.name ?? null });
+      refuse(res, 403, `the token for ${peer} is honoured only from its own machine`, env);
+    } catch (e) {
+      log.warn("peer.machine_unchecked", { peer, ip, error: e instanceof Error ? e.message : String(e) });
+      refuse(res, 403, `cannot check which machine is calling as ${peer}`, env);
+    }
+    return false;
+  }
+
   /** Every path this node answers, in order, with its `auth` beside it. The passthrough is last and takes the rest. */
   const ROUTES: Route[] = [
     // Unauthenticated on purpose, and on a port that may be bound wide, so it
@@ -1333,6 +1356,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       if (!claims(r, path, req.method)) continue;
       const c = authorize(r, req, res);
       if (c === null) return;
+      if (c.peer !== null && !(await fromPeerMachine(c.peer, req, res, r.envelope ?? "plain"))) return;
       await r.handler(c);
       return;
     }

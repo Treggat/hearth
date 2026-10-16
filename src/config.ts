@@ -473,6 +473,10 @@ export interface HearthConfig {
   /** Tokens peers present to us, by peer name (`peers.<name>.accept`). Kept separate from apiKeys so
    *  peer traffic is attributable and can be capped on its own. */
   peerTokens: Record<string, string>;
+  /** The Tailscale stable node ID a peer's token is bound to (`peers.<name>.tailnet`), by peer name. */
+  peerTailnet: Record<string, string>;
+  /** tailscaled's local API socket, asked which machine a bound peer is calling from (`tailscaleSocket`). */
+  tailscaleSocket: string;
   /**
    * The operator login: a username and the scrypt hash of its password, as printed by
    * `hearth set-operator`. Null means the console has no login form and no session can
@@ -1603,11 +1607,18 @@ export function parseConfig(raw: unknown): HearthConfig {
   const peers: PeerConfig[] = [];
   const peerTokens: Record<string, string> = {};
   const peerTerms: Record<string, Partial<LendTerms>> = {};
+  const peerTailnet: Record<string, string> = {};
   for (const [name, p] of Object.entries(asRecord(root.peers ?? {}, "peers"))) {
     const at = `peers.${name}`;
     const entry = asRecord(p, at);
     only(entry, "peer", at);
     if (entry.accept !== undefined) peerTokens[name] = resolveSecret(str(entry.accept, `${at}.accept`), `${at}.accept`);
+    // Empty is unset, as a freshly added setting is.
+    const tailnet = str(entry.tailnet, `${at}.tailnet`, "").trim();
+    if (tailnet !== "") {
+      if (entry.accept === undefined) throw bad(`${at}.tailnet`, `binds the token ${name} presents to you, which needs its accept`);
+      peerTailnet[name] = tailnet;
+    }
     if (entry.lend !== undefined) {
       if (entry.accept === undefined) throw bad(`${at}.lend`, `is what ${name} may take from you, which needs its accept`);
       const lend = asRecord(entry.lend, `${at}.lend`);
@@ -1782,6 +1793,8 @@ export function parseConfig(raw: unknown): HearthConfig {
     apiKeyModels,
     apiKeyRules,
     peerTokens,
+    peerTailnet,
+    tailscaleSocket: str(root.tailscaleSocket, "tailscaleSocket", "") || "/var/run/tailscale/tailscaled.sock",
     operator,
     share: lent,
     notes,

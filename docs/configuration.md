@@ -87,6 +87,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `peers.<name>.url` | — | the peer's hearth, main port |
 | `peers.<name>.token` | — | what you present when borrowing from them |
 | `peers.<name>.accept` | — | what they present when borrowing from you. Without it they cannot |
+| `peers.<name>.tailnet` | unset | the Tailscale stable node ID of their machine. Set, their `accept` is honoured only from that machine, as your tailscaled names the caller. Needs `accept`. See [Binding a peer to its machine](sharing.md#binding-a-peer-to-its-machine) |
 | `peers.<name>.models` | `{}` | `your id: their id` for each model you borrow. Also the allowlist |
 | `peers.<name>.lend` | unset | this peer's own lending limits: any of `models`, `tokensPerDay`, `maxConcurrent`, `rateLimit`. Each one set replaces the `lending.*` setting of the same name for this peer. `off: true` lends it nothing and keeps the rest. Needs `accept`. See [Limits per peer](sharing.md#limits-per-peer) |
 | `lending.models` | `[]` | models peers may run here. Empty lends nothing. A model on a `cloud` backend is refused: a peer would be spending that provider's key |
@@ -109,6 +110,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `modelHeader` | `true` | send `x-hearth-model` on every chat answer: the id the request ran as. See [Flows](routing.md#flows) |
 | `updateCheck` | `true` | ask the npm registry once a day, and when `hearth serve` starts, whether a newer hearth is out; the console says so and the log has an `update.available` line. The request names the package and nothing else. Applies live |
 | `historyFile` | unset | a file that keeps the console's day of history, its recent log lines and the month of usage per caller across restarts, written every minute and at shutdown. Unset keeps them in memory. A file written by a later hearth is set aside as `<file>.v<n>` and a fresh one started |
+| `tailscaleSocket` | `/var/run/tailscale/tailscaled.sock` | where this machine's tailscaled local API answers. Read only to check a peer that sets `tailnet` |
 | `stateFile` | unset | a console sidecar from an earlier version. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 
 Tokens accept `env:NAME`, so the config stays committable.

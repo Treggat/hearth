@@ -9,6 +9,8 @@ comment is read by strangers. Write for them.
 - `src/scheduler.ts`, `src/pool.ts`, `src/resources.ts`: admission, per-backend
   queues, shared hardware
 - `src/route.ts`, `src/peers.ts`: local vs peer routing, peer health
+- `src/tailscale.ts`: asks the local tailscaled which tailnet machine a
+  caller is, for peers bound with `tailnet`
 - `src/actions.ts`: what a flow step can set off beside routing; one entry
   per kind
 - `src/config.ts`, `src/fields.ts`, `src/configfile.ts`: parsing, the settings
