@@ -57,8 +57,16 @@ curl -X POST localhost:4141/control -H 'content-type: application/json' \
 ```
 
 `GET /control` reports the current state and where edits are saved. Adding a
-**peer** is an edit to `peers:` and applies on restart: a token and a URL are a
-trust decision, and the map is only what you do with one you already have.
+**peer** is an edit to `peers:`, from the console's config editor, `PATCH /config`
+or the file itself, and applies without a restart:
+
+- A new peer starts out down and is asked for its state at once.
+- A changed `url` or `token` starts that peer over: what was read from the old
+  address says nothing about the new one, so it is down until the new one
+  answers.
+- A removed peer is forgotten. Requests already sent to it finish.
+- Only `borrowing.pollMs`, how often every peer is asked in the background,
+  still waits for a restart.
 
 ## Limits per peer
 

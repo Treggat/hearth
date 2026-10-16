@@ -167,9 +167,13 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
   const controls = new Controls();
   // hearth.yaml as the only config state: edits write the file and apply live.
   // Deferred: the sidecar migration below applies before the stream state further down exists.
-  const config = new ConfigFile(cfg, log, () => queueMicrotask(() => void broadcast()));
-  if (cfg.stateFile) config.migrateSidecar(cfg.stateFile);
   const peers = new PeerRegistry(cfg, log, controls);
+  // Peers apply live, so the registry follows every edit before the status surfaces hear of it.
+  const config = new ConfigFile(cfg, log, () => {
+    peers.sync();
+    queueMicrotask(() => void broadcast());
+  });
+  if (cfg.stateFile) config.migrateSidecar(cfg.stateFile);
 
   /** The opt-in canary, or null when `canary:` is not configured. */
   const canary = createCanary(cfg, pool, log);

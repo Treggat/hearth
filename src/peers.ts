@@ -92,6 +92,7 @@ export class PeerRegistry {
   private readonly byName = new Map<string, PeerConfig>();
   private readonly inFlight = new Map<string, Promise<void>>();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private started = false;
   /** When the reading each peer's capacity came from was asked for. */
   private readonly readAt = new Map<string, number>();
   /** When each peer last answered one of our requests. */
@@ -110,20 +111,50 @@ export class PeerRegistry {
      *  on. */
     private readonly controls: Controls = new Controls(),
   ) {
-    for (const p of cfg.peers) {
-      this.byName.set(p.name, p);
-      this.status.set(p.name, {
-        name: p.name,
-        url: p.url,
-        up: false,
-        capacity: null,
-        lastOkAt: null,
-        lastError: null,
-        consecutiveFailures: 0,
-        backoffUntil: null,
-        lastFailAt: null,
-      });
+    for (const p of cfg.peers) this.track(p);
+  }
+
+  /** Start a peer from nothing: down, unread, until a probe says otherwise. */
+  private track(p: PeerConfig): void {
+    this.byName.set(p.name, p);
+    this.status.set(p.name, {
+      name: p.name,
+      url: p.url,
+      up: false,
+      capacity: null,
+      lastOkAt: null,
+      lastError: null,
+      consecutiveFailures: 0,
+      backoffUntil: null,
+      lastFailAt: null,
+    });
+    for (const m of [this.readAt, this.servedAt, this.caps]) m.delete(p.name);
+  }
+
+  /**
+   * Match `cfg.peers` after a live edit. A new peer starts down and is probed; a removed one is
+   * forgotten, its requests in flight left to finish; one whose url or token changed starts over,
+   * since nothing read from the old address says anything about the new one. Model maps alone
+   * keep the peer's state.
+   */
+  sync(): void {
+    const next = new Map(this.cfg.peers.map((p) => [p.name, p]));
+    for (const name of [...this.byName.keys()]) {
+      if (next.has(name)) continue;
+      for (const m of [this.byName, this.status, this.readAt, this.servedAt, this.caps, this.open, this.inFlight]) m.delete(name);
     }
+    for (const [name, p] of next) {
+      const was = this.byName.get(name);
+      if (was && was.url === p.url && was.token === p.token) {
+        this.byName.set(name, p);
+        continue;
+      }
+      this.track(p);
+      // A probe still out to the old address must not stand in for one to the new.
+      this.inFlight.delete(name);
+      if (this.started) void this.probe(name);
+    }
+    if (this.started) this.start();
   }
 
   config(name: string): PeerConfig | undefined {
@@ -217,6 +248,8 @@ export class PeerRegistry {
         headers: { Authorization: `Bearer ${peer.token}` },
         headersTimeoutMs: timeoutMs,
       });
+      // The peer was removed or changed while this was asked: the answer is about something gone.
+      if (this.status.get(name) !== s) return;
       // An answer we do not recognise is unknown, which means unavailable.
       if (
         typeof cap?.free !== "number" ||
@@ -254,6 +287,7 @@ export class PeerRegistry {
       s.up = true;
       if (!was) this.log.info("peer.up", { peer: name });
     } catch (e) {
+      if (this.status.get(name) !== s) return;
       s.consecutiveFailures++;
       s.lastFailAt = Date.now();
       s.lastError = e instanceof Error ? e.message : String(e);
@@ -309,7 +343,8 @@ export class PeerRegistry {
     const existing = this.inFlight.get(name);
     if (existing) return existing;
     const p = this.pollOnce(name, PROBE_HEADERS_TIMEOUT_MS).finally(() => {
-      this.inFlight.delete(name);
+      // Only its own entry: a live edit may have started a newer probe under the same name.
+      if (this.inFlight.get(name) === p) this.inFlight.delete(name);
     });
     this.inFlight.set(name, p);
     return p;
@@ -357,7 +392,8 @@ export class PeerRegistry {
         this.log.warn("peer.protocol", { peer: name, theirs: hi.protocol, ours: 2 });
       }
       // Capabilities are asked for, never inferred from how a missing route fails.
-      this.caps.set(name, new Set(hi.capabilities ?? []));
+      const now = this.byName.get(name);
+      if (now?.url === peer.url && now.token === peer.token) this.caps.set(name, new Set(hi.capabilities ?? []));
     } catch {
       // Not fatal. A peer that's down at startup gets checked again when it next
       // comes up, and routing won't touch it before then anyway.
@@ -365,6 +401,8 @@ export class PeerRegistry {
   }
 
   start(): void {
+    // Remembered, so a peer added later by a live edit starts the poll a node with none skipped.
+    this.started = true;
     if (this.timer || this.byName.size === 0) return;
     void this.pollAll();
     this.timer = setInterval(() => void this.pollAll(), this.cfg.peerPollMs);
@@ -373,6 +411,7 @@ export class PeerRegistry {
   }
 
   stop(): void {
+    this.started = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
   }
