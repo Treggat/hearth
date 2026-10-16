@@ -13,7 +13,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type React
 
 import type { Backend, Node as NetNode, Resource, UiData } from "./types.js";
 import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
-import { BAYS, bayRoom, callersIn, draftView, EVERYONE, list, movedBay, obj, ordered, put, routerFor, usersOf, withCaller, callerChoices, paneChoices } from "./draft.js";
+import { BAYS, bayRoom, callersIn, draftView, EVERYONE, list, movedBay, movedHardware, obj, ordered, put, routerFor, usersOf, withCaller, callerChoices, paneChoices } from "./draft.js";
 import { change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit, addRouter, askAt } from "./editStore.js";
 import { Menu, VersionsButton, openVersions } from "./editor.js";
 import { control, go, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
@@ -103,6 +103,20 @@ function dropBackend(backend: string, x: number, y: number): void {
   const under = document.elementsFromPoint(x, y).map((el) => el.closest(".react-flow__node")?.getAttribute("data-id") ?? "").find((id) => drops.has(id));
   const to = under ? drops.get(under) : undefined;
   if (to && useEdit.getState().draft) change((d) => moved(d, backend, to));
+}
+
+/** Put hardware, and what runs on it, on whatever machine is under a point of the page, in the draft. */
+function dropHardware(group: string, x: number, y: number): void {
+  const from = drops.get(group);
+  const machine = document.elementsFromPoint(x, y).map((el) => el.closest(".react-flow__node")?.getAttribute("data-id") ?? "").find((id) => id.startsWith("machine:") && drops.has(id));
+  const draft = useEdit.getState().draft;
+  if (!from?.resource || !machine || !draft) return;
+  const to = drops.get(machine)!.server;
+  if (to === from.server) return;
+  const next = movedHardware(draft, from.resource, from.server, to);
+  if (next === draft) { toast("bad", `nothing runs on ${from.resource} yet, so nothing says which machine it is on: drag a backend onto it first`); return; }
+  change(() => next);
+  toast("ok", `${from.resource} and what runs on it are on ${to || "this machine"} in the draft`);
 }
 
 const FIELD = "h-8 w-full rounded-md border border-line bg-bg px-2 text-[12px] focus:border-accent focus:outline-none";
@@ -198,7 +212,7 @@ function ProviderDialog({ taken, onClose, onCreate }: { taken: string[]; onClose
 
 /** A card or CPU: the frame its backends sit in, so "runs on" needs no line. */
 type Chip = { name: string; tone: Tone; busy: boolean; sub: string };
-type Group = { /** What a backend let go here is given: this hardware, on this machine. */ drop?: { resource: string; server: string }; title: string; sub: string; icon: ReactNode; hot: boolean; selected?: boolean; tip?: string; chips?: Chip[]; picked?: string };
+type Group = { /** What a backend let go here is given: this hardware, on this machine. */ drop?: { resource: string; server: string }; /** It can be dragged onto another machine. */ moves?: boolean; title: string; sub: string; icon: ReactNode; hot: boolean; selected?: boolean; tip?: string; chips?: Chip[]; picked?: string };
 
 const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
   return (
@@ -208,7 +222,7 @@ const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
       data.selected && "ring-2 ring-accent/25",
     )}>
       <Handle type="target" position={Position.Left} />
-      <div className="flex items-center gap-2 px-3 pt-2 text-[11px]">
+      <div className={cx("flex items-center gap-2 px-3 pt-2 text-[11px]", data.moves && "cursor-grab")} title={data.moves ? "Drag it onto another machine: what runs on it goes too" : undefined}>
         <span className={data.hot ? "text-ok" : "text-dim"}>{data.icon}</span>
         <span className="font-semibold uppercase tracking-wide">{data.title}</span>
         <span className="truncate text-dim" title={data.tip}>{data.sub}</span>
@@ -521,9 +535,10 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
         const all = mine.flatMap((b) => runningIds.get(b.name) ?? []);
         if (chips) edges.push({ id: `e:${group}`, source: hub, target: group, type: "flow", data: { jobs: all, pulses: pulsesFor(`e:${group}`, all, who ? 2 : 1) } });
         inside.push({
-          id: group, type: "hardware", ...(frame ? { parentId: frame, extent: "parent" as const } : {}), position: { x: left, y: top }, style: { width, height },
+          // With a draft it can be dragged out of its machine onto another, and what runs on it goes too.
+          id: group, type: "hardware", ...(frame ? { parentId: frame, ...(who ? { draggable: true, zIndex: 4 } : { extent: "parent" as const }) } : {}), position: { x: left, y: top }, style: { width, height },
           data: {
-            drop: { resource: key, server: machine },
+            drop: { resource: key, server: machine }, moves: Boolean(frame && who),
             title: key, hot: all.length > 0, selected: is("resource", key),
             icon: r?.kind === "cpu" ? <Cpu size={13} /> : <CircuitBoard size={13} />,
             sub: mine.length === 0 ? "· empty: drag a backend here" : r?.shared ? "shared" : r?.holder ? `· in use by ${r.holder}` : r ? "· not in use" : "",
@@ -818,7 +833,7 @@ export function Topology() {
       </button>
       <VersionsButton />
       {/* The hint gives way to whatever the strip has to say, so it stays one row. */}
-      {!isDirty && waiting.length === 0 && <span className="truncate text-[11px] text-dim max-xl:hidden">Click anything for its settings. Drag a backend onto hardware, or a caller onto a router.</span>}
+      {!isDirty && waiting.length === 0 && <span className="truncate text-[11px] text-dim max-xl:hidden">Click anything for its settings. Drag a backend onto hardware, hardware onto a machine, or a caller onto a router.</span>}
       <div className="ml-auto flex items-center gap-2">
         {/* What is published but not running yet stays said until the restart that applies it. */}
         {waiting.length > 0 && !isDirty && (
@@ -869,6 +884,7 @@ export function Topology() {
         dragging.current = null;
         const at = "changedTouches" in e ? (e as unknown as TouchEvent).changedTouches[0]! : e;
         if (n.id.startsWith("backend:")) dropBackend(n.id.slice(8), at.clientX, at.clientY);
+        if (n.id.startsWith("resource:")) dropHardware(n.id, at.clientX, at.clientY);
         // A box of callers let go among the others takes that place in the row, which the draft keeps with its layout.
         if (n.id.startsWith("bay:")) {
           const middle = (x: Node) => x.position.x + Number(x.style?.width ?? 0) / 2;

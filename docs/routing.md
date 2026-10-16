@@ -289,8 +289,12 @@ The rest of the Topology page is edited where it stands too, into the same
 draft: **+ backend**, **+ hardware** and **+ machine** add one; clicking a
 backend, a card or a machine opens its settings beside the picture; and a
 backend's card is dragged onto other hardware or another machine to say where
-it runs. Hardware and machines with nothing on them yet are drawn empty, to be
-dragged onto, and the small chips of a crowded card drag the same way.
+it runs. Hardware is dragged by its title onto another machine the same way:
+every backend there that uses it goes with it, and so does any other card those
+backends use, since one card is in one machine. Shared hardware takes only the
+backends that sit in it. Hardware and machines with nothing on them yet are
+drawn empty, to be dragged onto, and the small chips of a crowded card drag the
+same way.
 **review & publish** there lists what changes in plain words above the diff
 and says what needs a restart before anything is written; **versions** is
 beside it. What is published but not running yet stays said on the strip, with

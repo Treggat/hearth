@@ -391,6 +391,31 @@ export function movedBay(doc: Doc, names: string[], name: string, x: number, mid
   return next.reduce<Doc>((d, n, k) => put(d, "layout", BAYS + n, { x: 0, y: k }), doc);
 }
 
+/**
+ * Hardware put on another machine: the backends on machine `from` ("" for this one) that use it go to
+ * `to` with it, and so does any other card they use, as one card cannot be on two machines. Shared
+ * hardware can, so only the backends that sit in it go. One reached by `port` alone that comes to this
+ * machine is given a loopback url, as a port needs a server.
+ */
+export function movedHardware(doc: Doc, resource: string, from: string, to: string): Doc {
+  if (from === to) return doc;
+  const shared = (r: string) => obj(obj(doc.resources)[r]).shared === true;
+  const here = Object.entries(obj(doc.backends)).filter(([, b]) => obj(b).cloud !== true && text(obj(b).server) === from).map(([name, b]) => ({ name, had: list(obj(b).resources) }));
+  const going = new Set(here.filter((b) => (shared(resource) ? (b.had.find((r) => !shared(r)) ?? b.had[0]) === resource : b.had.includes(resource))).map((b) => b.name));
+  // A card one of them uses goes too, and every backend here that uses it, until no card is left on both sides.
+  for (let more = true; more;) {
+    const cards = new Set(here.filter((b) => going.has(b.name)).flatMap((b) => b.had.filter((r) => !shared(r))));
+    const next = here.filter((b) => !going.has(b.name) && b.had.some((r) => cards.has(r)));
+    next.forEach((b) => going.add(b.name));
+    more = next.length > 0;
+  }
+  return [...going].reduce<Doc>((d, name) => {
+    const { server: _, port, ...rest } = obj(obj(d.backends)[name]);
+    const local = to === "" && rest.url === undefined && port !== undefined;
+    return put(d, "backends", name, { ...rest, ...(local ? { url: `http://127.0.0.1:${String(port)}` } : port !== undefined ? { port } : {}), ...(to ? { server: to } : {}) });
+  }, doc);
+}
+
 /** Move a type `by` places in the list `names`, which is the order they are shown in now. */
 export function movedName(doc: Doc, names: string[], name: string, by: number): Doc {
   const i = names.indexOf(name);
