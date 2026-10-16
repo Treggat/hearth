@@ -1956,8 +1956,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         // Not hearth on the other end; refused below with its status.
       }
       if (!up.ok) {
+        // The code chose this address, so only a short hearth-shaped reason is passed on, never a body.
         const why = typeof answer.error === "object" && answer.error !== null ? (answer.error as { message?: unknown }).message : answer.error;
-        throw new Refusal(502, `the inviter refused: ${typeof why === "string" ? why : `it answered ${up.status}`}`);
+        throw new Refusal(502, `the inviter refused: ${typeof why === "string" ? why.slice(0, 200) : `it answered ${up.status}`}`);
       }
       if (typeof answer.token !== "string" || typeof answer.name !== "string") throw new Refusal(502, "the inviter answered something that is not a join");
       const name = as || answer.name;

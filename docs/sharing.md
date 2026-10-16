@@ -61,6 +61,8 @@ token, and both apply at once. Neither person ever sees the token.
 - The code works once and for 10 minutes, and lives only in the running node, so
   a restart voids it. Anyone holding the code in that window can join with it,
   so send it the way you would send a short-lived password.
+- A code names the address your node contacts when you join, the way a peer's
+  `url` does. Join only with a code from someone you would add as a peer by hand.
 - The borrower's node name must be one the lender has no peer under yet.
   `hearth join --as <name>` picks the name the lender is kept under on the
   borrower's side.
