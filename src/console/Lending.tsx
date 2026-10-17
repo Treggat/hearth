@@ -567,7 +567,7 @@ export function Lending() {
             <Models all={lendable} lent={d.configuredShare} who="every peer" onToggle={(m, on) => void flip({ share: { [m]: on } }, on ? `lending ${m}` : `holding ${m}`)} /></div>
           <div><div className="mb-1 text-[12px] text-dim">tokens a day, each model</div>
             <Num label="tokens a day of each model, for every peer" min={0} none="no limit" value={defaults.tokensPerDay} className="w-32" onSave={(n) => void save(["lending", "tokensPerDay"], n, "saved")} /></div>
-          <div><div className="mb-1 text-[12px] text-dim">jobs at once, each model</div>
+          <div><div className="mb-1 text-[12px] text-dim">jobs at once, all models</div>
             <Num label="jobs at once, for every peer" min={1} value={defaults.maxConcurrent} className="w-16" onSave={(n) => void save(["lending", "maxConcurrent"], n, "saved")} /></div>
           <div><div className="mb-1 text-[12px] text-dim">requests an hour, each model</div>
             <Num label="requests an hour, for every peer" min={1} value={defaults.rateLimit} className="w-20" onSave={(n) => void save(["lending", "rateLimit"], n, "saved")} /></div>

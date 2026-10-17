@@ -92,7 +92,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `peers.<name>.lend` | unset | this peer's own lending limits: any of `models`, `tokensPerDay`, `maxConcurrent`, `rateLimit`. Each one set replaces the `lending.*` setting of the same name for this peer. `limits.<model>` sets any of the last three for one model. `off: true` lends it nothing and keeps the rest. Needs `accept`. See [Limits per peer](sharing.md#limits-per-peer) |
 | `lending.models` | `[]` | models peers may run here. Empty lends nothing. A model on a `cloud` backend is refused: a peer would be spending that provider's key |
 | `lending.lane` | lowest-priority lane | which lane borrowed work enters |
-| `lending.maxConcurrent` | `2` | jobs of each model one peer may have in flight |
+| `lending.maxConcurrent` | `2` | jobs one peer may have in flight, across every model: the hardware is shared, so this is one total, unlike the day's tokens and the hour's requests. A model's own `limits.<model>.maxConcurrent` caps that model within it |
 | `lending.rateLimit` | `600` | requests for each model one peer may send an hour. Capacity polling has its own budget |
 | `lending.tokensPerDay` | `0` | tokens one peer may run of each model here in a UTC day. `0` is no limit |
 | `borrowing.firstByteMs` | `180000` | how long to wait for a peer to start answering before falling back. `0` waits forever |

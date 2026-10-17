@@ -243,10 +243,15 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return false;
   }
 
-  /** Jobs one caller may hold per lane; a peer's is its limit for the model, counted over that model's jobs alone. */
-  const capFor = (peer: string | null, model: string): { maxPerCaller?: number; capModel?: boolean } => {
-    const cap = callerCap(peer, { scheduler: cfg.scheduler, peerMaxConcurrent: peer !== null ? limitsFor(termsFor(cfg, peer), model).maxConcurrent : cfg.peerMaxConcurrent });
-    return peer !== null ? { maxPerCaller: cap, capModel: true } : { maxPerCaller: cap };
+  /**
+   * Jobs one caller may hold per lane. A peer's limit is one total over every model, since the
+   * hardware is shared; a model's own limit caps that model as well.
+   */
+  const capFor = (peer: string | null, model: string): { maxPerCaller?: number; maxPerModel?: number } => {
+    const t = peer !== null ? termsFor(cfg, peer) : null;
+    const cap = callerCap(peer, { scheduler: cfg.scheduler, peerMaxConcurrent: t !== null ? t.maxConcurrent : cfg.peerMaxConcurrent });
+    const own = t?.limits?.[model]?.maxConcurrent;
+    return { maxPerCaller: cap, ...(own !== undefined ? { maxPerModel: own } : {}) };
   };
   const peerOverLimit = (name: string, model: string) => overBudget(peerHits, JSON.stringify([name, model]), limitsFor(termsFor(cfg, name), model).rateLimit);
   const controlOverLimit = (name: string) => overBudget(controlHits, name, CONTROL_LIMIT_PER_HOUR);

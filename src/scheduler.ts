@@ -73,8 +73,8 @@ export interface JobSpec {
   id?: string;
   /** Reject once this caller has this many queued-or-running in the lane. */
   maxPerCaller?: number;
-  /** Count only this caller's jobs of the same model against maxPerCaller. */
-  capModel?: boolean;
+  /** Beside maxPerCaller, at most this many of the caller's jobs of this one model. */
+  maxPerModel?: number;
   /** Context this job holds while it runs, counted against the model's pool. */
   tokens?: number;
   /** No slot needed, this one runs off-box. */
@@ -665,8 +665,8 @@ export class Scheduler {
       // burst of concurrent submits serializes properly: first one lands, rest
       // see it. Any check the caller did earlier is just a fast path.
       if (
-        spec.maxPerCaller != null &&
-        this.countFor(job.caller, job.lane, spec.capModel ? job.model : undefined) >= spec.maxPerCaller
+        (spec.maxPerCaller != null && this.countFor(job.caller, job.lane) >= spec.maxPerCaller) ||
+        (spec.maxPerModel != null && this.countFor(job.caller, job.lane, job.model) >= spec.maxPerModel)
       ) {
         job.detach?.();
         reject(new QueueFullError("caller_cap", job.lane));
