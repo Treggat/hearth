@@ -52,8 +52,19 @@ Seven pages, and ⌘K (Ctrl+K) jumps between them and to anything on Topology:
 - **Config**: `hearth.yaml` by section, or as text. See below.
 
 Behind the Models, Keys, Lending and Queue pages a faint ASCII smoke rises,
-thicker and quicker the more the node has queued and running. With reduced
-motion it holds still, and without WebGL2 there is none.
+and beside the Topology and Routing maps it rises behind the sidebar instead,
+thicker and quicker the more the node has queued and running. The load is a
+fire under it: coals along the bottom light the nearest wisps in the theme's
+fire colours, and embers rise off them, more the busier the node. The fire
+tells the truth about the work: each request that finishes sends up a spark,
+blue-hot when it ran on a peer or came in from one; a failed request is a drop
+of rain that hisses on the coals; after a big load falls away, ash drifts down
+for a while; five idle minutes and the fire ashes over, until the next request
+catches it again. A wind leans it all, stronger the busier the node. Clicking
+the empty floor stokes it where you click, and hovering the flame in the
+corner stokes the whole hearth. None of that touches the node. The node's name
+seeds it, so every node burns its own way. With reduced motion it holds still,
+and without WebGL2 there is none.
 
 The live view is 120 samples taken every 5s. The day view and the Logs page are
 held in memory and lost on restart unless `historyFile` names a file to keep
