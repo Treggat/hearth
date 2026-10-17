@@ -51,6 +51,10 @@ Seven pages, and ⌘K (Ctrl+K) jumps between them and to anything on Topology:
   filter, a model filter, a search, and the raw fields a click away.
 - **Config**: `hearth.yaml` by section, or as text. See below.
 
+Behind the Models, Keys, Lending and Queue pages a faint ASCII smoke rises,
+thicker and quicker the more the node has queued and running. With reduced
+motion it holds still, and without WebGL2 there is none.
+
 The live view is 120 samples taken every 5s. The day view and the Logs page are
 held in memory and lost on restart unless `historyFile` names a file to keep
 them in:
