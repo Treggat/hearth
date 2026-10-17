@@ -181,21 +181,27 @@ function Smoke({ load }: { load: number }) {
     // The theme's own greys, as 0..1 RGB: the thin smoke in --dim, the dense halfway to --fg.
     const probe = document.createElement("canvas").getContext("2d", { willReadFrequently: true })!;
     probe.canvas.width = probe.canvas.height = 1;
-    const rgb = (css: string): [number, number, number] => {
-      probe.clearRect(0, 0, 1, 1);
-      probe.fillStyle = "#000";
+    // A colour the canvas cannot read leaves the sentinel in place; that, or an empty
+    // variable, gives the fallback, so a missing theme colour never draws invisible smoke.
+    const SENTINEL = "#010203";
+    const rgb = (css: string, fallback: [number, number, number]): [number, number, number] => {
+      if (!css) return fallback;
+      probe.fillStyle = SENTINEL;
       probe.fillStyle = css;
+      if (probe.fillStyle === SENTINEL) return fallback;
+      probe.clearRect(0, 0, 1, 1);
       probe.fillRect(0, 0, 1, 1);
       const d = probe.getImageData(0, 0, 1, 1).data;
       return [d[0]! / 255, d[1]! / 255, d[2]! / 255];
     };
-    let dim: [number, number, number] = [0.5, 0.5, 0.5], hot = dim, alpha = 0.4;
+    const GREY: [number, number, number] = [0.55, 0.55, 0.55];
+    let dim = GREY, hot = GREY, alpha = 0.4;
     const colours = () => {
       const s = getComputedStyle(document.documentElement);
-      dim = rgb(s.getPropertyValue("--dim").trim());
-      const fg = rgb(s.getPropertyValue("--fg").trim());
+      dim = rgb(s.getPropertyValue("--dim").trim(), GREY);
+      const fg = rgb(s.getPropertyValue("--fg").trim(), [0.75, 0.75, 0.75]);
       hot = [0, 1, 2].map((i) => dim[i]! + (fg[i]! - dim[i]!) * 0.55) as [number, number, number];
-      const bg = rgb(s.getPropertyValue("--bg").trim());
+      const bg = rgb(s.getPropertyValue("--bg").trim(), [0.5, 0.5, 0.5]);
       alpha = (bg[0] + bg[1] + bg[2]) / 3 < 0.5 ? 0.42 : 0.34;
     };
 
