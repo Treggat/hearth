@@ -1,6 +1,7 @@
 /**
  * A slice of rising smoke, lit by a fanned sheet of light and drawn in ASCII,
- * behind the Queue page. The busier the node, the thicker and quicker it rises.
+ * behind the Queue, Models, Keys and Lending pages. The busier the node, the
+ * thicker and quicker it rises.
  * WebGL2 in two passes: the first works out how bright the smoke is in each
  * character cell, the second draws each cell's glyph from a small atlas. No
  * WebGL2, no smoke; with reduced motion, one still frame. It takes no input.
@@ -110,8 +111,8 @@ function program(gl: WebGL2RenderingContext, fs: string): Program {
   return { p, u };
 }
 
-/** The smoke for the Queue page: as busy as the node is, counting a backlog of twice its slots as full. */
-export function QueueSmoke() {
+/** The smoke behind a page: as busy as the node is, counting a backlog of twice its slots as full. */
+export function NodeSmoke() {
   const jobs = useStore((s) => s.data?.q.jobs.length ?? 0);
   const slots = useStore((s) => s.data?.q.capacity.slots ?? 1);
   return <Smoke load={jobs / Math.max(4, slots * 2)} />;

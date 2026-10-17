@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { Config } from "./config.js";
 import { Logs } from "./logs.js";
 import { CanaryAlert, History, Inspector, KeyOnce, Keys, Models, Queue } from "./pages.js";
-import { QueueSmoke } from "./Smoke.js";
+import { NodeSmoke } from "./Smoke.js";
 import { Palette } from "./Palette.js";
 import type { UiData } from "./types.js";
 import { go, login, logout, pageOf, restartNode, select, useStore, type Page } from "./store.js";
@@ -421,19 +421,18 @@ export default function App() {
           </div>
         ) : page === "logs" ? (
           <div className="flex min-h-0 flex-1 flex-col p-5"><Logs /></div>
-        ) : page === "queue" ? (
-          // The smoke fills the page behind the cards and stays put while they scroll.
-          <div className="relative flex min-h-0 flex-1 flex-col">
-            <QueueSmoke />
-            <div className="relative min-h-0 flex-1 overflow-auto p-5"><Queue /><History /></div>
-          </div>
         ) : (
-          <div className="min-h-0 flex-1 overflow-auto p-5">
+          // The smoke fills the page behind the cards and stays put while they scroll; Config is a form, read without it.
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            {page !== "config" && <NodeSmoke />}
+          <div className="relative min-h-0 flex-1 overflow-auto p-5">
             {page === "models" && <Models />}
             {page === "lending" && <Lending />}
             {page === "keys" && <Keys />}
+            {page === "queue" && <><Queue /><History /></>}
             {/* What has been published, and the way back to it, wherever the file is edited. */}
             {page === "config" && <><div className="mb-2 flex justify-end"><VersionsHere /></div><Config /></>}
+          </div>
           </div>
         )}
       </main>

@@ -47,11 +47,13 @@ Seven pages, and ⌘K (Ctrl+K) jumps between them and to anything on Topology:
   waited and ran, over the last ten minutes or the last day; a row opens to
   its individual calls. The day view adds
   a chart of requests per 15 minutes, failures in red, with queue depth behind.
-  Behind the page, a faint ASCII smoke rises, thicker and quicker the more
-  the node has queued and running; with reduced motion it holds still.
 - **Logs**: hearth's recent log lines as sentences, newest first, with a level
   filter, a model filter, a search, and the raw fields a click away.
 - **Config**: `hearth.yaml` by section, or as text. See below.
+
+Behind the Models, Keys, Lending and Queue pages a faint ASCII smoke rises,
+thicker and quicker the more the node has queued and running. With reduced
+motion it holds still, and without WebGL2 there is none.
 
 The live view is 120 samples taken every 5s. The day view and the Logs page are
 held in memory and lost on restart unless `historyFile` names a file to keep
