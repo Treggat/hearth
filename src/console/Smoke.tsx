@@ -224,7 +224,10 @@ void main(){
   float ray=0.88+0.12*sin(ang*55.0+sin(t*0.5)*1.5);
   float r=length(v)/max(size.x,size.y); float fall=1.0/(1.0+r*r*1.1);
   // The bottom fade lifts as the fire builds, so dense smoke sits right over the coals.
-  float fade=smoothstep(0.0,0.05,y)*(1.0-smoothstep(0.75,1.0,y)*(1.0-0.6*uLoad));
+  // Under the page header, where bare text can sit, the whole effect fades out over the first hundred
+  // pixels, so no glyph runs through a line of text.
+  float top=smoothstep(16.0,104.0,px.y);
+  float fade=top*(1.0-smoothstep(0.75,1.0,y)*(1.0-0.6*uLoad));
   float smoke=d*fan*ray*fall*fade*mix(0.75,1.15,uLoad);
   // The coals: the bottom band, patchy with a slow noise of its own, flickering.
   float spots=0.55+0.45*(0.5+0.5*snoise(vec3(px.x/150.0+uSeed.w*50.0,px.y/70.0,t*0.07)));
@@ -232,7 +235,8 @@ void main(){
   float heat=clamp(band*spots*flick*uHeat+stoke,0.0,1.0);
   // The fire lights the smoke from below: the wisps nearest the coals take its colour. A stoke
   // lights even thin smoke, so the flare shows wherever the click lands, but never past a plus.
-  float glow=(d*heat+max(stoke,0.0)*(0.25+0.5*d))*0.8;
+  float glow=(d*heat+max(stoke,0.0)*(0.25+0.5*d))*0.8*top;
+  ember*=top;
   o=vec4(smoke+steam*0.6,glow,ember,ember>0.0?(kind*64.0+floor(age*63.0))/255.0:heat);
 }`;
 
