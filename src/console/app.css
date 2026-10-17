@@ -70,6 +70,15 @@ body {
 }
 .tabular { font-variant-numeric: tabular-nums; }
 
+/* The flame in the sidebar corner flickers when hovered; the smoke answers on its own. */
+@keyframes flare {
+  0%, 100% { transform: scale(1) rotate(0); filter: brightness(1); }
+  25% { transform: scale(1.2) rotate(-8deg); filter: brightness(1.35); }
+  55% { transform: scale(1.1) rotate(7deg); filter: brightness(1.2); }
+  80% { transform: scale(1.16) rotate(-3deg); filter: brightness(1.3); }
+}
+.flame:hover { animation: flare 0.9s ease-in-out; transform-origin: 50% 80%; }
+
 .react-flow {
   --xy-background-color: transparent;
   --xy-edge-stroke: var(--border);

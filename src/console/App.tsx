@@ -346,7 +346,10 @@ export default function App() {
     <div className="flex h-full">
       <nav className="flex w-52 shrink-0 flex-col border-r border-line bg-panel px-3 py-4 max-md:w-14 max-md:px-2">
         <div className="mb-6 flex items-center gap-2 px-2">
-          <Flame size={18} className="text-accent" />
+          {/* Hovering the flame stokes the whole hearth: the flame flickers and every smoke on the page glows and sparks. */}
+          <span className="flame inline-flex" onPointerEnter={() => window.dispatchEvent(new Event("hearth-stoke"))}>
+            <Flame size={18} className="text-accent" />
+          </span>
           <span className="font-semibold tracking-tight max-md:hidden">hearth</span>
         </div>
         {PAGES.map((p) => (
@@ -357,8 +360,13 @@ export default function App() {
             <span className="max-md:hidden">{p.label}</span>
           </button>
         ))}
-        <div className="mt-auto px-2 text-[11px] text-dim max-md:hidden">
-          <div><kbd className="rounded border border-line px-1">⌘K</kbd> to jump</div>
+        {/* The maps have no smoke of their own, so beside them it rises in the sidebar's empty stretch, down to
+            the bottom edge; the jump hint floats on it in a bubble of its own, so no text sits over the glyphs. */}
+        <div className="relative flex min-h-0 flex-1 flex-col justify-end">
+          {(page === "topology" || page === "routing") && <NodeSmoke />}
+          <div className="relative mx-1 self-start rounded-lg border border-line bg-panel px-2 py-1 text-[11px] text-dim max-md:hidden">
+            <kbd className="rounded border border-line px-1">⌘K</kbd> to jump
+          </div>
         </div>
       </nav>
 
@@ -425,7 +433,7 @@ export default function App() {
           // The smoke fills the page behind the cards and stays put while they scroll; Config is a form, read without it.
           <div className="relative flex min-h-0 flex-1 flex-col">
             {page !== "config" && <NodeSmoke />}
-            <div className="relative min-h-0 flex-1 overflow-auto p-5">
+            <div className="relative min-h-0 flex-1 overflow-auto p-5" data-smoke="floor">
               {page === "models" && <Models />}
               {page === "lending" && <Lending />}
               {page === "keys" && <Keys />}
