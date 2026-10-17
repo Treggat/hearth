@@ -425,14 +425,14 @@ export default function App() {
           // The smoke fills the page behind the cards and stays put while they scroll; Config is a form, read without it.
           <div className="relative flex min-h-0 flex-1 flex-col">
             {page !== "config" && <NodeSmoke />}
-          <div className="relative min-h-0 flex-1 overflow-auto p-5">
-            {page === "models" && <Models />}
-            {page === "lending" && <Lending />}
-            {page === "keys" && <Keys />}
-            {page === "queue" && <><Queue /><History /></>}
-            {/* What has been published, and the way back to it, wherever the file is edited. */}
-            {page === "config" && <><div className="mb-2 flex justify-end"><VersionsHere /></div><Config /></>}
-          </div>
+            <div className="relative min-h-0 flex-1 overflow-auto p-5">
+              {page === "models" && <Models />}
+              {page === "lending" && <Lending />}
+              {page === "keys" && <Keys />}
+              {page === "queue" && <><Queue /><History /></>}
+              {/* What has been published, and the way back to it, wherever the file is edited. */}
+              {page === "config" && <><div className="mb-2 flex justify-end"><VersionsHere /></div><Config /></>}
+            </div>
           </div>
         )}
       </main>
