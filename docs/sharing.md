@@ -128,7 +128,7 @@ that has used its day of one model still has its day of every other. A peer's ow
 lending:
   models: [small-model]     # what any peer may run
   tokensPerDay: 500000      # each peer, each model, in a UTC day; 0 is no limit
-  maxConcurrent: 2          # jobs of each model in flight
+  maxConcurrent: 2          # jobs in flight, across every model
   rateLimit: 600            # requests for each model an hour
 
 peers:
@@ -138,7 +138,7 @@ peers:
       models: [small-model, big-model]   # this one may run the big one too
       tokensPerDay: 2000000
       limits:
-        big-model: { tokensPerDay: 200000, maxConcurrent: 1 }   # but less of it
+        big-model: { tokensPerDay: 200000, maxConcurrent: 1 }   # and at most one of those jobs on it
   acquaintance:
     accept: env:HEARTH_PEER_ACQUAINTANCE   # the node's limits, as they are
 ```

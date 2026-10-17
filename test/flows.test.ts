@@ -551,6 +551,7 @@ const heavy = { inputs: ["big"], steps: [{ when: { caller: "app" }, to: { peer: 
   const told = posted[0]!;
   assert.deepEqual([told["model"], told["backend"], told["outcome"]], ["big", "main", "ok"]);
   assert.ok((told["ranMs"] as number) >= 500 && (told["ms"] as number) >= (told["ranMs"] as number), "with how long it ran, out of how long it took");
+  assert.ok((told["queuedMs"] as number) >= 0, "and the wait before it, never below zero");
   // Its response closed, so the line has room again.
   const third = ask();
   await until(() => release.length === 1);
@@ -839,6 +840,36 @@ const heavy = { inputs: ["big"], steps: [{ when: { caller: "app" }, to: { peer: 
   // A strict router's callers get the model the line names, or its failure.
   assert.ok((await post("k-test", "TTS:fast")) >= 500);
   assert.equal(got.length, before + 1, "and nothing ran in its place");
+  await node.close();
+  backend.closeAllConnections();
+  backend.close();
+}
+
+// --- a path with the model in it falls through to the next line, under that line's model ---------------
+{
+  const got: string[] = [];
+  const backend = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      got.push(req.url ?? "");
+      // One model is broken; the other answers.
+      res.writeHead(req.url?.includes("img-a") ? 502 : 200, { "Content-Type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
+  const node = createNode(parseConfig({
+    backends: { draw: { url, kind: "none", serves: ["img-a", "img-b"], routes: [{ path: "/upstream/{model}/generate", lane: "chat" }] } },
+    scheduler: { lanes: { chat: { priority: 0 } } },
+    flows: { ImageGen: { takes: "/upstream/{model}/generate", inputs: ["ImageGen"], steps: [{ to: "img-a" }, { to: "img-b" }] } },
+  }), silentLogger);
+  const at = await new Promise<string>((ready) =>
+    node.server.listen(0, "127.0.0.1", () => ready(`http://127.0.0.1:${(node.server.address() as AddressInfo).port}`)));
+  const r = await fetch(`${at}/upstream/ImageGen/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: "a fox" }) });
+  await r.text();
+  // The first line's model fails before anything reaches the client: the next line runs, at its own path.
+  assert.deepEqual([r.status, got], [200, ["/upstream/img-a/generate", "/upstream/img-b/generate"]]);
   await node.close();
   backend.closeAllConnections();
   backend.close();

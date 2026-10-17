@@ -243,10 +243,15 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
     return false;
   }
 
-  /** Jobs one caller may hold per lane; a peer's is its limit for the model, counted over that model's jobs alone. */
-  const capFor = (peer: string | null, model: string): { maxPerCaller?: number; capModel?: boolean } => {
-    const cap = callerCap(peer, { scheduler: cfg.scheduler, peerMaxConcurrent: peer !== null ? limitsFor(termsFor(cfg, peer), model).maxConcurrent : cfg.peerMaxConcurrent });
-    return peer !== null ? { maxPerCaller: cap, capModel: true } : { maxPerCaller: cap };
+  /**
+   * Jobs one caller may hold per lane. A peer's limit is one total over every model, since the
+   * hardware is shared; a model's own limit caps that model as well.
+   */
+  const capFor = (peer: string | null, model: string): { maxPerCaller?: number; maxPerModel?: number } => {
+    const t = peer !== null ? termsFor(cfg, peer) : null;
+    const cap = callerCap(peer, { scheduler: cfg.scheduler, peerMaxConcurrent: t !== null ? t.maxConcurrent : cfg.peerMaxConcurrent });
+    const own = t?.limits?.[model]?.maxConcurrent;
+    return { maxPerCaller: cap, ...(own !== undefined ? { maxPerModel: own } : {}) };
   };
   const peerOverLimit = (name: string, model: string) => overBudget(peerHits, JSON.stringify([name, model]), limitsFor(termsFor(cfg, name), model).rateLimit);
   const controlOverLimit = (name: string) => overBudget(controlHits, name, CONTROL_LIMIT_PER_HOUR);
@@ -896,10 +901,12 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
         };
         if (action.on === "decided") act(a.name, action, facts);
         else ended.push((error) => {
-          const ms = Date.now() - startedAt;
+          // One reading of the clock, so the time it ran is never more than the time it took.
+          const now = Date.now();
+          const ms = now - startedAt;
           if ((action.on === "failed" && error === null) || (action.slowerThan > 0 && ms <= action.slowerThan)) return;
           // Where it ended up, which a failed backend or peer may have changed since the step decided.
-          const ran = t.startedAt > 0 ? Date.now() - t.startedAt : 0;
+          const ran = t.startedAt > 0 ? now - t.startedAt : 0;
           act(a.name, action, { ...facts, model, backend: ranOn, outcome: error === null ? "ok" : "failed", ms, error: error ?? "", queuedMs: ms - ran, ranMs: ran });
         });
       }
@@ -2067,12 +2074,14 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
       const name = typeof body.name === "string" ? body.name.trim() : "";
       if (!PEER_NAME.test(name)) throw new Refusal(400, "name must be 1-40 letters, digits, '.', '_' or '-'");
       const knows = Array.isArray(body.knows) ? body.knows.filter((k): k is string => typeof k === "string").slice(0, 64) : [];
+      // Claimed before the lookup awaits, so a second try with the same secret cannot race this one.
+      invites.delete(secret);
       const known = await knownJoiner(c.req, secret, knows);
       if (known === null && (name in cfg.peerTokens || cfg.peers.some((p) => p.name === name))) {
+        // A taken name spends nothing: the joiner may try again under another.
+        invites.set(secret, until);
         throw new Refusal(409, `this node already has a peer called ${name}`);
       }
-      // Spent before the write, so a second try with the same secret cannot race this one.
-      invites.delete(secret);
       const peer = known?.peer ?? name;
       const kept = cfg.peerTokens[peer];
       const token = kept ?? "hpeer_" + randomBytes(24).toString("hex");
@@ -2720,8 +2729,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           }
         }
       }
-      // A path with the model in it is matched to its backend by that name, so only the others can be asked again.
-      if (!held && r.path.length > 0) {
+      if (r.path.length > 0) {
         flowed = name;
         again = (failed) => resolve(name, { ...world, noPeers: true, skip: new Set(failed) });
       }
@@ -2848,7 +2856,9 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
           // What is left if this fails before anything reaches the client: the flow's next line that ends at a
           // model this path can run, as a chat flow's would, and after the last of those the route's own fallback.
           const next = !strict && again ? again([...failed, as]) : null;
-          const line = next && next.target === "local" && next.model !== as && !failed.includes(next.model) ? placeOf(next.model) : undefined;
+          const usable = next && next.target === "local" && next.model !== as && !failed.includes(next.model);
+          // A path with the model in it runs the next line at that path for its model.
+          const line = !usable ? undefined : held ? pool.forPath(held.as(next.model))?.slot : placeOf(next.model);
           const more = line ? { slot: line, model: next!.model, line: next }
             : spare && fb && !fellBack ? { slot: spare, model: fb.model, line: null } : null;
           try {
@@ -2864,7 +2874,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger): HearthNode {
             failed.push(as);
             if (more.line && flowed !== null) settle(more.line, flowed, who);
             else fellBack = true;
-            [to, as, sendBody] = [more.slot, more.model, renamed(more.model)];
+            if (held && more.line) outPath = held.as(more.model);
+            [to, as, sendBody] = [more.slot, more.model, held && more.line ? sendBody : renamed(more.model)];
           }
         }
       } else if (routed) {
