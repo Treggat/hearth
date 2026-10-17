@@ -329,19 +329,19 @@ function Smoke({ load, seed, recent }: { load: number; seed: [number, number, nu
   // The last twelve stokes, as (cell x, cell y, when, kind), oldest overwritten first: kind 1 is a
   // click, 0.5 a finished request, 0.4 one in from a peer, 0.3 one sent to a peer, 0.2 a failure.
   // The grid size rides along so a spark can start on the bottom row and a drop at the top.
-  const ring = useRef({ v: new Float32Array(48), next: 0, cols: 1, rows: 1 }).current;
+  const ring = useRef({ v: new Float32Array(48), next: 0, cols: 1, rows: 1, sized: false }).current;
   const put = (x: number, y: number, kind: number) => {
     ring.v.set([x, y, performance.now() / 1000, kind], ring.next * 4);
     ring.next = (ring.next + 1) % 12;
   };
-  // Each new request sends its thing, at most four per update; the newest success is when the
-  // fire last had work, which decides whether it has ashed over.
+  // Each new request sends its thing, at most four per update, once the grid has been sized; the
+  // newest success is when the fire last had work, which decides whether it has ashed over.
   const seen = useRef(0);
   const worked = useRef(Date.now());
   const catching = useRef(false);
   useEffect(() => {
     if (!recent?.length) return;
-    if (seen.current) {
+    if (seen.current && ring.sized) {
       for (let i = 0, n = 0; i < recent.length && recent[i]!.t > seen.current && n < 4; i++, n++) {
         const r = recent[i]!;
         // A request that ran and failed is rain; one refused before it ran, with nowhere it ran, is nothing.
@@ -394,6 +394,7 @@ function Smoke({ load, seed, recent }: { load: number; seed: [number, number, nu
       rows = Math.ceil(canvas.height / ch);
       ring.cols = cols;
       ring.rows = rows;
+      ring.sized = true;
       gl.bindTexture(gl.TEXTURE_2D, density);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
