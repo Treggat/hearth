@@ -10,7 +10,7 @@ import { flowsOf } from "./route.js";
 import type { Controls } from "./controls.js";
 import { KEEP, type History } from "./history.js";
 import type { ConfigFile } from "./configfile.js";
-import type { PeerRegistry } from "./peers.js";
+import type { LentTerms, PeerRegistry } from "./peers.js";
 import type { RecentCall } from "./server.js";
 import { troubleSays } from "./backend.js";
 import type { BackendPool } from "./pool.js";
@@ -77,6 +77,10 @@ export interface LedgerRow {
   own?: string[];
   /** Why it is turned away right now; null when it is not. */
   closed?: string | null;
+  /** Tokens it ran here today, by model, against each model's own day. */
+  lentToday?: Record<string, number>;
+  /** What this node borrows from it, by this node's model id: their id, and what they hold us to on it when they say. */
+  received?: Record<string, { theirs: string; terms?: LentTerms }>;
 }
 
 export interface ViewDeps {

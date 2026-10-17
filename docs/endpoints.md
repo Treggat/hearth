@@ -32,7 +32,7 @@ Beyond `/v1/chat/completions` and `/v1/models`:
 | `/ui/lending` | loopback, or a login | what `/lending` answers, for the Lending page |
 | `/ui/logs` | loopback, or a login | the most recent log lines (up to 5,000), for the Logs page |
 | `/healthz` | anyone | whether this node can serve. `503` when it can't. The one unauthenticated endpoint |
-| `/peer/hello`, `/peer/state` | peers | identity and capacity, per model |
+| `/peer/hello`, `/peer/state` | peers | identity and capacity, per model, with the limits the peer is held to on each |
 | `/peers/invite` | local | `POST { url }`: a one-time code (`hearth-invite:…`) holding `url`, where the other node reaches this one, and a secret. Good for 10 minutes and held in memory, so a restart voids it. What `hearth invite` asks for |
 | `/peers/machine` | local | `GET ?peer=<name>`: what that peer's token is bound to (`bound`, or `null`), and the address it last presented it from with the tailnet machine this node's tailscaled says that is (`seen.node`, `null` off the tailnet, `seen.error` when tailscaled cannot be asked). `seen` is `null` until it calls. What the Lending page offers to bind to |
 | `/peers/join` | local | `POST { code, as? }`: redeem another node's invite. Asks it to take this node as a peer, then adds it under `peers.<its name>` (or `as`) with the token it answered. An entry already at the code's address, or the one the inviter recognised, takes the url and token instead of a new one: `409` before the inviter is asked when the name is a peer this node borrows from at another address, and a peer it only lends to keeps its entry. What `hearth join` asks for |

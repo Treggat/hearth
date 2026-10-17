@@ -120,15 +120,16 @@ or the file itself, and applies without a restart:
 
 ## Limits per peer
 
-`lending:` says what every peer may take. A peer's own `lend:` restates any of it
-for that peer alone:
+`lending:` says what every peer may take. Each limit holds per model: a peer
+that has used its day of one model still has its day of every other. A peer's own
+`lend:` restates any of it for that peer alone, and its `limits:` for one model:
 
 ```yaml
 lending:
   models: [small-model]     # what any peer may run
-  tokensPerDay: 500000      # each, in a UTC day; 0 is no limit
-  maxConcurrent: 2          # jobs in flight
-  rateLimit: 600            # requests an hour
+  tokensPerDay: 500000      # each peer, each model, in a UTC day; 0 is no limit
+  maxConcurrent: 2          # jobs in flight, across every model
+  rateLimit: 600            # requests for each model an hour
 
 peers:
   friend:
@@ -136,6 +137,8 @@ peers:
     lend:
       models: [small-model, big-model]   # this one may run the big one too
       tokensPerDay: 2000000
+      limits:
+        big-model: { tokensPerDay: 200000, maxConcurrent: 1 }   # and at most one of those jobs on it
   acquaintance:
     accept: env:HEARTH_PEER_ACQUAINTANCE   # the node's limits, as they are
 ```
@@ -143,10 +146,15 @@ peers:
 `lend: { off: true }` lends one peer nothing and leaves its limits in the file
 for when it is turned back on.
 
-A peer that has used its tokens for the day, or is turned off, is shown a node that lends it
-nothing, on the same poll that reports capacity, so its flows stop choosing you
-instead of sending work to be refused. One that asks anyway gets a `429` that
-says so. The day's tokens are counted as each answer ends, so a peer can pass
+A peer that is turned off is shown a node that lends it nothing, and one that has
+used a model's tokens for the day is shown a node that does not lend that model,
+on the same poll that reports capacity, so its flows stop choosing you instead of
+sending work to be refused. One that asks anyway gets a `429` that says so.
+
+The same poll tells each peer, for every model it is lent, the three limits it is
+held to and how many of the day's tokens it has used. Its console shows them
+beside the models it borrows. A node that predates this says nothing, and is shown
+as not stating them. The day's tokens are counted as each answer ends, so a peer can pass
 its limit by what it had in flight when it reached it.
 
 A model taken back on the Models page, or with `share` on `/control`, is taken

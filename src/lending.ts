@@ -1,8 +1,8 @@
 /**
  * What one peer may take from this node: the node's lending limits with that peer's own laid over
- * them, and whether they let it in right now.
+ * them, each held per model, and whether they let it in right now.
  */
-import type { HearthConfig, LendTerms } from "./config.js";
+import type { HearthConfig, LendTerms, ModelLimits } from "./config.js";
 import type { Row } from "./usage.js";
 
 type Lending = Pick<HearthConfig, "share" | "lendTokensPerDay" | "peerMaxConcurrent" | "peerRateLimit" | "peerTerms">;
@@ -18,9 +18,18 @@ export function termsFor(cfg: Lending, peer: string): LendTerms {
   };
 }
 
-/** Why a peer on these limits is turned away right now, given what it ran here today; null when it is not. */
-export function closedWhy(t: LendTerms, lentToday: Row): string | null {
-  if (t.off) return "lending to this peer is off";
-  if (t.tokensPerDay > 0 && lentToday.in + lentToday.out >= t.tokensPerDay) return `today's ${t.tokensPerDay} tokens are used (UTC)`;
-  return null;
+/** What one model is held to under these terms: the peer's three, with that model's own laid over them. */
+export function limitsFor(t: LendTerms, model: string): ModelLimits {
+  return { tokensPerDay: t.tokensPerDay, maxConcurrent: t.maxConcurrent, rateLimit: t.rateLimit, ...t.limits?.[model] };
+}
+
+/** Why a peer on these terms is turned away from every model right now; null when it is not. */
+export function closedWhy(t: LendTerms): string | null {
+  return t.off ? "lending to this peer is off" : null;
+}
+
+/** Why a peer is turned away from one model, given what it ran of that model today; null when it is not. */
+export function spentWhy(model: string, l: ModelLimits, ranToday: Row | undefined): string | null {
+  const used = ranToday ? ranToday.in + ranToday.out : 0;
+  return l.tokensPerDay > 0 && used >= l.tokensPerDay ? `today's ${l.tokensPerDay} tokens of ${model} are used (UTC)` : null;
 }

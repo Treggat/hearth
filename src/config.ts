@@ -35,7 +35,12 @@ export interface LendTerms {
   rateLimit: number;
   /** Nothing is lent to this peer while set; only a peer's own `lend:` carries it. */
   off?: boolean;
+  /** One model's own limits, each laid over the three above for that model; only a peer's own `lend:` carries them. */
+  limits?: Record<string, Partial<ModelLimits>>;
 }
+
+/** The limits each lent model is held to on its own: a peer's use of one model never spends another's. */
+export type ModelLimits = Pick<LendTerms, "tokensPerDay" | "maxConcurrent" | "rateLimit">;
 
 /** A backend's `kind`, one of the entries in kinds.ts. */
 export type WarmSource = KindName;
@@ -1624,6 +1629,16 @@ export function parseConfig(raw: unknown): HearthConfig {
       const lend = asRecord(entry.lend, `${at}.lend`);
       only(lend, "lend", `${at}.lend`);
       peerTerms[name] = lendTerms(lend, `${at}.lend`);
+      if (lend.limits !== undefined) {
+        const limits: Record<string, Partial<ModelLimits>> = {};
+        for (const [model, l] of Object.entries(asRecord(lend.limits, `${at}.lend.limits`))) {
+          const where = `${at}.lend.limits.${model}`;
+          const rec = asRecord(l ?? {}, where);
+          only(rec, "limit", where);
+          limits[model] = lendTerms(rec, where);
+        }
+        if (Object.keys(limits).length > 0) peerTerms[name].limits = limits;
+      }
       if (lend.off !== undefined) {
         if (typeof lend.off !== "boolean") throw bad(`${at}.lend.off`, "must be true or false");
         if (lend.off) peerTerms[name].off = true;
