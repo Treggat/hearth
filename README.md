@@ -5,6 +5,8 @@
 [![Node](https://img.shields.io/node/v/@vcvzgbzz/hearth)](package.json)
 [![License: MIT](https://img.shields.io/github/license/Vcvzgbzz/hearth)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/xH4p2FTpqn)
+[![Website](https://img.shields.io/badge/website-hearthrouter.com-f08042)](https://www.hearthrouter.com)
+[![Demo](https://img.shields.io/badge/demo-try_it_in_your_browser-f08042)](https://www.hearthrouter.com/demo/)
 
 A queue in front of your local inference server, and optionally a way to lend
 the spare capacity to someone you trust.
@@ -25,7 +27,8 @@ the whole migration.
 
 ![The console: routing rules decide where a request goes, the queue holds work so one card does not thrash between models, and a peer takes the overflow and lends a model this node does not run](assets/demo.gif)
 
-No GPU to hand? Clone the repo and run `npm install && npm run demo`: a node
+No GPU to hand? [Try the demo in your browser](https://www.hearthrouter.com/demo/),
+or clone the repo and run `npm install && npm run demo`: a node
 with one of everything and stand-ins behind it, at
 <http://127.0.0.1:4300/ui>. The screenshots below are of it. See
 [`demo/`](demo/README.md).
