@@ -99,7 +99,8 @@ const node = createNode(parseConfig({
     split: { accept: "split-token", lend: { models: ["big", "small"], limits: { small: { tokensPerDay: 50, rateLimit: 1 } } } },
     shut: { accept: "shut-token", lend: { off: true } },
     brisk: { accept: "brisk-token", lend: { rateLimit: 1 } },
-    single: { accept: "single-token", lend: { models: ["big", "small"], maxConcurrent: 1 } },
+    single: { accept: "single-token", lend: { models: ["big", "small"], maxConcurrent: 2, limits: { small: { maxConcurrent: 1 } } } },
+    one: { accept: "one-token", lend: { models: ["big", "small"], maxConcurrent: 1 } },
   },
   flows: { away: { inputs: ["away"], steps: [{ to: { peer: "close" } }, { to: { refuse: "not run here" } }] } },
 }), silentLogger);
@@ -158,6 +159,15 @@ try {
   held = null;
   release();
   assert.deepEqual([(await first).status, second, (await other).status], [200, 429, 200], "its one job of small is taken, and big's is not");
+
+  // The total holds across models: a peer held to one job is refused another on any model.
+  held = new Promise<void>((r) => { release = r; });
+  const only = chat("one-token", "small");
+  await new Promise((r) => setTimeout(r, 100));
+  const elsewhere = await Promise.race([chat("one-token", "big").then((r) => r.status), new Promise<number>((r) => setTimeout(() => r(0), 3000))]);
+  held = null;
+  release();
+  assert.deepEqual([(await only).status, elsewhere], [200, 429], "its one job is taken, whichever model asks");
 
   // What was lent and what was borrowed are counted apart, per peer.
   assert.equal((await chat("close-token", "big")).status, 200);

@@ -34,7 +34,7 @@ export const SECTION_KEYS = ["backends", "resources", "servers", "models", "flow
 const TERMS: Record<string, Field> = {
   models: { type: "refs", ref: "models", desc: "Models peers may run here. Empty lends nothing." },
   tokensPerDay: { type: "number", min: 0, desc: "Tokens one peer may run of each model here in a UTC day. 0 is no limit.", def: 0 },
-  maxConcurrent: { type: "number", min: 1, desc: "Jobs of each model one peer may have in flight.", def: 2 },
+  maxConcurrent: { type: "number", min: 1, desc: "Jobs one peer may have in flight here, across every model.", def: 2 },
   rateLimit: { type: "number", min: 1, desc: "Requests for each model one peer may send an hour. Capacity polling has its own budget.", def: 600 },
 };
 
@@ -181,7 +181,7 @@ export const FIELDS: Record<Scope, Record<string, Field>> = {
   },
   limit: {
     tokensPerDay: { type: "number", min: 0, desc: "Tokens this peer may run of this model in a UTC day. 0 is no limit." },
-    maxConcurrent: { type: "number", min: 1, desc: "Jobs of this model this peer may have in flight." },
+    maxConcurrent: { type: "number", min: 1, desc: "At most this many of the peer's jobs on this model, within its total." },
     rateLimit: { type: "number", min: 1, desc: "Requests for this model this peer may send an hour." },
   },
   lending: {
