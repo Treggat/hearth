@@ -280,6 +280,53 @@ export interface LendTerms extends ModelLimits { models: string[]; off?: boolean
 /** A model's limits as the peer lending it states them, with how much of today this node has used. */
 export interface LentTerms extends ModelLimits { usedToday: number }
 
+export type PluginStage = "request" | "routed" | "parallel" | "stream" | "response" | "log" | "error";
+export type StageNumbers = { calls: number; errors: number; refused: number; flagged: number; skipped: number; p50: number; p95: number };
+
+/** One plugin as /plugins reports it. */
+export interface PluginView {
+  name: string;
+  trust: "code" | "http";
+  state: "running" | "failed" | "off";
+  error: string | null;
+  /** What runs, by request kind: the plugin's own declaration narrowed by the config. */
+  kinds: Partial<Record<string, PluginStage[]>>;
+  declared: Partial<Record<string, PluginStage[]>>;
+  /** Its model slots, each with the kind of model it takes. */
+  needs: Record<string, { kind: string; optional?: boolean }>;
+  /** The models wired into its slots on the plugin itself. */
+  models: Record<string, string>;
+  /** Runs on every line rather than where a step places it. */
+  everyLine: boolean;
+  use: string;
+  when: { asked?: string[]; askedNot?: string[]; caller?: string[]; callerNot?: string[]; lane?: string[]; target?: string[]; header?: Record<string, string[]> } | null;
+  timeoutMs: number;
+  onError: "skip" | "refuse";
+  onFail: "refuse" | "flag";
+  locked: boolean;
+  required: boolean;
+  reads: string[];
+  paused: boolean;
+  pausedUntil: number;
+  failOpens: number;
+  stages: Partial<Record<PluginStage, StageNumbers>>;
+}
+
+export interface PluginsView {
+  plugins: PluginView[];
+  /** Every placement on a line, as the running config has it. */
+  placed: { plugin: string; router: string; flow: string; step: number; kind: string; models: Record<string, string> }[];
+  /** Models that take something other than chat, by id. */
+  modelKinds: Record<string, string>;
+  /** The kinds and stages this build runs plugins for. */
+  liveKinds: string[];
+  liveStages: PluginStage[];
+  /** Each router: the global plugins it turns off or gives settings of its own, and the callers that go by it. */
+  routers: Record<string, { plugins: Record<string, "off" | "own">; /** For "own": the settings it changes, by name. */ changes: Record<string, string[]>; callers: string[] }>;
+  /** Plugins in hearth.yaml that differ from the running ones, until a restart. */
+  pending: { name: string; change: "added" | "changed" | "removed" }[];
+}
+
 export interface UiData {
   /** Which console the node serves now; the page reloads when it stops being the one it was loaded from. */
   build?: string;
@@ -330,4 +377,6 @@ export interface UiData {
   update?: string | null;
   /** The requests this node made most recently, newest first; neither `backend` nor `peer` when it never ran. */
   recent?: { t: number; model: string; caller: string; backend?: string; peer?: string; ms: number; ok: boolean }[];
+  /** Plugins, for the Plugins page and the Routing map. Absent on an older server's payload. */
+  plugins?: PluginsView;
 }
