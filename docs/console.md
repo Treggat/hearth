@@ -36,7 +36,19 @@ Seven pages, and ⌘K (Ctrl+K) jumps between them and to anything on Topology:
   does, where the pointer is: a new backend, hardware, machine or provider, the
   published versions, and fitting the picture in view.
 - **Routing**: every model name, the rules some pass through, and where each
-  ends up, as a map you edit. See [Editing on the graph](#editing-on-the-graph).
+  ends up, as a map you edit. Plugins on a line are blocks between its
+  conditions and where it sends the request; plugins that run on every line
+  are a badge on the router. See [Editing on the graph](#editing-on-the-graph).
+- **Plugins**: every plugin, what it runs as (in-process or a service), the
+  kinds of request it handles, the models wired into its slots, the lines it
+  runs on and how it is doing. A plugin's panel wires its model slots (each
+  offering only models of its kind), lists its lines with a link to each on
+  the Routing map, says what it is sent and how it fails, and pauses it until
+  resumed or restarted; a locked plugin cannot be paused. **Add plugin** adds
+  a service: hearth reads what it handles and the models it needs from its
+  `/manifest`, you wire its models and choose where it runs, and the entry is
+  written after the usual review; it starts on the next restart. Code that
+  runs inside hearth is added in the file by hand. See [Plugins](plugins.md).
 - **Models**: every model on one row: which nodes hold it, whether it is loaded
   anywhere, and whether you are lending it. `/network` is always one node's
   view; this is all of them at once. A model served here can be warmed or
@@ -52,11 +64,19 @@ Seven pages, and ⌘K (Ctrl+K) jumps between them and to anything on Topology:
 - **Config**: `hearth.yaml` by section, or as text. See below.
 
 Behind the Models, Keys, Lending and Queue pages a faint ASCII smoke rises,
+and beside the Topology and Routing maps it rises behind the sidebar instead,
 thicker and quicker the more the node has queued and running. The load is a
 fire under it: coals along the bottom light the nearest wisps in the theme's
-fire colours, and embers rise off them, more the busier the node. The node's
-name seeds it, so every node burns its own way. With reduced motion it holds
-still, and without WebGL2 there is none.
+fire colours, and embers rise off them, more the busier the node. The fire
+tells the truth about the work: each request that finishes sends up a spark,
+blue-hot when it ran on a peer or came in from one; a failed request is a drop
+of rain that hisses on the coals; after a big load falls away, ash drifts down
+for a while; five idle minutes and the fire ashes over, until the next request
+catches it again. A wind leans it all, stronger the busier the node. Clicking
+the empty floor stokes it where you click, and hovering the flame in the
+corner stokes the whole hearth. None of that touches the node. The node's name
+seeds it, so every node burns its own way. With reduced motion it holds still,
+and without WebGL2 there is none.
 
 The live view is 120 samples taken every 5s. The day view and the Logs page are
 held in memory and lost on restart unless `historyFile` names a file to keep
@@ -146,6 +166,11 @@ line; **+ type** brings one onto the map.
   off a busy model, give one caller its own model) or from a blank. A new
   rule is left on the map, picked out and in view; its pencil opens it to be
   edited line by line.
+- **Plugins on a line** are added from the line's ⋯ menu (*run plugins*),
+  which offers only plugins that handle what the line carries. A block's own
+  menu wires its model slots for this line, moves it earlier or later, or takes
+  it off. A block with an empty model slot is amber and requests pass by it; a
+  plugin that only watches the finished exchange is drawn dashed.
 - **A line's conditions are changed where they stand.** Click the sentence a
   line reads as, or **choose a condition** on a new one, and its conditions
   open in the box; the line's first word closes them again. Under a heading

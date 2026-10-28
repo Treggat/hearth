@@ -13,6 +13,9 @@ comment is read by strangers. Write for them.
   caller is, for peers bound with `tailnet`
 - `src/actions.ts`: what a flow step can set off beside routing; one entry
   per kind
+- `src/plugins.ts`: loading plugins and running their hooks: the kind gate,
+  timeouts, `onError` / `onFail`, the pause after repeated failures, the
+  tokens that mark a plugin's own calls as internal
 - `src/config.ts`, `src/fields.ts`, `src/configfile.ts`: parsing, the settings
   table, live edits to hearth.yaml
 - `src/kinds.ts`: what each backend `kind` supports
@@ -26,9 +29,12 @@ comment is read by strangers. Write for them.
   notice (`updateCheck`)
 - `src/console/`: the React status page and config editor (built to `dist/`).
   The Lending page is `Lending.tsx`; the recent-requests rail beside the
-  Topology map is `Rail.tsx`; the ASCII smoke behind the Queue, Models,
-  Keys and Lending pages is `Smoke.tsx`, and what the node's load does to its
-  fire is `fire.ts`. The routing map is `Routing.tsx` (layout),
+  Topology map is `Rail.tsx`; the Plugins page is
+  `Plugins.tsx` and its Add plugin dialog `AddPlugin.tsx` (plugin blocks on the
+  routing map are in `flowNodes.tsx`); the ASCII smoke behind the Queue, Models,
+  Keys and Lending pages, and behind the sidebar beside the maps, is
+  `Smoke.tsx`, and what the node's load does to its fire is `fire.ts`. The
+  routing map is `Routing.tsx` (layout),
   `flowNodes.tsx` (one view per kind of node) and `draft.ts` (`NODES`: what
   drawing a line from or onto each kind changes in the file)
 - `test/`: one `*.test.ts` per area; run one with `npx tsx test/<name>.test.ts`
