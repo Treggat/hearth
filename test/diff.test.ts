@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 
-import { lineDiff, opsBetween } from "../src/console/diff.js";
+import { keyLines, lineDiff, opsBetween } from "../src/console/diff.js";
 
 // --- only what changed becomes an op -------------------------------------------------
 {
@@ -37,6 +37,17 @@ import { lineDiff, opsBetween } from "../src/console/diff.js";
   assert.equal(d.filter((l) => l.kind === " ").length, 6, "with three lines of context either side");
   const changed = d.filter((l) => l.kind === "-" || l.kind === "+").map((l) => l.kind);
   assert.deepEqual(changed, ["-", "+"], "the old line reads before its replacement");
+}
+
+// --- where a key sits in the file ----------------------------------------------------
+{
+  const text = ["name: t", "plugins:", "  # memory first", "  memory:", "    use: http://x:1", "    config:", "      a: 1", "", "  crawler:", "    serves: http://y:2", "flows: {}"].join("\n");
+  assert.deepEqual(keyLines(text, ["plugins", "crawler"]), { from: 8, to: 9 }, "a plugin's lines, from its name to its last setting");
+  assert.deepEqual(keyLines(text, ["plugins", "memory"]), { from: 3, to: 6 }, "a blank line inside is not its end");
+  assert.deepEqual(keyLines(text, ["plugins", "nope"]), { from: 1, to: 9 }, "a missing plugin lands on plugins:");
+  assert.equal(keyLines(text, ["actions"]), null);
+  assert.deepEqual(keyLines(text, ["plugins", "a"]), { from: 1, to: 9 }, "a key deeper down is not one directly under plugins:");
+  assert.deepEqual(keyLines("plugins: {crawler: {serves: http://y:2}}", ["plugins", "crawler"]), { from: 0, to: 0 }, "flow style stops at the key it spells out");
 }
 
 console.log("diff.test.ts ok");
