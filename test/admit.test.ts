@@ -44,10 +44,15 @@ import { parseV1 } from "./v1.js";
 {
   let release!: () => void;
   const held = new Promise<void>((r) => (release = r));
+  let reached!: () => void;
+  const atBackend = new Promise<void>((r) => (reached = r));
   const backend = createServer((req, res) => {
     res.setHeader("content-type", "application/json");
     if (req.url === "/v1/models") return void res.end(JSON.stringify({ data: [] }));
-    if (req.url === "/render") return void held.then(() => res.end("{}"));
+    if (req.url === "/render") {
+      reached();
+      return void held.then(() => res.end("{}"));
+    }
     res.end("{}");
   });
   await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
@@ -71,7 +76,8 @@ import { parseV1 } from "./v1.js";
   });
 
   const first = post("/render", {});
-  await new Promise((r) => setTimeout(r, 50));
+  // Once the backend has the first render it is running, so it counts against the cap.
+  await atBackend;
   const second = await Promise.race([
     post("/render", {}),
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("the second render queued: no caller cap")), 2_000)),

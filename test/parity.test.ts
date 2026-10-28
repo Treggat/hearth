@@ -51,11 +51,17 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // --- queue position on the wire, opt-in --------------------------------------------
 {
+  // A turn the backend has received is running, so the next request is sure to queue behind it.
+  let hits = 0;
+  const waiting: { n: number; resolve: () => void }[] = [];
+  const reached = (n: number) => new Promise<void>((resolve) => (hits >= n ? resolve() : waiting.push({ n, resolve })));
   const backend = createServer(async (req, res) => {
     if (req.url === "/v1/models") {
       res.setHeader("content-type", "application/json");
       return void res.end(JSON.stringify({ data: [{ id: "m" }] }));
     }
+    hits++;
+    for (const w of waiting.filter((w) => w.n <= hits)) w.resolve();
     for await (const _ of req) { /* drain */ }
     await sleep(300);
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -73,7 +79,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   });
 
   const first = ask();
-  await sleep(50);
+  await reached(1);
   const second = await ask({ "x-hearth-queue": "stream" });
   assert.equal(second.status, 200);
   const text = await second.text();
@@ -109,7 +115,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     method: "POST", headers: { "content-type": "application/json", "x-hearth-job": id },
     body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "x" }] }),
   }).then((r) => r.text());
-  await Promise.all([tagged("app-1"), (async () => { await sleep(30); await tagged("app-2"); })()]);
+  await Promise.all([tagged("app-1"), (async () => { await reached(3); await tagged("app-2"); })()]);
   await sleep(50);
   ctrl.abort();
   await pump;
