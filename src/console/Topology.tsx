@@ -8,7 +8,7 @@ import {
   applyNodeChanges, Background, BaseEdge, Controls, getBezierPath, Handle, Position, ReactFlow,
   type Edge, type EdgeProps, type Node, type NodeProps, type ReactFlowInstance,
 } from "@xyflow/react";
-import { CircuitBoard, Cloud, Cpu, Flame, Globe, KeyRound, Monitor, Plus, Redo2, RotateCcw, Save, Server, Split, Undo2, Users, Waypoints } from "lucide-react";
+import { CircuitBoard, Cloud, Cpu, Flame, Globe, KeyRound, Monitor, Plug, Plus, Redo2, RotateCcw, Save, Server, Split, Undo2, Users, Waypoints } from "lucide-react";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Rail } from "./Rail.js";
@@ -17,7 +17,7 @@ import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
 import { BAYS, bayRoom, callersIn, draftView, EVERYONE, list, movedBay, movedHardware, obj, ordered, put, routerFor, usersOf, withCaller, callerChoices, paneChoices, restacked, STACK, unstacked } from "./draft.js";
 import { change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit, addRouter, askAt } from "./editStore.js";
 import { Menu, VersionsButton, openVersions } from "./editor.js";
-import { control, go, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
+import { control, go, openPlugin, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
 import { Button, cx, Dialog, Dot, type Tone } from "./ui.js";
 
 /** `tags`: hardware a backend uses besides the group it sits in. `tip`: what the status dot is saying. */
@@ -228,7 +228,7 @@ function ProviderDialog({ taken, onClose, onCreate }: { taken: string[]; onClose
 
 /** A card or CPU: the frame its backends sit in, so "runs on" needs no line. */
 type Chip = { name: string; tone: Tone; busy: boolean; sub: string };
-type Group = { /** What a backend let go here is given: this hardware, on this machine. */ drop?: { resource: string; server: string }; /** It can be dragged onto another machine. */ moves?: boolean; title: string; sub: string; icon: ReactNode; hot: boolean; selected?: boolean; tip?: string; chips?: Chip[]; picked?: string };
+type Group = { /** What a backend let go here is given: this hardware, on this machine. */ drop?: { resource: string; server: string }; /** It can be dragged onto another machine. */ moves?: boolean; title: string; sub: string; icon: ReactNode; hot: boolean; selected?: boolean; tip?: string; chips?: Chip[]; picked?: string; /** Fed from above: how far from its right edge the line comes in, in px. */ up?: number };
 
 const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
   return (
@@ -238,6 +238,8 @@ const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
       data.selected && "ring-2 ring-accent/25",
     )}>
       <Handle type="target" position={Position.Left} />
+      {/* A group fed from above takes its line this far from its right edge. */}
+      {data.up !== undefined && <Handle type="target" id="up" position={Position.Top} isConnectable={false} style={{ left: "auto", right: data.up, transform: "translate(50%, -50%)" }} />}
       <div className={cx("flex items-center gap-2 px-3 pt-2 text-[11px]", data.moves && "cursor-grab")} title={data.moves ? "Drag it onto another machine: what runs on it goes too" : undefined}>
         <span className={data.hot ? "text-ok" : "text-dim"}>{data.icon}</span>
         <span className="font-semibold uppercase tracking-wide">{data.title}</span>
@@ -756,6 +758,38 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
     });
     py += block + GAP;
   });
+  // Plugins that serve an API hang under the hub: callers reach them through this node, as they reach a backend.
+  const services = (d.plugins?.plugins ?? []).filter((p) => p.serves !== null);
+  if (services.length > 0) {
+    // Two wide at most, ending at the hub's right edge, and as many rows down as there are services, so the group
+    // never reaches the machines on the right. One line goes into it, straight down from the hub, crossing no box.
+    const cols = Math.min(services.length, 2);
+    const rows = Math.ceil(services.length / cols);
+    const wide = PAD * 2 + cols * W + (cols - 1) * GAP;
+    // Below the hub and below the last peer, however many peers there are.
+    const peersBottom = peers.length ? mid + (blocks.reduce((a, b) => a + b, 0) + GAP * (peers.length - 1)) / 2 : -Infinity;
+    const top = Math.max(mid + H / 2 + 72, peersBottom + 56);
+    nodes.push({
+      id: "services", type: "hardware", position: { x: X.self + W + PAD - wide, y: top }, style: { width: wide, height: HEAD + PAD + rows * H + (rows - 1) * GAP },
+      data: { title: "Services", icon: <Plug size={13} />, hot: false, sub: "", up: PAD + W / 2, tip: "Plugins that serve an API of their own, at /plugins/<name>/. Callers reach each one through this node, with the same keys as the models." } satisfies Group,
+    });
+    const down = services.filter((p) => p.state !== "running" || p.paused).length;
+    edges.push({ id: "e:services", source: hub, sourceHandle: "down", target: "services", targetHandle: "up", type: "flow", data: { jobs: [], pulses: [], wire: true, color: "var(--dim)", dashed: down === services.length } });
+    services.forEach((p, n) => {
+      const out = p.state !== "running";
+      // The last row fills from the right, under the hub, as the first rows do.
+      const row = Math.floor(n / cols);
+      const col = cols - 1 - (n % cols);
+      nodes.push({
+        id: `service:${p.name}`, type: "card", parentId: "services", extent: "parent", position: { x: PAD + col * (W + GAP), y: HEAD + row * (H + GAP) },
+        data: {
+          title: p.name, icon: <Plug size={14} />, tone: out ? "bad" : p.paused ? "warn" : "ok",
+          sub: out ? (p.error ?? "did not start") : p.paused ? "paused" : `/plugins/${p.name}/${p.served.calls ? ` · ${p.served.calls} served${p.served.errors ? `, ${p.served.errors} failed` : ""}` : ""}`,
+          tip: `/plugins/${p.name}/ goes to ${p.serves}. Click to open it on the Plugins page.`,
+        } satisfies Card,
+      });
+    });
+  }
   return { nodes, edges };
 }
 
@@ -938,6 +972,7 @@ export function Topology() {
         else if (kind === "self" || kind === "peer" || kind === "backend") select({ kind, id });
         else if (kind === "resource") select({ kind, id: id.split("/").pop()! });
         else if (kind === "machine" && id) select({ kind, id });
+        else if (kind === "service") openPlugin(id);
       }}
       onPaneClick={() => select(null)}
       // A right-click on the empty part of the picture offers what the strip over it does, where the pointer is.

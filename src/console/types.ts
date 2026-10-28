@@ -299,6 +299,9 @@ export interface PluginView {
   /** Runs on every line rather than where a step places it. */
   everyLine: boolean;
   use: string;
+  /** The service's own API, answered at /plugins/<name>/; null when it has none. */
+  serves: string | null;
+  served: { calls: number; errors: number };
   when: { asked?: string[]; askedNot?: string[]; caller?: string[]; callerNot?: string[]; lane?: string[]; target?: string[]; header?: Record<string, string[]> } | null;
   timeoutMs: number;
   onError: "skip" | "refuse";

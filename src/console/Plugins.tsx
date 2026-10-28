@@ -28,6 +28,9 @@ const CHIP = "rounded border px-1.5 text-[11px]";
 
 type Status = { tone: "bad" | "warn" | "dim" | "ok"; word: string };
 
+/** A plugin that only serves an API: it hooks nothing, so lines, kinds and stages say nothing about it. */
+export const servesOnly = (p: PluginView): boolean => p.serves !== null && Object.keys(p.declared).length === 0;
+
 /** The one thing to say about a plugin in its row: a problem when there is one, else how fast it answers. */
 function statusOf(p: PluginView, pv: PluginsView): Status {
   if (p.state === "failed") return { tone: "bad", word: "did not start" };
@@ -41,6 +44,11 @@ function statusOf(p: PluginView, pv: PluginsView): Status {
     if (BLOCKING.includes(stage as PluginStage) && n!.calls > 0 && n!.p95 >= p.timeoutMs * 0.8) return { tone: "warn", word: "slow" };
   }
   if (p.paused) return { tone: "dim", word: "paused" };
+  if (servesOnly(p)) {
+    const { calls, errors } = p.served;
+    if (calls >= 5 && errors / calls >= 0.1) return { tone: "warn", word: `${Math.round((errors / calls) * 100)}% errors` };
+    return { tone: "ok", word: calls ? `${calls} served` : "no calls yet" };
+  }
   if (!p.everyLine && !pv.placed.some((x) => x.plugin === p.name)) return { tone: "dim", word: "on no line" };
   if (emptySlots(p, pv).length) return { tone: "warn", word: "needs a model" };
   const fast = p.stages.routed ?? p.stages.request ?? p.stages.log;
@@ -62,6 +70,7 @@ function Tier({ p }: { p: PluginView }) {
 }
 
 function Kinds({ p, live }: { p: PluginView; live: string[] }) {
+  if (servesOnly(p)) return <span className={cx(CHIP, "border-line")} title="it serves its own API and changes no requests">API</span>;
   const kinds = Object.keys(p.declared);
   if (!kinds.length) return <span className="text-dim">unknown</span>;
   return (
@@ -76,6 +85,7 @@ function Kinds({ p, live }: { p: PluginView; live: string[] }) {
 
 /** Where a plugin runs, said in a few words. */
 function usedOn(p: PluginView, pv: PluginsView): string {
+  if (servesOnly(p)) return `/plugins/${p.name}/`;
   if (p.everyLine) return "every line";
   const n = pv.placed.filter((x) => x.plugin === p.name).length;
   return n === 0 ? "on no line" : `${n} line${n === 1 ? "" : "s"}`;
@@ -119,11 +129,21 @@ function Panel({ p, pv, onClose, onWire }: { p: PluginView; pv: PluginsView; onC
         <button className="text-dim hover:text-fg" aria-label="close" onClick={onClose}><X size={16} /></button>
       </div>
       <div className="flex max-h-[75vh] flex-col gap-4 overflow-auto px-4 py-3 text-[12px] max-lg:max-h-none max-lg:flex-1">
-        <div className={cx(mono, "break-all text-dim")}>{p.use}</div>
+        {!servesOnly(p) && <div className={cx(mono, "break-all text-dim")}>{p.use}</div>}
         {p.state === "failed" && <div className="rounded-md border border-bad/40 px-3 py-2 text-bad"><b>Did not start.</b> {p.error}<div className="mt-1 text-dim">hearth tries again when it restarts.</div></div>}
         {st.tone !== "ok" && p.state !== "failed" && <div className={cx("rounded-md border px-3 py-2", st.tone === "bad" ? "border-bad/40 text-bad" : st.tone === "warn" ? "border-warn/50 text-warn" : "border-line text-dim")}>{st.word}</div>}
         {p.locked && p.onError === "skip" && <LockedOpen />}
 
+        {p.serves !== null && (
+          <section className="flex flex-col gap-1.5">
+            <div className={H}>Serves</div>
+            <span><code className={mono}>/plugins/{p.name}/…</code> goes to <code className={cx(mono, "break-all")}>{p.serves}/…</code></span>
+            <span className="text-dim">For this machine and api keys, not peers or keys limited to models. The caller's key stays here; {p.trust === "http" ? "the plugin's own key is sent instead, with who is calling." : ""}</span>
+            <span className="text-dim tabular">{p.served.calls} request{p.served.calls === 1 ? "" : "s"} since hearth started{p.served.errors ? <>, <span className="text-bad">{p.served.errors} it could not answer</span></> : ""}.</span>
+          </section>
+        )}
+
+        {!servesOnly(p) && <>
         <section className="flex flex-col gap-1.5">
           <div className={H}>Handles</div>
           <Kinds p={p} live={pv.liveKinds} />
@@ -198,6 +218,7 @@ function Panel({ p, pv, onClose, onWire }: { p: PluginView; pv: PluginsView; onC
             </tbody>
           </table>
         </section>
+        </>}
 
         <section className="flex flex-col gap-1">
           <div className={H}>Its own settings</div>
@@ -315,7 +336,7 @@ export function Plugins() {
                     <span key={slot} className={p.models[slot] ? "text-fg" : n.optional ? "text-dim" : "text-warn"}>{i ? " · " : ""}{slot} → {p.models[slot] ?? (n.optional ? "none" : "pick one")}</span>
                   ))}
                 </span>
-                <span className={cx("max-md:hidden", usedOn(p, pv) === "on no line" && "text-dim")}>{usedOn(p, pv)}</span>
+                <span className={cx("max-md:hidden", usedOn(p, pv) === "on no line" && "text-dim", servesOnly(p) && cx(mono, "truncate"))}>{usedOn(p, pv)}</span>
                 <span className={cx("flex min-w-0 items-center gap-1 max-md:justify-end", TONE[st.tone])}>
                   {st.tone === "bad" ? <XCircle size={12} className="shrink-0" /> : st.tone === "warn" ? <AlertTriangle size={12} className="shrink-0" /> : st.word === "paused" ? <Pause size={12} className="shrink-0" /> : st.word === "on no line" ? <CircleDashed size={12} className="shrink-0" /> : null}
                   <span className="truncate">{st.word}</span>

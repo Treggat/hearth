@@ -5,7 +5,7 @@ plugin, with the guarantees below.
 Plugins are placed on routing lines or on every line, with model slots, and the console has a Plugins
 page and plugin blocks on the Routing map (C10, C11, C8; Try and per-request records are not built). A
 plugin that `serves` an API is answered at `/plugins/<name>/*` ([A plugin that serves an API](#a-plugin-that-serves-an-api));
-the console does not show it yet, and plugin pages are not built. The other stages, the other request kinds and plugins on peers' requests are
+the console shows it under the router on the Topology map and on the Plugins page. Plugin pages are not built. The other stages, the other request kinds and plugins on peers' requests are
 not built yet (tracking: #191); requests of other kinds run no plugins.
 
 A plugin changes or watches what passes through hearth: it can rewrite a request before it runs, keep a
@@ -379,6 +379,9 @@ plugins:
   nothing (503).
 - A paused plugin answers 503, an unknown name 404, and a service that cannot be reached 502. The Plugins
   status counts the requests served and the ones that failed (`served`).
+- **In the console** each one is a box under the router on the Topology map, since callers reach it through
+  this node as they reach a backend; a click opens it on the Plugins page, which says where its path goes
+  and how many requests it has served.
 
 ## Guarantees
 
