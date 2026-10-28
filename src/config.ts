@@ -759,8 +759,10 @@ export interface PluginWhen {
 
 /** `plugins.<name>`: code or a service that reads or changes requests at the stages it hooks. */
 export interface PluginDecl {
-  /** `file:<path>` or `npm:<package>@<version>` for code; an http(s) URL for a service. */
-  use: string;
+  /** `file:<path>` or `npm:<package>@<version>` for code; an http(s) URL for a service. Null for a plugin that only `serves`. */
+  use: string | null;
+  /** A service's own API, answered at `/plugins/<name>/*`; null when it has none. */
+  serves: string | null;
   trust: "code" | "http";
   /** For `file:`, the sha256 of the file, as `sha256-<hex>`; a file that differs is not loaded. */
   integrity: string | null;
@@ -832,10 +834,16 @@ function pluginDecls(raw: unknown): Record<string, PluginDecl> {
     const at = `plugins.${name}`;
     if (!PLUGIN_NAME.test(name)) throw bad(at, "a plugin's name is lowercase letters, digits and dashes");
     const r = asRecord(v, at);
-    only(r, ["use", "trust", "integrity", "key", "kinds", "when", "timeoutMs", "onError", "onFail", "locked", "required", "peers", "reads", "everyLine", "models", "config"], at);
-    const use = str(r.use, `${at}.use`);
-    const service = /^https?:\/\//.test(use);
-    if (!service && !/^(file:.+|npm:(@[^/]+\/)?[^@/]+@\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$/.test(use)) throw bad(`${at}.use`, "is file:<path>, npm:<package>@<exact version, like 1.2.3>, or an http(s) URL");
+    only(r, ["use", "serves", "trust", "integrity", "key", "kinds", "when", "timeoutMs", "onError", "onFail", "locked", "required", "peers", "reads", "everyLine", "models", "config"], at);
+    const serves = r.serves === undefined ? null : str(r.serves, `${at}.serves`).replace(/\/$/, "");
+    if (serves !== null && !/^https?:\/\/[^/]/.test(serves)) throw bad(`${at}.serves`, "is the http(s) URL of the service's own API");
+    // `/plugins/probe` is the console's own route, so a plugin of that name could never be reached.
+    if (serves !== null && name === "probe") throw bad(at, "a plugin that serves cannot be named probe: /plugins/probe is taken");
+    if (r.use === undefined && serves === null) throw bad(`${at}.use`, "is required, unless the plugin only serves an API (serves: <url>)");
+    const use = r.use === undefined ? null : str(r.use, `${at}.use`);
+    const service = use === null || /^https?:\/\//.test(use);
+    if (use !== null && !service && !/^(file:.+|npm:(@[^/]+\/)?[^@/]+@\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$/.test(use)) throw bad(`${at}.use`, "is file:<path>, npm:<package>@<exact version, like 1.2.3>, or an http(s) URL");
+    if (serves !== null && !service) throw bad(`${at}.serves`, "is for a service; code answers its own routes inside hearth");
     const trust = r.trust;
     if (trust !== "code" && trust !== "http") throw bad(`${at}.trust`, service ? "must be http for a service" : "must be code: this plugin runs inside hearth, and saying so is the opt-in");
     if (service !== (trust === "http")) throw bad(`${at}.trust`, service ? "a URL is a service: trust: http" : "a file or package runs inside hearth: trust: code");
@@ -864,7 +872,7 @@ function pluginDecls(raw: unknown): Record<string, PluginDecl> {
     const key = r.key === undefined ? null : resolveSecret(str(r.key, `${at}.key`), `${at}.key`);
     if (integrity !== null && !/^sha256-[0-9a-f]{64}$/.test(integrity)) throw bad(`${at}.integrity`, "is sha256-<64 hex digits>");
     out[name] = {
-      use, trust, integrity, key, kinds, when: pluginWhen(r.when, `${at}.when`), timeoutMs,
+      use, serves, trust, integrity, key, kinds, when: pluginWhen(r.when, `${at}.when`), timeoutMs,
       onError: pick(r.onError, ["skip", "refuse"] as const, "skip", `${at}.onError`),
       onFail: pick(r.onFail, ["refuse", "flag"] as const, "refuse", `${at}.onFail`),
       locked: bool(r.locked, `${at}.locked`, false),
