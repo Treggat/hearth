@@ -9,7 +9,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ANY, beside as besideLines, directTo, draftView, factsOf, groupRows, list, nodeOf, ordered, orderOf, placedOn, refusal, restOf, spread, toOf, unchecked, type End, type Facts, type To } from "./draft.js";
 import { connect, editSelect, pick, place, useEdit, type EditSel, type Tried, selectMany } from "./editStore.js";
 import { contextMenu } from "./editor.js";
-import { HUE, takesWork, VIEWS, type ActionBox, type Dest, type FastestBox, type Hub, type OrderBox, type RefuseBox, type SwitchBox } from "./flowNodes.js";
+import { HUE, pluginHue, takesWork, VIEWS, type ActionBox, type Dest, type FastestBox, type Hub, type OrderBox, type RefuseBox, type SwitchBox } from "./flowNodes.js";
 import { arrive, edgeTypes, held, type Line } from "./Topology.js";
 import type { UiData } from "./types.js";
 import { useStore } from "./store.js";
@@ -123,7 +123,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
     const p = servingKind(name);
     nodes.push({
       id: `plugin:${name}`, type: "dest", position: { x: endX, y },
-      data: { title: name, kind: "plugin", down: p === undefined || p.state !== "running", sub: p === undefined ? "no plugin of this name" : `a plugin · /plugins/${name}${p.mcp ? p.mcp.path : "/"}` } satisfies Dest,
+      data: { title: name, kind: pluginHue(d.plugins, name), down: p === undefined || p.state !== "running", sub: p === undefined ? "no plugin of this name" : `a plugin · /plugins/${name}${p.mcp ? p.mcp.path : "/"}` } satisfies Dest,
     });
     y += 56;
   }
@@ -232,7 +232,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
       f.steps.forEach((s, i) => {
         const t = toOf(s.to);
         const lit = step === i;
-        const line = wire(`e:${id}:${i}`, lit, t.kind === "flow" && orders.has(t.flow) ? "fastest" : kindOf(t));
+        const line = wire(`e:${id}:${i}`, lit, t.kind === "flow" && orders.has(t.flow) ? "fastest" : t.kind === "plugin" ? pluginHue(d.plugins, t.plugin) : kindOf(t));
         if (t.kind === "flow" && orders.has(t.flow)) {
           // The first line that hands to an order has it beside it; any other line is drawn across to it.
           const end = `inorder:${t.flow}`;
