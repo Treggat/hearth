@@ -524,7 +524,7 @@ export class BackendPool {
    * The chat body for the backend: `as` for the id and the route's `params` over the client's.
    * `wire` overrides the id for a peer, and params still apply. Untouched when neither is set.
    * The `efforts` fields for the effort asked (after params) go under params: the seat's only when
-   * it runs here, a template switch being the seat's own, then the id's.
+   * it runs here, a template switch being the seat's own, then the id's, which travel like params.
    */
   outboundBody(
     model: string,

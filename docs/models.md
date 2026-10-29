@@ -133,7 +133,9 @@ models:
   ids included while that seat is the one loaded. An id may carry its own
   `efforts` too; the id's wins over the seat's, and `params` wins over both.
 - The fields are checked like `params`. A seat's `efforts` are not sent to a
-  peer: its template is its own.
+  peer: its template is its own. An id's own `efforts` are, like its `params`:
+  the id means the same thing wherever it lands. Put a template switch on the
+  seat, not on an id that may spill over to a peer.
 
 ## Keeping answers
 

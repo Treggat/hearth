@@ -175,6 +175,21 @@ await node.pool.first().state.refresh();
   assert.equal("chat_template_kwargs" in lent, false, "a peer's seat is not ours: our template switch stays home");
 }
 
+// --- efforts on the id itself travel with the job, as its params do ---------
+{
+  const n4 = createNode(
+    parseV1({
+      name: "me",
+      backends: [{ name: "swap", url: be.url(), kind: "none" }],
+      models: { [SEAT]: { backend: "swap" }, "seat-quick": { backend: "swap", as: SEAT, efforts: { none: { thinking: { type: "disabled" } } } } },
+    }),
+    silentLogger,
+  );
+  const lent = n4.pool.outboundBody("seat-quick", { model: "seat-quick", messages: [], reasoning_effort: "none" }, "their-seat");
+  assert.deepEqual(lent.thinking, { type: "disabled" }, "the id means the same thing wherever it lands");
+  await n4.close();
+}
+
 // --- the plain id is completely unaffected ----------------------------------
 {
   const r = await chat(url, { model: SEAT, messages: [], reasoning_effort: "high" });
