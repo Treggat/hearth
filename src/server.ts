@@ -2084,6 +2084,15 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
       fail(res, e);
       return;
     }
+    // An MCP server hearth runs answers at its own /mcp, whatever comes after the name.
+    if ("stdio" in to) {
+      const t0 = Date.now();
+      const a = await to.stdio.handle(req.method ?? "GET", body);
+      to.done(a.status < 500);
+      res.writeHead(a.status, { "content-type": a.type, ...(a.session ? { "mcp-session-id": a.session } : {}) }).end(a.body);
+      log.info("plugin.served", { plugin: m![1], method: req.method, path: m?.[2] ?? "/", status: a.status, caller: c.caller, ms: Date.now() - t0 });
+      return;
+    }
     const headers = stripOurKey(req) as Record<string, string>;
     delete headers["x-hearth-caller"];
     if (to.key) headers.authorization = `Bearer ${to.key}`;

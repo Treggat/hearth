@@ -380,9 +380,47 @@ plugins:
   nothing (503).
 - A paused plugin answers 503, an unknown name 404, and a service that cannot be reached 502. The Plugins
   status counts the requests served and the ones that failed (`served`).
-- **In the console** each one is a box under the router on the Topology map, since callers reach it through
-  this node as they reach a backend; a click opens it on the Plugins page, which says where its path goes
-  and how many requests it has served.
+- **In the console** each one is a box under the router on the Topology map, in a Plugins frame, since callers
+  reach it through this node as they reach a backend; a click opens it on the Plugins page, which says where
+  its path goes and how many requests it has served.
+
+## A plugin that speaks MCP
+
+An MCP server is a plugin too, in either of two ways:
+
+```yaml
+plugins:
+  tools:
+    serves: http://tools:3100        # an MCP server already on the network
+    trust: http
+    key: env:TOOLS_TOKEN
+    mcp: true                        # its endpoint is /mcp; or give the path: mcp: /v2/mcp
+  search:
+    run:                             # a program hearth starts, spoken to over stdin and stdout
+      command: npx
+      args: [-y, some-mcp-server]
+      env: { SEARCH_API_KEY: env:SEARCH_API_KEY }
+    trust: code                      # it runs on this machine: the same opt-in as code
+```
+
+- **Served** (`serves` with `mcp`): requests go through as for any served API. hearth also makes the handshake
+  a client would (`initialize`, then `tools/list`, with the plugin's `key`) at startup and every minute after,
+  ends the session it opened, and shows the server's name and how many tools it has, or why it did not answer.
+  A failed check is shown, never a reason to stop forwarding.
+- **Run** (`run`): hearth starts the program when it starts, initializes it once, and answers
+  `/plugins/<name>/mcp` as MCP's streamable HTTP does without a stream: a JSON answer for each request, 202 for
+  a notification, and 405 for the GET that would open a stream. Every caller shares the one program: a caller's
+  `initialize` is answered from hearth's own, with a session id, and every request is given an id of its own on
+  the way in, so two callers using the same id each get their own answer. A request the program makes of its
+  caller (sampling, roots) is refused. A program that exits is started again, after one second, then longer
+  each time it exits again, up to a minute.
+- The program sees the `env` its entry gives it, and of hearth's own environment only what it needs to find
+  and cache its files (`PATH`, `HOME`, `TMPDIR`). The console shows its command line, never its `env`, so a
+  secret belongs in `env`, not in `args`.
+- Callers are let in as for a served API: this machine or one of `apiKeys`.
+- **In the console** MCP servers have a group of their own beside Services in the Plugins frame, each box with
+  its tool count; with both groups present, each is one box wide. The Plugins page shows the server's name, its
+  tools and when it was last asked.
 
 ## Guarantees
 
