@@ -448,8 +448,10 @@ request goes: the same page that decides the model shows what happens to the req
   the models it needs and what is wired into them, the lines it is placed on, and how it is doing. A
   plugin's panel has its model slots (each offering only models of its kind), the lines it is on with a
   link to each on the Routing map, what it is sent, its failure policy, a pause switch, and a settings
-  form drawn from the settings its manifest describes. **Add plugin** checks a service's `/manifest`,
-  then writes the entry through the usual review; code plugins are added in the file by hand.
+  form drawn from the settings its manifest describes. **Add plugin** adds an API, an MCP server on the
+  network (checked by its handshake first: `POST /plugins/probe` with `mcp: <path>`), or a hook service
+  (checked at its `/manifest`), and writes the entry through the usual review. Code plugins, and MCP servers
+  hearth runs, are added in the file by hand; for the latter the dialog writes out the entry to add.
 - **On the Routing map** a plugin is a block on a line, between the rule and the model: request in on
   the left, changed request out on the right, its model slots underneath with lines to the models wired
   into them. Plugins that only watch hang off a dashed tap after the model. `everyLine` plugins are a

@@ -124,6 +124,11 @@ try {
   assert.deepEqual(asked.slice(0, 3), ["initialize", "notifications/initialized", "tools/list"], "the handshake a client makes");
   await until(() => asked.includes("DELETE"), "and the session it opened is ended");
 
+  // The console checks an MCP server the same way before adding it.
+  const probe = (b: Record<string, unknown>) => fetch(`${url}/plugins/probe`, { method: "POST", headers: { Authorization: "Bearer k-app", "Content-Type": "application/json" }, body: JSON.stringify(b) }).then((r) => r.json() as Promise<Record<string, unknown>>);
+  assert.deepEqual(await probe({ url: servedUrl, mcp: "/mcp", key: "env:TEST_MCP_KEY" }), { ok: true, url: servedUrl, server: "served-tools 2.0", tools: 3 });
+  assert.match(String((await probe({ url: servedUrl, mcp: "/mcp" })).problem), /answered 401: it wants a key/, "without its key it says so");
+
   // The program hearth runs.
   await until(() => status().runner!.mcp?.tools === 2, "the program is initialized and its tools counted");
   assert.equal(status().runner!.mcp!.server, "run-tools 1.0");
