@@ -396,7 +396,9 @@ export const SwitchNode = memo(function SwitchNode({ id, data }: NodeProps<Node<
         const word = i === last ? "Otherwise" : group ? (Object.keys(mine).length === 0 && i === group.to ? "Else" : i === group.from ? "If" : "Else if") : i === 0 ? "If" : "Else if";
         // A line that hands to an order reads as the places in it, not as the rule that holds them.
         const order = to.kind === "flow" ? data.orders?.[to.flow] : undefined;
-        const goes = order ? order.map(toText).join(", then ") : own(to) ? "its own model" : toText(to);
+        // A rule for plugin requests runs one as asked at the plugin it names, not at a model.
+        const plugins = (data.inputs ?? []).some((n) => n === "MCP" || n === "API");
+        const goes = order ? order.map(toText).join(", then ") : plugins && to.kind === "asked" ? "as asked: its plugin" : own(to) ? "its own model" : toText(to);
         return (
           <Fragment key={i}>
           {group?.from === i && (

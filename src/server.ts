@@ -2072,7 +2072,21 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
   async function routePluginServes(c: Call): Promise<void> {
     const { req, res, url } = c;
     const m = /^\/plugins\/([^/]+)(\/.*)?$/.exec(c.path);
-    const to = plugins.serve(m?.[1] ?? "");
+    // A router with a rule for MCP or API decides, as it does for a model: the request is asked of it as MCP:<name>
+    // or API:<name>. One with no such rule lets plugins through, so a router decides plugins only once it says so.
+    let name = m?.[1] ?? "";
+    const kind = plugins.kindOf(name);
+    const rules = rulesFor(c.caller);
+    if (kind !== null && entryOf(rules.flows, kind) !== undefined) {
+      const r = resolve(`${kind}:${name}`, { ...worldFor(c.caller, Object.keys(cfg.scheduler.lanes)[0]!, undefined, rules, headersOf(req)), plugin: name });
+      if (r.plugin === undefined) {
+        log.info("plugin.refused", { plugin: name, caller: c.caller, reason: r.reason });
+        json(res, 403, { error: r.reason });
+        return;
+      }
+      name = r.plugin;
+    }
+    const to = plugins.serve(name);
     if ("why" in to) {
       json(res, to.status, { error: to.why });
       return;
@@ -2091,7 +2105,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
       const a = await to.stdio.handle(req.method ?? "GET", body);
       to.done(a.status < 500);
       res.writeHead(a.status, { "content-type": a.type, ...(a.session ? { "mcp-session-id": a.session } : {}) }).end(a.body);
-      log.info("plugin.served", { plugin: m![1], method: req.method, path: m?.[2] ?? "/", status: a.status, caller: c.caller, ms: Date.now() - t0 });
+      log.info("plugin.served", { plugin: name, method: req.method, path: m?.[2] ?? "/", status: a.status, caller: c.caller, ms: Date.now() - t0 });
       return;
     }
     const headers = stripOurKey(req) as Record<string, string>;
@@ -2112,13 +2126,13 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
       to.done(up.status < 500);
       res.writeHead(up.status, forwardable(up.headers));
       await pipeline(up.body, res);
-      log.info("plugin.served", { plugin: m![1], method: req.method, path: m?.[2] ?? "/", status: up.status, caller: c.caller, ms: Date.now() - t0 });
+      log.info("plugin.served", { plugin: name, method: req.method, path: m?.[2] ?? "/", status: up.status, caller: c.caller, ms: Date.now() - t0 });
     } catch (e) {
       to.done(false);
       // A caller that hung up mid-stream is the end of the exchange, not a failure of the service.
       if (ctrl.signal.aborted) return;
-      log.warn("plugin.serve_failed", { plugin: m![1], path: m?.[2] ?? "/", error: e instanceof Error ? e.message : String(e) });
-      if (!res.headersSent) json(res, 502, { error: `plugin ${m![1]} could not be reached: ${e instanceof Error ? e.message : String(e)}` });
+      log.warn("plugin.serve_failed", { plugin: name, path: m?.[2] ?? "/", error: e instanceof Error ? e.message : String(e) });
+      if (!res.headersSent) json(res, 502, { error: `plugin ${name} could not be reached: ${e instanceof Error ? e.message : String(e)}` });
       else res.destroy();
     }
   }

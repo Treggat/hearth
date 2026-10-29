@@ -372,7 +372,10 @@ plugins:
   answering (502 if it does not); after that there is no deadline, so a stream it holds open (server-sent
   events, an MCP session) stays open until one side closes it.
 - **Callers are let in as on `/v1`**: this machine, or one of `apiKeys`. A peer never is, and neither is a key
-  scoped to `models:`.
+  scoped to `models:`. A router with a rule for `API` or `MCP` then decides, as it does for a model: the
+  request is asked of it as `API:<name>` (or `MCP:<name>`), so it can let a plugin through, send it to
+  another, or refuse it. A router with no such rule lets plugins through.
+  See [Plugins on the router](routing.md#plugins-on-the-router).
 - **The caller's key stays here.** The service is sent the plugin's `key` as a bearer token instead, when it
   has one, and who is calling in `x-hearth-caller` (`local` or `key:<label>`), which a caller cannot set.
 - **`use` is optional.** A plugin that only serves hooks nothing, so hearth reads no `/manifest` from it and

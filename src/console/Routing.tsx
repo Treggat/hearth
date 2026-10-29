@@ -117,6 +117,16 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
     });
     y += 56;
   }
+  // A plugin a line sends to, for the requests made to /plugins/<name>/*.
+  const servingKind = (p: string) => (d.plugins?.plugins ?? []).find((x) => x.name === p);
+  for (const name of new Set(flows.flatMap(([, f]) => f.steps.flatMap((s) => { const t = toOf(s.to); return t.kind === "plugin" ? [t.plugin] : []; })))) {
+    const p = servingKind(name);
+    nodes.push({
+      id: `plugin:${name}`, type: "dest", position: { x: endX, y },
+      data: { title: name, kind: "plugin", down: p === undefined || p.state !== "running", sub: p === undefined ? "no plugin of this name" : `a plugin · /plugins/${name}${p.mcp ? p.mcp.path : "/"}` } satisfies Dest,
+    });
+    y += 56;
+  }
   // Everything hangs from the top: adding a line or a rule grows the picture downward and moves nothing that was there.
 
   // Only names that are routed somewhere are drawn. The rest go to their own model, which needs no picture.
@@ -233,6 +243,7 @@ function layout(d: UiData, sel: EditSel, edit?: Editing) {
           edges.push({ ...line, source: id, sourceHandle: `step-${i}`, target: end });
         } else if (t.kind === "flow") edges.push({ ...line, source: id, sourceHandle: `step-${i}`, target: `flow:${t.flow}` });
         else if (t.kind === "model" || t.kind === "peer") to(line, id, `step-${i}`, t);
+        else if (t.kind === "plugin") edges.push({ ...line, source: id, sourceHandle: `step-${i}`, target: `plugin:${t.plugin}` });
         else if (t.kind === "fastest" || t.kind === "refuse") {
           // A line that ends in a choice or a refusal gets that as a node beside it.
           const end = `${t.kind}:${name}:${i}`;
