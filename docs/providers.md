@@ -119,3 +119,8 @@ backends:
   (4096 when the request names none: this API requires one), `temperature`,
   `top_p`, `stop`, and streaming. Reasoning text comes back as
   `reasoning_content`. Other request fields are not sent.
+- `reasoning_effort` goes out as `output_config.effort` (`low`, `medium`,
+  `high`, `xhigh`, `max`). `none` and `minimal` are sent as `low`: the API
+  has no level below it, and several models refuse a request that turns
+  thinking off. A model without effort support answers such a request with
+  an error, so leave `reasoning_effort` off for one.
