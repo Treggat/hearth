@@ -6,7 +6,8 @@
  *   - "as asked" lets a plugin request through to its plugin; `refuse` turns it away with the step's words
  *   - a step that names a plugin sends the request there; a step that names a model is passed over
  *   - on a model request, a step that names a plugin is passed over
- *   - a router decides plugins only once it has a rule for MCP or API: one without lets them through, as before
+ *   - with no rule for MCP or API, a router's flow for every other name decides: running as itself lets plugins
+ *     through, refusing refuses them
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -105,8 +106,8 @@ try {
   // The default rules run a plugin request as asked: today's behaviour, for every caller on them.
   assert.deepEqual(await call("/plugins/crawl/x", "k-app"), { status: 200, body: { at: "/crawl/x" } });
 
-  // A router with no rule for MCP or API leaves plugins as they were, though it refuses every other name.
-  assert.deepEqual(await call("/plugins/crawl/x", "k-closed"), { status: 200, body: { at: "/crawl/x" } });
+  // A router with no rule for MCP or API decides plugins as it does every other name: this one refuses them.
+  assert.deepEqual(await call("/plugins/crawl/x", "k-closed"), { status: 403, body: { error: "not for this caller" } });
   // One with such a rule decides them, in its own words.
   assert.deepEqual(await call("/plugins/crawl/x", "k-shut"), { status: 403, body: { error: "no plugins for this caller" } });
   assert.equal((await call("/plugins/tools/mcp", "k-shut")).status, 403);

@@ -2072,12 +2072,13 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
   async function routePluginServes(c: Call): Promise<void> {
     const { req, res, url } = c;
     const m = /^\/plugins\/([^/]+)(\/.*)?$/.exec(c.path);
-    // A router with a rule for MCP or API decides, as it does for a model: the request is asked of it as MCP:<name>
-    // or API:<name>. One with no such rule lets plugins through, so a router decides plugins only once it says so.
+    // The caller's router decides, as it does for a model: the request is asked of it as MCP:<name> or API:<name>.
+    // With no rule for MCP or API, its flow for every other name decides: one that runs a name as itself lets
+    // plugins through, and one that refuses refuses them until a rule for MCP or API is added.
     let name = m?.[1] ?? "";
     const kind = plugins.kindOf(name);
     const rules = rulesFor(c.caller);
-    if (kind !== null && entryOf(rules.flows, kind) !== undefined) {
+    if (kind !== null) {
       const r = resolve(`${kind}:${name}`, { ...worldFor(c.caller, Object.keys(cfg.scheduler.lanes)[0]!, undefined, rules, headersOf(req)), plugin: name });
       if (r.plugin === undefined) {
         log.info("plugin.refused", { plugin: name, caller: c.caller, reason: r.reason });

@@ -349,9 +349,9 @@ routers:
   `refuse` turns it away (403, with the step's words). A step that sends to a model or a peer is passed over.
 - A model request passes over a step that names a plugin, so such a step cannot be a flow's last.
 - Every condition a step can test applies: the caller, a header, the time of day.
-- A router decides plugin requests only once it has a flow that takes `MCP` or `API`. One without lets
-  every plugin through, as it would with no routers at all, whatever its flow for every other name says;
-  give it a flow for `MCP` and `API` that refuses to shut them all.
+- With no flow for `MCP` or `API`, a router's flow for every other name decides, as it does for a name no
+  rule takes: one that runs it as itself lets every plugin through, and one that refuses refuses every plugin
+  until a flow for `MCP` or `API` is added.
 
 ### Actions
 
