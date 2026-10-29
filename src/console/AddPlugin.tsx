@@ -8,6 +8,7 @@ import { CircleDashed, ShieldAlert } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Review, type File, type Plan } from "./config.js";
+import { splitMcp } from "./draft.js";
 import { modelsOfKind } from "./flowNodes.js";
 import { LockedOpen } from "./Plugins.js";
 import type { PluginStage } from "./types.js";
@@ -62,12 +63,20 @@ const nameWhy = (name: string, taken: Set<string>): string | null =>
   !name ? "give it a name" : !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) ? "lowercase letters, digits and dashes" : name === "probe" ? "probe is the console's own path" : taken.has(name) ? `${name} is already a plugin` : null;
 
 /** A key field: the environment variable hearth reads it from, so the key itself never goes in the file. */
-function KeyVar({ value, onChange, hint }: { value: string; onChange: (v: string) => void; hint: string }) {
+/** An environment variable's name, as opposed to a key pasted in: capitals, digits and underscores. */
+const isVarName = (v: string) => /^[A-Z_][A-Z0-9_]*$/.test(v);
+
+/** A key as the entry holds it: `env:NAME` for a variable's name, or the key itself. */
+const keyOf = (v: string): string | null => (v.trim() === "" ? null : isVarName(v.trim()) ? `env:${v.trim()}` : v.trim());
+
+/** A key field: the name of the environment variable hearth reads it from, or the key itself, which then goes in the file. */
+function KeyField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const v = value.trim();
+  const literal = v !== "" && !isVarName(v);
   return (
-    <Field label="Key (optional)" hint={hint}>
-      <span className="flex items-center gap-1"><span className={cx(mono, "text-dim")}>env:</span>
-        <input className={cx(input, mono)} value={value} placeholder="MY_SERVICE_KEY" onChange={(e) => onChange(e.target.value.replace(/[^A-Za-z0-9_]/g, ""))} />
-      </span>
+    <Field label="Key (optional)" hint={v === "" ? "sent to it as a bearer token: the key itself, or the name of an environment variable hearth reads it from"
+      : literal ? "the key itself: it is written into hearth.yaml, like the other keys there. A variable's name keeps it out" : `read from the variable ${v} in hearth's environment; the key stays out of the file`}>
+      <input className={cx(input, mono, literal && "border-warn")} type={literal ? "password" : "text"} autoComplete="off" spellCheck={false} value={value} placeholder="the key, or MY_SERVICE_KEY" onChange={(e) => onChange(e.target.value)} />
     </Field>
   );
 }
@@ -79,7 +88,6 @@ function KeyVar({ value, onChange, hint }: { value: string; onChange: (v: string
 function Serving({ kind, file, taken, onPlan, onClose }: { kind: "api" | "mcp"; file: File | null; taken: Set<string>; onPlan: (p: Plan | null) => void; onClose: () => void }) {
   const [where, setWhere] = useState<"network" | "program">("network");
   const [url, setUrl] = useState("");
-  const [path, setPath] = useState("/mcp");
   const [keyVar, setKeyVar] = useState("");
   const [name, setName] = useState("");
   const [checking, setChecking] = useState(false);
@@ -96,7 +104,9 @@ function Serving({ kind, file, taken, onPlan, onClose }: { kind: "api" | "mcp"; 
   const check = async () => {
     setChecking(true); setProblem(null); setFound(null);
     try {
-      const r = await request<{ ok: boolean; server?: string | null; tools?: number; problem?: string }>("POST", "/plugins/probe", { url: url.trim(), mcp: path, ...(keyVar ? { key: `env:${keyVar}` } : {}) });
+      const at = splitMcp(url)!;
+      const key = keyOf(keyVar);
+      const r = await request<{ ok: boolean; server?: string | null; tools?: number; problem?: string }>("POST", "/plugins/probe", { url: at.serves, mcp: at.path, ...(key ? { key } : {}) });
       if (!r.ok) setProblem(r.problem ?? "it did not answer");
       else setFound(`${r.server ?? "An MCP server"} answers, with ${r.tools ?? 0} tool${r.tools === 1 ? "" : "s"}.`);
       if (!name) setName(nameFrom(url.trim()));
@@ -107,10 +117,11 @@ function Serving({ kind, file, taken, onPlan, onClose }: { kind: "api" | "mcp"; 
     }
   };
 
+  const at = kind === "mcp" ? splitMcp(url) : null;
   const entry = (): Record<string, unknown> => ({
-    serves: url.trim().replace(/\/$/, ""), trust: "http",
-    ...(keyVar ? { key: `env:${keyVar}` } : {}),
-    ...(kind === "mcp" ? { mcp: path === "/mcp" ? true : path } : {}),
+    serves: at ? at.serves : url.trim().replace(/\/$/, ""), trust: "http",
+    ...(keyOf(keyVar) ? { key: keyOf(keyVar) } : {}),
+    ...(at ? { mcp: at.path === "/mcp" ? true : at.path } : {}),
   });
 
   const review = async () => {
@@ -122,9 +133,9 @@ function Serving({ kind, file, taken, onPlan, onClose }: { kind: "api" | "mcp"; 
       onPlan({
         before: file.text, after: dry.text, restartPending: dry.restartPending, verb: "add plugin",
         summary: [
-          kind === "mcp" ? `adds ${name}, an MCP server at ${url.trim()}${path}` : `adds ${name}, an API at ${url.trim()}`,
-          `callers reach it at /plugins/${name}${kind === "mcp" ? path : "/"} with their hearth key`,
-          keyVar ? `it is sent the key in ${keyVar}, read from hearth's environment` : "it is sent no key of its own",
+          at ? `adds ${name}, an MCP server at ${at.serves}${at.path}` : `adds ${name}, an API at ${url.trim()}`,
+          `callers reach it at /plugins/${name}${at ? at.path : "/"} with their hearth key`,
+          !keyVar.trim() ? "it is sent no key of its own" : isVarName(keyVar.trim()) ? `it is sent the key in ${keyVar.trim()}, read from hearth's environment` : "it is sent the key you gave, which is written into hearth.yaml",
         ],
         commit: async () => {
           try {
@@ -207,14 +218,11 @@ ${envRows.map((r) => `        ${r.name.trim()}: env:${r.from.trim() || r.name.tr
       ) : (
         <section className="flex flex-col gap-3">
           <div className={H}>Where it is</div>
-          <div className={cx("grid gap-3", kind === "mcp" ? "sm:grid-cols-[1fr_7rem_14rem]" : "sm:grid-cols-[1fr_14rem]")}>
-            <Field label="Address" hint={kind === "mcp" ? "the server's base address" : `callers' /plugins/${name || "<name>"}/<path> goes to <address>/<path>`}>
+          <div className="grid gap-3 sm:grid-cols-[1fr_16rem]">
+            <Field label={kind === "mcp" ? "MCP address" : "Address"} hint={kind === "mcp" ? "the full address of its MCP endpoint, as its docs give it, such as https://example.com/api/mcp" : `callers' /plugins/${name || "<name>"}/<path> goes to <address>/<path>`}>
               <input autoFocus className={cx(input, mono)} value={url} placeholder="http://127.0.0.1:9000" onChange={(e) => { setUrl(e.target.value); setFound(null); setProblem(null); if (!name || name === nameFrom(url.trim())) setName(nameFrom(e.target.value.trim())); }} />
             </Field>
-            {kind === "mcp" && (
-              <Field label="MCP path"><input className={cx(input, mono)} value={path} onChange={(e) => { setPath(e.target.value.startsWith("/") ? e.target.value : `/${e.target.value}`); setFound(null); }} /></Field>
-            )}
-            <KeyVar value={keyVar} onChange={(v) => { setKeyVar(v); setFound(null); }} hint="sent to it as a bearer token; the key itself never goes in the file" />
+            <KeyField value={keyVar} onChange={(v) => { setKeyVar(v); setFound(null); setProblem(null); }} />
           </div>
           {kind === "mcp" && (
             <div className="flex items-center gap-3">
@@ -223,7 +231,7 @@ ${envRows.map((r) => `        ${r.name.trim()}: env:${r.from.trim() || r.name.tr
               {found && <span className="text-[12px] text-ok">{found}</span>}
             </div>
           )}
-          <Field label="Name" hint={nameProblem ?? `callers reach it at /plugins/${name || "<name>"}${kind === "mcp" ? path : "/"} with their hearth key`}>
+          <Field label="Name" hint={nameProblem ?? `callers reach it at /plugins/${name || "<name>"}${at ? at.path : "/"} with their hearth key`}>
             <input className={cx(input, mono, nameProblem && name && "border-bad")} value={name} onChange={(e) => setName(e.target.value.toLowerCase())} />
           </Field>
           <p className="text-[11px] text-dim">Nothing is written until you review it. hearth reads plugins at startup, so a new one starts after a restart.</p>
