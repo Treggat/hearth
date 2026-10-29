@@ -2063,9 +2063,10 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
   }
 
   /**
-   * `/plugins/<name>/*`: the API a plugin `serves`, forwarded both ways as it streams, with no deadline, since
-   * a service may hold a stream open (an MCP session, server-sent events). The caller's key for this node is
-   * not passed on; the plugin's own `key` is, and the service is told who is calling in `x-hearth-caller`.
+   * `/plugins/<name>/*`: the API a plugin `serves`, forwarded both ways as it streams. Only the first byte has a
+   * deadline (`backendDefaults.firstByteMs`): once an answer starts, a service may hold the stream open (an MCP
+   * session, server-sent events). The caller's key for this node is not passed on; the plugin's own `key` is, and
+   * the service is told who is calling in `x-hearth-caller`.
    */
   async function routePluginServes(c: Call): Promise<void> {
     const { req, res, url } = c;
@@ -2096,6 +2097,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
         ...(body && body.length > 0 ? { raw: body } : {}),
         headers,
         signal: ctrl.signal,
+        ...(cfg.backendFirstByteMs > 0 ? { headersTimeoutMs: cfg.backendFirstByteMs } : {}),
       });
       to.done(up.status < 500);
       res.writeHead(up.status, forwardable(up.headers));

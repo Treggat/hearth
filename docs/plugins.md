@@ -368,8 +368,9 @@ plugins:
 ```
 
 - **`/plugins/<name>/<path>`** goes to `<serves>/<path>` with the query, method, headers and body as sent,
-  and the service's answer comes back as it is written. There is no deadline, so a stream the service holds
-  open (server-sent events, an MCP session) stays open until one side closes it.
+  and the service's answer comes back as it is written. The service has `backendDefaults.firstByteMs` to start
+  answering (502 if it does not); after that there is no deadline, so a stream it holds open (server-sent
+  events, an MCP session) stays open until one side closes it.
 - **Callers are let in as on `/v1`**: this machine, or one of `apiKeys`. A peer never is, and neither is a key
   scoped to `models:`.
 - **The caller's key stays here.** The service is sent the plugin's `key` as a bearer token instead, when it

@@ -42,11 +42,14 @@ await new Promise<void>((r) => backend.listen(0, "127.0.0.1", r));
 const backendUrl = `http://127.0.0.1:${(backend.address() as AddressInfo).port}`;
 
 let release: () => void = () => {};
+const hung: import("node:http").ServerResponse[] = [];
 const got: { method: string; url: string; auth: string | undefined; caller: string | undefined; body: string }[] = [];
 const service = createServer(async (rq, rs) => {
   let body = "";
   for await (const c of rq) body += c;
   got.push({ method: rq.method!, url: rq.url!, auth: rq.headers.authorization, caller: rq.headers["x-hearth-caller"] as string | undefined, body });
+  // Takes the request and never answers it.
+  if (rq.url === "/api/silent") { hung.push(rs); return; }
   if (rq.url === "/api/stream") {
     // The first event goes out at once; the rest only once the test has read it.
     rs.writeHead(200, { "Content-Type": "text/event-stream", "Mcp-Session-Id": "s1" });
@@ -71,6 +74,7 @@ backends:
   main: {url: ${backendUrl}, serves: [m]}
 models:
   m: {backend: main}
+backendDefaults: {firstByteMs: 400}
 flows:
   rest: {inputs: ["*"], steps: [{to: {asked: true}}]}
 apiKeys:
@@ -117,6 +121,13 @@ try {
   assert.equal((await call("/plugins/crawl/crawl", { key: "wrong" })).status, 401);
   assert.equal((await call("/plugins/nope/x", { key: "k-app" })).status, 404);
 
+  // A service that takes the request and never starts answering is let go after the first-byte deadline,
+  // while the stream above, which answered at once, stayed open past it.
+  const t0 = Date.now();
+  const silent = await call("/plugins/crawl/silent", { key: "k-app" });
+  assert.equal(silent.status, 502, "no first byte within backendDefaults.firstByteMs");
+  assert.ok(Date.now() - t0 < 5_000, "and it is let go at the deadline, not when the caller gives up");
+
   // Down or paused.
   const r3 = await call("/plugins/gone/x", { key: "k-app" });
   assert.equal(r3.status, 502);
@@ -127,6 +138,7 @@ try {
   assert.equal(r4.status, 503);
   assert.match(((await r4.json()) as { error: string }).error, /crawl is paused/);
 } finally {
+  for (const rs of hung) rs.destroy();
   await node.close();
   backend.close();
   service.close();
