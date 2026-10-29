@@ -36,7 +36,9 @@ export function rpcAnswer(text: string, id: number | string): Message | null {
   const one = (s: string): Message | null => { try { return JSON.parse(s) as Message; } catch { return null; } };
   const t = text.trimStart();
   const all = t.startsWith("{") || t.startsWith("[") ? [one(t)].flat() : text.split("\n").filter((l) => l.startsWith("data:")).map((l) => one(l.slice(5).trim()));
-  return (all.flat() as (Message | null)[]).find((m) => m !== null && m.id === id) ?? null;
+  // A server may send a number id back as a string, as a program over stdin may (see StdioMcp.receive).
+  const same = (v: unknown) => v === id || (typeof v === "string" && typeof id === "number" && v === String(id));
+  return (all.flat() as (Message | null)[]).find((m) => m !== null && same(m.id)) ?? null;
 }
 
 /** Asks a served MCP endpoint who it is and how many tools it has, as a client would, and ends the session. */
@@ -193,8 +195,8 @@ export class StdioMcp {
     // Notifications go on to the program, but its own `initialized` was sent by hearth already.
     const notify = (m: Message) => { if ((m.id === undefined || m.id === null) && m.method && m.method !== "notifications/initialized") this.write({ jsonrpc: "2.0", method: m.method, params: m.params }); };
     const list = Array.isArray(msg) ? msg : [msg];
-    list.forEach(notify);
-    const answers = (await Promise.all(list.map(one))).filter((a): a is Message => a !== null);
+    // In the batch's order: each request is written to the program as `one` starts it, so a notification before it goes first.
+    const answers = (await Promise.all(list.map((m) => { notify(m); return one(m); }))).filter((a): a is Message => a !== null);
     const session = list.some((m) => m.method === "initialize") ? randomUUID() : undefined;
     if (answers.length === 0) return { status: 202, type: "text/plain", body: "" };
     return { ...json(200, Array.isArray(msg) ? answers : answers[0]), ...(session ? { session } : {}) };
