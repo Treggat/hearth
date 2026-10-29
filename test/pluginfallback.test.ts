@@ -6,6 +6,7 @@
  *   - a plugin that cannot be reached, answers 5xx or 429 hands the request to its fallback; one that answers 4xx does not
  *   - a request its adapter has no counterpart for is not carried over: the caller gets the plugin's own failure
  *   - without `adapt`, the fallback is sent the same request
+ *   - a host that never answers the connection falls back after the connect deadline, not the OS's
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -91,6 +92,7 @@ plugins:
   search: {serves: "${serviceUrl}/search", trust: http, fallback: {plugin: backup, adapt: searxng-to-degoog}}
   backup: {serves: "${serviceUrl}/backup", trust: http}
   lost: {serves: "http://127.0.0.1:${closed}", trust: http, fallback: twin}
+  dark: {serves: "http://10.255.255.1:9", trust: http, fallback: twin}
   twin: {serves: "${serviceUrl}/twin", trust: http}
 `);
 const node = createNode(loadConfig(cfgPath), silentLogger);
@@ -122,6 +124,11 @@ try {
 
   // With no adapter, the same request goes to the fallback; here the plugin cannot be reached at all.
   assert.deepEqual(await call("/plugins/lost/a/b?c=1"), { status: 200, body: { from: "twin", at: "/twin/a/b?c=1" } });
+
+  // A host that never answers the connection is given up on in seconds, not when the OS stops trying.
+  const t0 = Date.now();
+  assert.deepEqual(await call("/plugins/dark/x"), { status: 200, body: { from: "twin", at: "/twin/x" } });
+  assert.ok(Date.now() - t0 < 6_000, `a silent host falls back within the connect deadline (took ${Date.now() - t0} ms)`);
 } finally {
   await node.close();
   service.close();

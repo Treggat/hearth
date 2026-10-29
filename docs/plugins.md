@@ -368,9 +368,11 @@ plugins:
 ```
 
 - **`/plugins/<name>/<path>`** goes to `<serves>/<path>` with the query, method, headers and body as sent,
-  and the service's answer comes back as it is written. The service has `backendDefaults.firstByteMs` to start
-  answering (502 if it does not); after that there is no deadline, so a stream it holds open (server-sent
-  events, an MCP session) stays open until one side closes it.
+  and the service's answer comes back as it is written. The service has 3 seconds to accept the connection and
+  `backendDefaults.firstByteMs` to start answering (502 if it does not); after that there is no deadline, so a
+  stream it holds open (server-sent events, an MCP session) stays open until one side closes it. The connect
+  deadline is short so a host that is gone fails, or falls back, at once; a service on the network accepts in
+  milliseconds.
 - **Callers are let in as on `/v1`**: this machine, or one of `apiKeys`. A peer never is, and neither is a key
   scoped to `models:`. The caller's router then decides, as it does for a model: the request is asked of it
   as `API:<name>` (or `MCP:<name>`), so it can let a plugin through, send it to another, or refuse it. With
@@ -412,7 +414,7 @@ plugins:
     trust: http
 ```
 
-- **It is asked when the plugin cannot answer**: it cannot be reached or does not start answering in time, it
+- **It is asked when the plugin cannot answer**: it cannot be reached (within 3 seconds) or does not start answering in time, it
   answers 5xx or 429, or it is paused or did not start. A 4xx is the plugin's answer and is passed on. A
   plugin that has begun answering is not replaced partway.
 - **One hop.** The fallback answers with its own API; its own `fallback` is not followed.

@@ -142,6 +142,11 @@ function forwardable(
 /** One request this node asked for, where it ran, and how it ended; `backend` and `peer` are both absent when it never ran. */
 export interface RecentCall { t: number; model: string; caller: string; backend?: string; peer?: string; ms: number; ok: boolean }
 const RECENT_KEPT = 12;
+/**
+ * How long a plugin's service has to accept the connection. A service on the network accepts in milliseconds;
+ * one that is gone would otherwise hold the caller for as long as the OS keeps trying, before its fallback is asked.
+ */
+const PLUGIN_CONNECT_MS = 3_000;
 
 export interface HearthNode {
   server: Server;
@@ -2141,6 +2146,7 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
         ...(body && body.length > 0 ? { raw: body } : {}),
         headers,
         signal: ctrl.signal,
+        connectTimeoutMs: PLUGIN_CONNECT_MS,
         ...(cfg.backendFirstByteMs > 0 ? { headersTimeoutMs: cfg.backendFirstByteMs } : {}),
       });
     };
