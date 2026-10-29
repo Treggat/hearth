@@ -301,6 +301,8 @@ export interface PluginView {
   use: string;
   /** The service's own API, answered at /plugins/<name>/; null when it has none. */
   serves: string | null;
+  /** The plugin that answers when this one cannot, and the adapter between their APIs. */
+  fallback?: { plugin: string; adapt: string | null } | null;
   served: { calls: number; errors: number };
   /** Requests served now, or within the last moment, by id: drawn as dots on the map. */
   live: string[];
@@ -330,6 +332,8 @@ export interface PluginsView {
   /** The kinds and stages this build runs plugins for. */
   liveKinds: string[];
   liveStages: PluginStage[];
+  /** What a plugin's fallback can name as `adapt`: an adapter between two APIs. */
+  adapters?: { name: string; desc: string }[];
   /** Each router: the global plugins it turns off or gives settings of its own, and the callers that go by it. */
   routers: Record<string, { plugins: Record<string, "off" | "own">; /** For "own": the settings it changes, by name. */ changes: Record<string, string[]>; callers: string[] }>;
   /** Plugins in hearth.yaml that differ from the running ones, until a restart. */

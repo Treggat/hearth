@@ -11,6 +11,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { existsSync, readFileSync, renameSync } from "node:fs";
 
 import { actionDecls, runAction, type Action, type ActionFacts } from "./actions.js";
+import { ADAPTERS, type Adapter } from "./adapt.js";
 import { admitModel, inScope, BodyTooLargeError, callerCap, Refusal, refusalOf } from "./admit.js";
 import { createCanary, degradedError, type RelayWatch } from "./canary.js";
 import { ANY, backendAuth, backendBase, ConfigError, DEFAULT_ROUTER, flowsFor, resolveSecret, peersMapping, WARM_LANE, type BackendConfig, type FlowEnd, type HearthConfig, type RoutePolicy } from "./config.js";
@@ -2091,16 +2092,28 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
       json(res, refused !== null ? 403 : 404, { error: refused ?? `no plugin named ${asked} serves an API here, and no rule gives that name to one` });
       return;
     }
+    const path = m?.[2] ?? "/";
+    // What the plugin's fallback is sent if this plugin cannot answer: null when it has none, or when its adapter
+    // has no counterpart for this request on the fallback's API.
+    const fb = plugins.fallbackOf(name);
+    let carry: { path: string; query: URLSearchParams; adapter: Adapter | null } | null = null;
+    if (fb !== null && fb.adapt === null) carry = { path, query: url.searchParams, adapter: null };
+    else if (fb !== null) {
+      const adapter = ADAPTERS[fb.adapt!]!;
+      const r = adapter.request(req.method ?? "GET", path, url.searchParams);
+      if (r !== null) carry = { ...r, adapter };
+    }
     const to = plugins.serve(name);
-    if ("why" in to) {
+    if ("why" in to && carry === null) {
       json(res, to.status, { error: to.why });
       return;
     }
+    const done = "why" in to ? () => {} : to.done;
     let body: Buffer | undefined;
     try {
       body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req, cfg.maxBodyBytes);
     } catch (e) {
-      to.done(false);
+      done(false);
       fail(res, e);
       return;
     }
@@ -2113,31 +2126,79 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
       log.info("plugin.served", { plugin: name, method: req.method, path: m?.[2] ?? "/", status: a.status, caller: c.caller, ms: Date.now() - t0 });
       return;
     }
-    const headers = stripOurKey(req) as Record<string, string>;
-    delete headers["x-hearth-caller"];
-    if (to.key) headers.authorization = `Bearer ${to.key}`;
-    headers["x-hearth-caller"] = c.caller;
     const ctrl = new AbortController();
     res.on("close", () => { if (!res.writableEnded) ctrl.abort(); });
     const t0 = Date.now();
-    try {
-      const up = await send(`${to.url}${m?.[2] ?? "/"}${url.search}`, {
+    // The plugin's own key replaces ours; an answer hearth rewrites is asked for uncompressed, so it can be read.
+    const call = (target: { url: string; key: string | null }, at: string, search: string, plain: boolean) => {
+      const headers = stripOurKey(req) as Record<string, string>;
+      delete headers["x-hearth-caller"];
+      if (plain) delete headers["accept-encoding"];
+      if (target.key) headers.authorization = `Bearer ${target.key}`;
+      headers["x-hearth-caller"] = c.caller;
+      return send(`${target.url}${at}${search}`, {
         method: req.method ?? "GET",
         ...(body && body.length > 0 ? { raw: body } : {}),
         headers,
         signal: ctrl.signal,
         ...(cfg.backendFirstByteMs > 0 ? { headersTimeoutMs: cfg.backendFirstByteMs } : {}),
       });
-      to.done(up.status < 500);
-      res.writeHead(up.status, forwardable(up.headers));
-      await pipeline(up.body, res);
-      log.info("plugin.served", { plugin: name, method: req.method, path: m?.[2] ?? "/", status: up.status, caller: c.caller, ms: Date.now() - t0 });
+    };
+    const said = (e: unknown) => (e instanceof Error ? e.message : String(e));
+    // Why this plugin did not answer, when its fallback is asked instead.
+    let failure: string;
+    if ("why" in to) failure = to.why;
+    else {
+      try {
+        const up = await call(to, path, url.search, false);
+        if (carry !== null && (up.status >= 500 || up.status === 429)) {
+          to.done(false);
+          up.body.resume();
+          failure = `it answered ${up.status}`;
+        } else {
+          to.done(up.status < 500);
+          res.writeHead(up.status, forwardable(up.headers));
+          await pipeline(up.body, res);
+          log.info("plugin.served", { plugin: name, method: req.method, path, status: up.status, caller: c.caller, ms: Date.now() - t0 });
+          return;
+        }
+      } catch (e) {
+        to.done(false);
+        // A caller that hung up mid-stream is the end of the exchange, not a failure of the service.
+        if (ctrl.signal.aborted) return;
+        log.warn("plugin.serve_failed", { plugin: name, path, error: said(e) });
+        // Once an answer has begun there is no taking it back, so only a plugin that never answered falls back.
+        if (res.headersSent) { res.destroy(); return; }
+        if (carry === null) { json(res, 502, { error: `plugin ${name} could not be reached: ${said(e)}` }); return; }
+        failure = said(e);
+      }
+    }
+    // A fallback is one hop: it answers with its own API, and its own fallback is not followed.
+    const alt = plugins.serve(fb!.plugin);
+    log.info("plugin.fallback", { plugin: name, to: fb!.plugin, adapt: fb!.adapt, why: failure, caller: c.caller });
+    if ("why" in alt || "stdio" in alt) {
+      if ("done" in alt) alt.done(false);
+      json(res, 502, { error: `plugin ${name} could not answer (${failure}), and neither could its fallback ${fb!.plugin}${"why" in alt ? `: ${alt.why}` : ""}` });
+      return;
+    }
+    const via = carry!;
+    try {
+      const qs = via.query.toString();
+      const up = await call(alt, via.path, qs === "" ? "" : `?${qs}`, via.adapter !== null);
+      alt.done(up.status < 500);
+      if (via.adapter === null || up.status < 200 || up.status >= 300) {
+        res.writeHead(up.status, forwardable(up.headers));
+        await pipeline(up.body, res);
+      } else {
+        const out = via.adapter.response(Buffer.from(await up.text(cfg.maxBodyBytes)));
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "content-length": out.length }).end(out);
+      }
+      log.info("plugin.served", { plugin: fb!.plugin, for: name, method: req.method, path: via.path, status: up.status, caller: c.caller, ms: Date.now() - t0 });
     } catch (e) {
-      to.done(false);
-      // A caller that hung up mid-stream is the end of the exchange, not a failure of the service.
+      alt.done(false);
       if (ctrl.signal.aborted) return;
-      log.warn("plugin.serve_failed", { plugin: name, path: m?.[2] ?? "/", error: e instanceof Error ? e.message : String(e) });
-      if (!res.headersSent) json(res, 502, { error: `plugin ${name} could not be reached: ${e instanceof Error ? e.message : String(e)}` });
+      log.warn("plugin.serve_failed", { plugin: fb!.plugin, for: name, path: via.path, error: said(e) });
+      if (!res.headersSent) json(res, 502, { error: `plugin ${name} could not answer (${failure}), and its fallback ${fb!.plugin} failed: ${said(e)}` });
       else res.destroy();
     }
   }
@@ -3371,6 +3432,8 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
         modelKinds: cfg.modelKinds,
         liveKinds: [...LIVE_KINDS],
         liveStages: [...LIVE_STAGES],
+        // What a plugin's fallback can name as `adapt`, for the picker.
+        adapters: Object.entries(ADAPTERS).map(([name, a]) => ({ name, desc: a.desc })),
         pending: config.pluginChanges(),
         routers: Object.fromEntries([DEFAULT_ROUTER, ...Object.keys(cfg.routers).filter((n) => n !== DEFAULT_ROUTER)].map((name) => [name, {
           plugins: Object.fromEntries(Object.entries(cfg.routers[name]?.plugins ?? {}).map(([p, v]) => [p, v === "off" ? "off" : "own"])),

@@ -388,6 +388,45 @@ plugins:
   reach it through this node as they reach a backend; a click opens it on the Plugins page, which says where
   its path goes and how many requests it has served.
 
+### A fallback
+
+`fallback` names another plugin that answers when this one cannot, as a backend route's `fallback` does for a
+model. It belongs to the plugin, not to a router: whichever router let the request through, the fallback is
+where it goes next.
+
+```yaml
+plugins:
+  search:
+    serves: http://search:8080           # a SearXNG instance
+    trust: http
+    fallback: { plugin: backup, adapt: searxng-to-degoog }
+  backup:
+    serves: http://backup:4444           # a degoog instance
+    trust: http
+  crawler:
+    serves: http://crawler:8080
+    trust: http
+    fallback: crawler-2                  # the same API: sent the same request
+  crawler-2:
+    serves: http://crawler-2:8080
+    trust: http
+```
+
+- **It is asked when the plugin cannot answer**: it cannot be reached or does not start answering in time, it
+  answers 5xx or 429, or it is paused or did not start. A 4xx is the plugin's answer and is passed on. A
+  plugin that has begun answering is not replaced partway.
+- **One hop.** The fallback answers with its own API; its own `fallback` is not followed.
+- **`adapt`** names an adapter between two APIs, for a fallback that speaks another. The request is rewritten
+  for the fallback, and its answer back into the shape the caller asked for. A request the adapter has no
+  counterpart for is not carried over, and the caller gets the plugin's own failure. The adapters:
+  - `searxng-to-degoog`: a SearXNG JSON search (`/search?q=…&format=json`, with `pageno` and the first of
+    `categories`) is asked of degoog's `/api/search`, and its results come back as SearXNG's (`snippet` as
+    `content`, `source` as `engine`, related searches as `suggestions`, engines that failed as
+    `unresponsive_engines`).
+- Only a plugin that serves an API other than MCP has a fallback, and only such a plugin is one.
+- The log says `plugin.fallback` with why; the Routing map draws "↳ falls back to" on the plugin's box, and
+  the Plugins page sets it.
+
 ## A plugin that speaks MCP
 
 An MCP server is a plugin too, in either of two ways:
