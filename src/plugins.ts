@@ -466,6 +466,8 @@ export class Plugins {
     if (l.state !== "running") return { status: 503, why: `${name} is ${l.state === "off" ? "off" : `not running: ${l.error}`}` };
     if (l.paused) return { status: 503, why: `${name} is paused` };
     l.served.calls++;
+    // Let go of what has been seen out here too, so the record stays bounded whether or not anyone reads the status.
+    this.live(l);
     const id = `${name}:${++this.seq}`;
     l.flying.set(id, null);
     const done = (ok: boolean) => { if (!ok) l.served.errors++; l.flying.set(id, Date.now()); };

@@ -7,6 +7,7 @@
  *   - two callers using the same request id each get their own answer
  *   - a notification is 202, a GET is 405, and a request the program makes of hearth is refused
  *   - a program that exits is started again, and answers again
+ *   - an answer whose id comes back as a string is still matched to its request
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -82,6 +83,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (m.method === "tools/call" && m.params.name === "echo") return setTimeout(() => say({ id: m.id, result: { content: [{ type: "text", text: m.params.arguments.text + " " + process.env.SECRET }] } }), m.params.arguments.wait ?? 0);
   if (m.method === "tools/call" && m.params.name === "inits") return say({ id: m.id, result: { content: [{ type: "text", text: inits + " " + refused }] } });
   if (m.method === "tools/call" && m.params.name === "exit") process.exit(3);
+  if (m.method === "tools/call" && m.params.name === "strid") return say({ id: String(m.id), result: { content: [{ type: "text", text: "id came back as a string" }] } });
 });
 `);
 
@@ -148,6 +150,9 @@ try {
   assert.deepEqual([fast.body!.id, fast.body!.result!.content![0]!.text], [7, "fast from-env"], "and the program got its env");
   const counted = await rpc({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "inits", arguments: {} } });
   assert.match(counted.body!.result!.content![0]!.text, /^1 hearth does not answer/, "initialized once for every caller, and its own request refused");
+
+  const strid = await rpc({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "strid", arguments: {} } });
+  assert.deepEqual([strid.status, strid.body!.id, strid.body!.result!.content![0]!.text], [200, 11, "id came back as a string"], "a program that sends the id back as a string is still answered");
 
   const get = await fetch(`${url}/plugins/runner/mcp`, { headers: { Authorization: "Bearer k-app" } });
   assert.equal(get.status, 405, "no stream of its own to open");

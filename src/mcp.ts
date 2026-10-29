@@ -160,11 +160,15 @@ export class StdioMcp {
       this.write({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "hearth does not answer requests from an MCP server" } });
       return;
     }
-    if (typeof m.id === "number" && this.pending.has(m.id)) {
-      const answer = this.pending.get(m.id)!;
-      this.pending.delete(m.id);
-      answer(m);
+    // An id sent back as a string ("7" for 7) is still the request it answers.
+    const id = typeof m.id === "string" && /^\d+$/.test(m.id) ? Number(m.id) : m.id;
+    if (typeof id === "number" && this.pending.has(id)) {
+      const answer = this.pending.get(id)!;
+      this.pending.delete(id);
+      answer({ ...m, id });
+      return;
     }
+    if (m.id !== undefined && m.id !== null) this.log.warn("plugin.mcp_unmatched", { plugin: this.name, id: m.id, hint: "an answer for no request hearth is waiting on" });
   }
 
   /**
