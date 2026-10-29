@@ -684,9 +684,9 @@ function flowTo(raw: unknown, at: string): FlowTo {
   if (typeof raw === "string" && raw.trim() !== "") return { model: raw.trim() };
   const o = asRecord(raw, at);
   only(o, ["model", "peer", "flow", "fastest", "refuse", "asked", "plugin"], at);
-  const said = ["peer", "flow", "fastest", "refuse", "asked"].filter((k) => o[k] !== undefined);
+  const said = ["peer", "flow", "fastest", "refuse", "asked", "plugin"].filter((k) => o[k] !== undefined);
   if (said.length > 1 || (said.length === 1 && said[0] !== "peer" && o.model !== undefined)) {
-    throw bad(at, "must say one thing: a model, a peer, a flow, fastest, refuse or asked");
+    throw bad(at, "must say one thing: a model, a peer, a flow, fastest, refuse, asked or a plugin");
   }
   if (o.asked !== undefined) {
     if (o.asked !== true) throw bad(`${at}.asked`, "must be true: run it here as the id that was asked for");

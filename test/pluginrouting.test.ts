@@ -27,6 +27,8 @@ const flows = (steps: unknown[]) => ({ flows: { rest: { inputs: ["*"], steps } }
 assert.deepEqual(parseConfig({ ...base, ...flows([{ to: { plugin: "tools" } }, { to: { asked: true } }]) }).flows.rest!.steps[0]!.to, { plugin: "tools" });
 assert.throws(() => parseConfig({ ...base, ...flows([{ to: { plugin: "tools" } }]) }), ConfigError, "a model request passes a plugin step over, so it cannot be the last");
 assert.throws(() => parseConfig({ ...base, ...flows([{ to: { fastest: [{ plugin: "a" }, "m"] } }]) }), ConfigError, "fastest chooses between models and peers");
+assert.throws(() => parseConfig({ ...base, ...flows([{ to: { plugin: "tools", model: "m" } }, { to: { asked: true } }]) }), /a plugin/, "a step says a plugin or a model, not both");
+assert.throws(() => parseConfig({ ...base, ...flows([{ to: { plugin: "tools", refuse: "no" } }, { to: { asked: true } }]) }), /a plugin/);
 
 // --- a node with plugins and routers -------------------------------------------
 const backend = createServer((rq, rs) => {
