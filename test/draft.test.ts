@@ -100,6 +100,11 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.equal(directTo("image", { inputs: ["image"], steps: [{ to: "chat", do: ["note"] }] }), null);
 
   const live = { net: { nodes: [{ name: "me", self: true, up: true, free: 1, slots: 1, queued: 0 }] }, routing: {} } as unknown as UiData;
+  // A model one backend declares is placed there, though a backend that declares nothing discovered it too.
+  const both = { ...live, net: { nodes: [{ ...live.net.nodes[0], backends: [{ name: "big", serves: ["chat", "side"] }, { name: "small", serves: ["side"] }] }] }, routing: { side: { backend: "small" } } } as unknown as UiData;
+  const placedOn = { backends: { big: { url: "http://a" }, small: { url: "http://b", serves: ["side"] } }, models: { side: {}, chat: {} } };
+  assert.equal(draftView(placedOn, both).routing?.side?.backend, "small");
+  assert.equal(draftView({ ...placedOn, backends: { big: { url: "http://a" }, small: { url: "http://b" } } }, both).routing?.side?.backend, "small");
   assert.deepEqual(draftView(acting, live).actions, { note: { kind: "log", says: "{asked} ran as {model}" }, tell: { kind: "call", says: "http://127.0.0.1:9/hook" } });
 
   // Taking an action away takes it off every line that ran it, so what is left still loads.
@@ -341,6 +346,15 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   // A model only a route names (a path with no name in it) is not chat either.
   const filmed = factsOf({ ...withFacts, backends: { ...(withFacts.backends as object), film: { url: "http://127.0.0.1:8", kind: "none", routes: [{ path: "/generate", model: "film-model", lane: "chat" }] } } }, live);
   assert.equal(filmed.kind("film-model"), "paths");
+  // A chat model on that kind of backend (one llama-swap serving image models and an LLM) is still chat when something
+  // says so; one a route names keeps its paths whatever it declares.
+  const mixed = factsOf({
+    ...withFacts,
+    backends: { ...(withFacts.backends as object), swap2: { url: "http://127.0.0.1:7", kind: "none", serves: ["pic", "talk", "talk2", "named"], routes: [{ path: "/upstream/{model}/generate", lane: "batch" }, { path: "/sing", model: "named" }] } },
+    models: { ...(withFacts.models as object), talk: { stats: { context: 81920 } }, talk2: { emulate: "llama-server" }, named: { stats: { context: 4096 } } },
+  }, live);
+  assert.deepEqual([mixed.kind("pic"), mixed.kind("talk"), mixed.kind("talk2"), mixed.kind("named")], ["paths", "chat", "chat", "paths"]);
+  assert.equal(refusal(null, to("talk"), mixed), null, "a chat line may end on the backend's chat model");
   // A rule that takes a path may end at any model here, one whose backend declares no path included, but never at a peer.
   assert.equal(refusal(null, to("paint"), facts, true), null);
   assert.equal(refusal(null, to("chat"), facts, true), null);

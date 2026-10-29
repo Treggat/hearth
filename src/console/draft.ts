@@ -108,7 +108,8 @@ export function draftView(doc: Doc, live: UiData): UiData {
   const routing: Record<string, Routing> = {};
   for (const [id, m] of Object.entries(obj(doc.models))) {
     const wire = text(obj(m).as) || id;
-    const backend = text(obj(m).backend) || backends.find((b) => (b.serves ?? []).includes(wire))?.name;
+    // Only a declared `serves` speaks here, as on the server: what a quiet backend discovered can list a model another declares.
+    const backend = text(obj(m).backend) || Object.entries(obj(doc.backends)).find(([, b]) => list(obj(b).serves).includes(wire))?.[0];
     // Where the draft cannot say which backend serves a name, what the running node worked out still stands.
     routing[id] = { ...live.routing?.[id], ...(backend ? { backend } : {}) };
   }
@@ -915,8 +916,18 @@ export function factsOf(doc: Doc, live: UiData): Facts {
   const routesOf = (backend: string): { path: string; model?: string }[] => (Array.isArray(obj(obj(doc.backends)[backend]).routes)
     ? (obj(obj(doc.backends)[backend]).routes as unknown[]).map((r) => ({ path: text(obj(r).path), ...(text(obj(r).model) ? { model: text(obj(r).model) } : {}) }))
     : (self?.backends ?? []).find((b) => b.name === backend)?.routes ?? []);
+  // A model that something says is chat (a context window, declared or seen, or a server it emulates) stays chat
+  // on a backend with paths, unless a route names it: an image backend's llama-swap can also serve a chat model.
+  const chatty = (name: string): boolean => {
+    const m = obj(obj(doc.models)[name]);
+    return text(m.emulate) !== "" || typeof obj(m.stats).context === "number" || typeof self?.stats?.[name]?.context === "number";
+  };
+  const named = (backend: string, name: string): boolean => {
+    const wire = text(obj(obj(doc.models)[name]).as) || name;
+    return routesOf(backend).some((r) => r.model === wire);
+  };
   return {
-    kind: (name) => { const on = owner(name); return on !== undefined && paths(on) ? "paths" : "chat"; },
+    kind: (name) => { const on = owner(name); return on !== undefined && paths(on) && (named(on, name) || !chatty(name)) ? "paths" : "chat"; },
     paths: (name) => {
       const on = owner(name);
       const wire = text(obj(obj(doc.models)[name]).as) || name;
