@@ -3,7 +3,9 @@
 **Status: partly built.** Chat requests run `request`, `routed`, `log` and `error` hooks for both kinds of
 plugin, with the guarantees below.
 Plugins are placed on routing lines or on every line, with model slots, and the console has a Plugins
-page and plugin blocks on the Routing map (C10, C11, C8; Try and per-request records are not built). The other stages, the other request kinds and plugins on peers' requests are
+page and plugin blocks on the Routing map (C10, C11, C8; Try and per-request records are not built). A
+plugin that `serves` an API is answered at `/plugins/<name>/*` ([A plugin that serves an API](#a-plugin-that-serves-an-api));
+the console shows it under the router on the Topology map and on the Plugins page. Plugin pages are not built. The other stages, the other request kinds and plugins on peers' requests are
 not built yet (tracking: #191); requests of other kinds run no plugins.
 
 A plugin changes or watches what passes through hearth: it can rewrite a request before it runs, keep a
@@ -74,7 +76,8 @@ between them:
 | `log` | after the last byte | read the exchange | no, runs in the background |
 | `error` | a backend, peer or plugin failed | read | no |
 
-Separately, a plugin may answer `routes` (requests to `/plugins/<name>/*`, its own API or page) and
+Separately, a plugin may answer `routes` (requests to `/plugins/<name>/*`, its own API or page; an
+http plugin's API is built, as [`serves`](#a-plugin-that-serves-an-api)) and
 `events` (queue, peer and eviction events, a superset of what `actions:` see).
 
 ### Streamed replies
@@ -347,6 +350,40 @@ A plugin with a page of its own serves it under its URL and declares it; hearth 
 proxies the page at `/plugins/<name>/`, checking the operator's login itself and passing who is viewing
 in headers. The page is shown in a sandboxed frame, so it never runs with the console's own access.
 
+## A plugin that serves an API
+
+Some services are a destination, not a step on the way to a model: a web crawler, a search index, an MCP
+server. `serves` puts one behind hearth's door, so callers reach it with the same keys as the models and
+the operator sees it beside the other plugins:
+
+```yaml
+plugins:
+  crawler:
+    serves: http://crawler:8080          # its own API, answered at /plugins/crawler/*
+    trust: http
+    key: env:CRAWLER_TOKEN               # what the service expects; optional
+  tools:
+    serves: http://tools:3100            # an MCP server: /plugins/tools/mcp
+    trust: http
+```
+
+- **`/plugins/<name>/<path>`** goes to `<serves>/<path>` with the query, method, headers and body as sent,
+  and the service's answer comes back as it is written. The service has `backendDefaults.firstByteMs` to start
+  answering (502 if it does not); after that there is no deadline, so a stream it holds open (server-sent
+  events, an MCP session) stays open until one side closes it.
+- **Callers are let in as on `/v1`**: this machine, or one of `apiKeys`. A peer never is, and neither is a key
+  scoped to `models:`.
+- **The caller's key stays here.** The service is sent the plugin's `key` as a bearer token instead, when it
+  has one, and who is calling in `x-hearth-caller` (`local` or `key:<label>`), which a caller cannot set.
+- **`use` is optional.** A plugin that only serves hooks nothing, so hearth reads no `/manifest` from it and
+  any service works as it is. With `use` as well, it does both, and a plugin that failed to start serves
+  nothing (503).
+- A paused plugin answers 503, an unknown name 404, and a service that cannot be reached 502. The Plugins
+  status counts the requests served and the ones that failed (`served`).
+- **In the console** each one is a box under the router on the Topology map, since callers reach it through
+  this node as they reach a backend; a click opens it on the Plugins page, which says where its path goes
+  and how many requests it has served.
+
 ## Guarantees
 
 1. **No deadlock.** `request` and `routed` run before a request holds a slot; a plugin's own model calls
@@ -401,6 +438,7 @@ request goes: the same page that decides the model shows what happens to the req
 | C9 | Request kinds: on the request context, `kind:` on backend routes and models, the per-request gate, checks at load, body shapes per kind. | medium |
 | C10 | Placement: `plugins:` on flow steps, run on the requests the step decides; `everyLine`; the line's kind checked against the plugin's when the config loads. | medium |
 | C11 | Model slots: `needs` in the manifest, `models` on the plugin and the step, `kind:` on models, `models` in every hook. | medium |
+| C12 | `serves`: an http plugin's own API forwarded at `/plugins/<name>/*`, streaming both ways. Built. | small |
 | C8 | Console: the Plugins page, plugin blocks and model slots on the Routing map, the palette and refused drops, plugin effects in Try, the per-request record, plugin pages proxied into the sidebar. | large |
 
 ## Order of work

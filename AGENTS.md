@@ -31,7 +31,8 @@ comment is read by strangers. Write for them.
   The Lending page is `Lending.tsx`; the recent-requests rail beside the
   Topology map is `Rail.tsx`; the Plugins page is
   `Plugins.tsx` and its Add plugin dialog `AddPlugin.tsx` (plugin blocks on the
-  routing map are in `flowNodes.tsx`); the ASCII smoke behind the Queue, Models,
+  routing map are in `flowNodes.tsx`; plugins that serve an API are boxes under
+  the router on the Topology map, in `Topology.tsx`); the ASCII smoke behind the Queue, Models,
   Keys and Lending pages, and behind the sidebar beside the maps, is
   `Smoke.tsx`, and what the node's load does to its fire is `fire.ts`. The
   routing map is `Routing.tsx` (layout),

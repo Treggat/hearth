@@ -8,7 +8,7 @@ import {
   applyNodeChanges, Background, BaseEdge, Controls, getBezierPath, Handle, Position, ReactFlow,
   type Edge, type EdgeProps, type Node, type NodeProps, type ReactFlowInstance,
 } from "@xyflow/react";
-import { CircuitBoard, Cloud, Cpu, Flame, Globe, KeyRound, Monitor, Plus, Redo2, RotateCcw, Save, Server, Split, Undo2, Users, Waypoints } from "lucide-react";
+import { CircuitBoard, Cloud, Cpu, Flame, Globe, KeyRound, Monitor, Plug, Plus, Redo2, RotateCcw, Save, Server, Split, Undo2, Users, Waypoints } from "lucide-react";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Rail } from "./Rail.js";
@@ -17,7 +17,7 @@ import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
 import { BAYS, bayRoom, callersIn, draftView, EVERYONE, list, movedBay, movedHardware, obj, ordered, put, routerFor, usersOf, withCaller, callerChoices, paneChoices, restacked, STACK, unstacked } from "./draft.js";
 import { change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit, addRouter, askAt } from "./editStore.js";
 import { Menu, VersionsButton, openVersions } from "./editor.js";
-import { control, go, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
+import { control, go, openPlugin, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
 import { Button, cx, Dialog, Dot, type Tone } from "./ui.js";
 
 /** `tags`: hardware a backend uses besides the group it sits in. `tip`: what the status dot is saying. */
@@ -275,13 +275,14 @@ const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
 });
 
 /** One machine: the frame around the backends on it. Drawn only once a config names another machine. */
-type Machine = { title: string; sub: string; /** The machine a backend let go here is put on. */ drop?: { server: string } };
+type Machine = { title: string; sub: string; /** The machine a backend let go here is put on. */ drop?: { server: string }; /** In place of the server icon. */ icon?: ReactNode; /** Fed from above: how far from its right edge the line comes in, in px. */ up?: number };
 
 const MachineNode = memo(function MachineNode({ data }: NodeProps<Node<Machine>>) {
   return (
     <div className="h-full w-full rounded-3xl border border-line bg-panel/40">
+      {data.up !== undefined && <Handle type="target" id="up" position={Position.Top} isConnectable={false} style={{ left: "auto", right: data.up, transform: "translate(50%, -50%)" }} />}
       <div className="flex items-center gap-2 px-4 pt-2.5 text-[12px]">
-        <Server size={13} className="text-dim" />
+        {data.icon ?? <Server size={13} className="text-dim" />}
         <span className="font-semibold">{data.title}</span>
         <span className="truncate text-dim">{data.sub}</span>
       </div>
@@ -756,6 +757,44 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
     });
     py += block + GAP;
   });
+  // Plugins that serve an API hang under the hub: callers reach them through this node, as they reach a backend.
+  const services = (d.plugins?.plugins ?? []).filter((p) => p.serves !== null);
+  if (services.length > 0) {
+    // A Plugins frame holding a Services group, as a machine holds its hardware. Two boxes wide at most, ending at the
+    // hub's right edge, and as many rows down as there are services, so it never reaches the machines on the right.
+    // One line goes into the frame, straight down from the hub, crossing no box.
+    const cols = Math.min(services.length, 2);
+    const rows = Math.ceil(services.length / cols);
+    const wide = PAD * 2 + cols * W + (cols - 1) * GAP;
+    const tall = HEAD + PAD + rows * H + (rows - 1) * GAP;
+    // Below the hub and below the last peer, however many peers there are.
+    const peersBottom = peers.length ? mid + (blocks.reduce((a, b) => a + b, 0) + GAP * (peers.length - 1)) / 2 : -Infinity;
+    const top = Math.max(mid + H / 2 + 72, peersBottom + 56);
+    nodes.push({
+      id: "plugins", type: "machine", position: { x: X.self + W + PAD + FRAME.pad - (wide + FRAME.pad * 2), y: top }, style: { width: wide + FRAME.pad * 2, height: FRAME.head + tall + FRAME.pad },
+      data: { title: "Plugins", sub: "", icon: <Plug size={13} className="text-dim" />, up: FRAME.pad + PAD + W / 2 } satisfies Machine,
+    });
+    nodes.push({
+      id: "services", type: "hardware", parentId: "plugins", extent: "parent", position: { x: FRAME.pad, y: FRAME.head }, style: { width: wide, height: tall },
+      data: { title: "Services", icon: <Plug size={13} />, hot: false, sub: "", tip: "Plugins that serve an API of their own, at /plugins/<name>/. Callers reach each one through this node, with the same keys as the models." } satisfies Group,
+    });
+    const down = services.filter((p) => p.state !== "running" || p.paused).length;
+    edges.push({ id: "e:plugins", source: hub, sourceHandle: "down", target: "plugins", targetHandle: "up", type: "flow", data: { jobs: [], pulses: [], wire: true, color: "var(--dim)", dashed: down === services.length } });
+    services.forEach((p, n) => {
+      const out = p.state !== "running";
+      // The last row fills from the right, under the hub, as the first rows do.
+      const row = Math.floor(n / cols);
+      const col = cols - 1 - (n % cols);
+      nodes.push({
+        id: `service:${p.name}`, type: "card", parentId: "services", extent: "parent", position: { x: PAD + col * (W + GAP), y: HEAD + row * (H + GAP) },
+        data: {
+          title: p.name, icon: <Plug size={14} />, tone: out ? "bad" : p.paused ? "warn" : "ok",
+          sub: out ? (p.error ?? "did not start") : p.paused ? "paused" : `/plugins/${p.name}/${p.served.calls ? ` · ${p.served.calls} served${p.served.errors ? `, ${p.served.errors} failed` : ""}` : ""}`,
+          tip: `/plugins/${p.name}/ goes to ${p.serves}. Click to open it on the Plugins page.`,
+        } satisfies Card,
+      });
+    });
+  }
   return { nodes, edges };
 }
 
@@ -938,6 +977,8 @@ export function Topology() {
         else if (kind === "self" || kind === "peer" || kind === "backend") select({ kind, id });
         else if (kind === "resource") select({ kind, id: id.split("/").pop()! });
         else if (kind === "machine" && id) select({ kind, id });
+        else if (kind === "service") openPlugin(id);
+        else if (n.id === "plugins") go("plugins");
       }}
       onPaneClick={() => select(null)}
       // A right-click on the empty part of the picture offers what the strip over it does, where the pointer is.

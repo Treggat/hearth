@@ -121,6 +121,10 @@ export interface PluginStatus {
   everyLine: boolean;
   /** Where it comes from: a URL shows only its origin and path. */
   use: string;
+  /** The service's own API, answered at `/plugins/<name>/*`, shown as its origin and path; null when it has none. */
+  serves: string | null;
+  /** Requests answered at `/plugins/<name>/*`, and those the service could not answer. */
+  served: { calls: number; errors: number };
   when: PluginWhen | null;
   timeoutMs: number;
   onError: PluginDecl["onError"];
@@ -275,6 +279,7 @@ interface Loaded {
   failOpens: number;
   paused: boolean;
   stats: Partial<Record<PluginStage, Stat>>;
+  served: { calls: number; errors: number };
 }
 
 /** One plugin as it applies to one request: its hooks, the settings its router gives it, its models and its line. */
@@ -305,14 +310,16 @@ export class Plugins {
   /** Loads every plugin. One that fails is turned off and logged, unless it is `required`. */
   async start(): Promise<void> {
     for (const [name, decl] of Object.entries(this.cfg.plugins)) {
-      const l: Loaded = { name, decl, declared: {}, needs: {}, kinds: {}, hooks: {}, state: "off", error: null, fails: 0, pausedUntil: 0, failOpens: 0, paused: false, stats: {} };
+      const l: Loaded = { name, decl, declared: {}, needs: {}, kinds: {}, hooks: {}, state: "off", error: null, fails: 0, pausedUntil: 0, failOpens: 0, paused: false, stats: {}, served: { calls: 0, errors: 0 } };
       this.loaded.push(l);
       if (this.opts.off) continue;
       try {
         const token = randomBytes(24).toString("base64url");
         this.tokens.set(token, name);
         const internal = { url: this.opts.selfUrl(), token };
-        const { declared, needs, hooks } = decl.trust === "code" ? await this.loadCode(name, decl, internal) : await this.loadService(name, decl, internal);
+        // A plugin that only serves an API hooks nothing, so it has no manifest to read.
+        const { declared, needs, hooks } = decl.use === null ? { declared: {}, needs: {}, hooks: {} }
+          : decl.trust === "code" ? await this.loadCode(name, decl, decl.use, internal) : await this.loadService(name, decl, decl.use, internal);
         const wider = widened(name, declared, decl.kinds);
         if (wider) throw new Error(wider);
         l.declared = declared;
@@ -324,7 +331,7 @@ export class Plugins {
         l.state = "running";
         const idle = Object.keys(l.kinds).filter((k) => !LIVE_KINDS.has(k as RequestKind));
         this.log.info("plugin.started", { plugin: name, trust: decl.trust, kinds: l.kinds, ...(idle.length ? { notYetRun: idle } : {}) });
-        if (!decl.everyLine && !placements(this.cfg).some((x) => x.plugin.name === name)) {
+        if (decl.use !== null && !decl.everyLine && !placements(this.cfg).some((x) => x.plugin.name === name)) {
           this.log.warn("plugin.on_no_line", { plugin: name, hint: "it runs nowhere: place it on a flow step, or set everyLine: true to run it on every request" });
         }
       } catch (e) {
@@ -405,6 +412,19 @@ export class Plugins {
       const o = own[l.name];
       return [{ name: l.name, config: typeof o === "object" ? o.config : l.decl.config, models, line }];
     });
+  }
+
+  /**
+   * Where `/plugins/<name>/*` goes: the service's URL and the key it is sent, or why it cannot be reached
+   * now, with the status to answer. Counts the request either way.
+   */
+  serve(name: string): { url: string; key: string | null; done: (ok: boolean) => void } | { status: number; why: string } {
+    const l = this.loaded.find((x) => x.name === name);
+    if (!l || l.decl.serves === null) return { status: 404, why: `no plugin named ${name} serves an API here` };
+    if (l.state !== "running") return { status: 503, why: `${name} is ${l.state === "off" ? "off" : `not running: ${l.error}`}` };
+    if (l.paused) return { status: 503, why: `${name} is paused` };
+    l.served.calls++;
+    return { url: l.decl.serves, key: l.decl.key, done: (ok) => { if (!ok) l.served.errors++; } };
   }
 
   /** Whether any plugin could run on a request at all, so the request carries what a line's plugins will need. */
@@ -554,7 +574,8 @@ export class Plugins {
       return s[Math.min(s.length - 1, Math.floor(q * s.length))]!;
     };
     return this.loaded.map((l) => ({
-      name: l.name, trust: l.decl.trust, state: l.state, error: l.error, kinds: l.kinds, declared: l.declared, needs: l.needs, models: l.decl.models, everyLine: l.decl.everyLine, use: shownUse(l.decl.use),
+      name: l.name, trust: l.decl.trust, state: l.state, error: l.error, kinds: l.kinds, declared: l.declared, needs: l.needs, models: l.decl.models, everyLine: l.decl.everyLine, use: shownUse(l.decl.use ?? l.decl.serves!),
+      serves: l.decl.serves === null ? null : shownUse(l.decl.serves), served: { ...l.served },
       when: l.decl.when, timeoutMs: l.decl.timeoutMs, onError: l.decl.onError, onFail: l.decl.onFail, locked: l.decl.locked,
       required: l.decl.required, reads: l.decl.reads, paused: l.paused, pausedUntil: l.pausedUntil, failOpens: l.failOpens,
       stages: Object.fromEntries(Object.entries(l.stats).map(([stage, st]) => [stage, {
@@ -563,10 +584,10 @@ export class Plugins {
     }));
   }
 
-  private async loadCode(name: string, decl: PluginDecl, internal: PluginContext["internal"]): Promise<{ declared: Declared; needs: Needs; hooks: Hooks }> {
+  private async loadCode(name: string, decl: PluginDecl, use: string, internal: PluginContext["internal"]): Promise<{ declared: Declared; needs: Needs; hooks: Hooks }> {
     let url: string;
-    if (decl.use.startsWith("file:")) {
-      const rel = decl.use.slice(5);
+    if (use.startsWith("file:")) {
+      const rel = use.slice(5);
       const base = this.cfg.configPath ? dirname(this.cfg.configPath) : process.cwd();
       const path = isAbsolute(rel) ? rel : resolvePath(base, rel);
       if (decl.integrity !== null) {
@@ -576,7 +597,7 @@ export class Plugins {
       url = pathToFileURL(path).href;
     } else {
       // npm:<package>@<version>: installed beside hearth by the operator, and held to that exact version.
-      const spec = decl.use.slice(4);
+      const spec = use.slice(4);
       const at = spec.lastIndexOf("@");
       const pkg = spec.slice(0, at), want = spec.slice(at + 1);
       const req = createRequire(this.cfg.configPath ?? resolvePath(process.cwd(), "hearth.yaml"));
@@ -612,8 +633,8 @@ export class Plugins {
     return { kinds: declared, needs };
   }
 
-  private async loadService(_name: string, decl: PluginDecl, internal: PluginContext["internal"]): Promise<{ declared: Declared; needs: Needs; hooks: Hooks }> {
-    const base = decl.use.replace(/\/$/, "");
+  private async loadService(_name: string, decl: PluginDecl, use: string, internal: PluginContext["internal"]): Promise<{ declared: Declared; needs: Needs; hooks: Hooks }> {
+    const base = use.replace(/\/$/, "");
     const auth: Record<string, string> = decl.key ? { authorization: `Bearer ${decl.key}` } : {};
     const { kinds: declared, needs } = await Plugins.manifest(base, decl.key);
     const post = async (hook: PluginStage, payload: Record<string, unknown>, ms: number): Promise<unknown> => {
