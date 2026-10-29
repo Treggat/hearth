@@ -124,3 +124,9 @@ backends:
   has no level below it, and several models refuse a request that turns
   thinking off. A model without effort support answers such a request with
   an error, so leave `reasoning_effort` off for one.
+- A request with an effort above `none` and `minimal` also asks for
+  `thinking: { type: adaptive, display: summarized }`: the API otherwise
+  returns the thinking empty. The summary comes back as `reasoning_content`.
+  The model still decides how much to think, and on an easy prompt it may
+  not think at all. Thinking blocks are not sent back on later turns; the API
+  accepts a conversation without them, tool calls included.

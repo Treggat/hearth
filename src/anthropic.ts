@@ -102,6 +102,8 @@ export function toAnthropic(body: Doc, cache: boolean, ttl: CacheTtl = "5m"): Do
   const stop = typeof body.stop === "string" ? [body.stop] : list(body.stop).filter((s) => typeof s === "string");
   const limit = [body.max_tokens, body.max_completion_tokens].find((n) => typeof n === "number" && n > 0);
   const effort = typeof body.reasoning_effort === "string" ? EFFORT[body.reasoning_effort] : undefined;
+  // A caller that asks for an effort is asked for the thinking too: the API returns it empty unless summarized.
+  const thinks = effort !== undefined && body.reasoning_effort !== "none" && body.reasoning_effort !== "minimal";
   return {
     model: body.model,
     max_tokens: limit ?? DEFAULT_MAX_TOKENS,
@@ -115,6 +117,7 @@ export function toAnthropic(body: Doc, cache: boolean, ttl: CacheTtl = "5m"): Do
     ...(typeof body.top_p === "number" ? { top_p: body.top_p } : {}),
     ...(stop.length > 0 ? { stop_sequences: stop } : {}),
     ...(effort !== undefined ? { output_config: { effort } } : {}),
+    ...(thinks ? { thinking: { type: "adaptive", display: "summarized" } } : {}),
     ...(body.stream === true ? { stream: true } : {}),
   };
 }

@@ -56,6 +56,11 @@ assert.deepEqual([effortOf("none"), effortOf("minimal")], [{ effort: "low" }, { 
 assert.equal(effortOf("turbo"), undefined, "a level the API has no name for is not sent");
 assert.equal(effortOf(undefined), undefined, "no effort asked, none sent: the model's own default stands");
 assert.ok(!("reasoning_effort" in (toAnthropic({ ...asked, reasoning_effort: "high" }, false) as Doc)), "the chat-completions name does not go out");
+// An effort asked for brings back its thinking, summarized; none, minimal and no effort leave thinking to the model.
+const thinkingOf = (e: unknown): unknown => (toAnthropic({ ...asked, reasoning_effort: e }, false) as Doc).thinking;
+assert.deepEqual(thinkingOf("high"), { type: "adaptive", display: "summarized" });
+assert.deepEqual(thinkingOf("low"), { type: "adaptive", display: "summarized" });
+assert.deepEqual([thinkingOf("none"), thinkingOf("minimal"), thinkingOf(undefined), thinkingOf("turbo")], [undefined, undefined, undefined, undefined]);
 
 // What a later request reads from the cache is what an earlier one marked, unchanged.
 type Sent = { system?: Doc[]; messages: { role: string; content: Doc[] }[]; tools?: Doc[] };
