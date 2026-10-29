@@ -46,21 +46,24 @@ const nameFrom = (url: string): string => {
 
 const input = "h-8 w-full rounded-md border border-line bg-bg px-2 text-[13px] focus:border-accent focus:outline-none";
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+function Field({ label, hint, bad, children }: { label: string; hint?: string; /** The hint says what is wrong with the value. */ bad?: boolean; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-1">
       <span className="text-[12px] font-medium">{label}</span>
       {children}
-      {hint && <span className="text-[11px] text-dim">{hint}</span>}
+      {hint && <span className={cx("text-[11px]", bad ? "text-bad" : "text-dim")}>{hint}</span>}
     </label>
   );
 }
 
 const H = "text-[11px] font-semibold uppercase tracking-wide text-dim";
 
+/** A name as it is typed: lowercase, anything but letters, digits and dashes turned into a dash, as in `my.tools` to `my-tools`. */
+const asName = (v: string) => v.toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+
 /** Why a name cannot be a new plugin's, or null. */
 const nameWhy = (name: string, taken: Set<string>): string | null =>
-  !name ? "give it a name" : !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) ? "lowercase letters, digits and dashes" : name === "probe" ? "probe is the console's own path" : taken.has(name) ? `${name} is already a plugin` : null;
+  !name ? "give it a name" : !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) ? "a name starts with a letter or digit, and is lowercase letters, digits and dashes" : name === "probe" ? "probe is the console's own path" : taken.has(name) ? `${name} is already a plugin` : null;
 
 /** A key field: the environment variable hearth reads it from, so the key itself never goes in the file. */
 /** An environment variable's name, as opposed to a key pasted in: capitals, digits and underscores. */
@@ -205,8 +208,8 @@ ${envRows.map((r) => `        ${r.name.trim()}: env:${r.from.trim() || r.name.tr
             ))}
             <button type="button" className="self-start text-[12px] text-accent underline" onClick={() => setEnv([...env, { name: "", from: "" }])}>add a variable</button>
           </div>
-          <Field label="Name" hint={nameProblem ?? `callers reach it at /plugins/${name || "<name>"}/mcp`}>
-            <input className={cx(input, mono, nameProblem && name && "border-bad")} value={name} onChange={(e) => setName(e.target.value.toLowerCase())} />
+          <Field label="Name" bad={!!name && nameProblem !== null} hint={nameProblem ?? `callers reach it at /plugins/${name || "<name>"}/mcp`}>
+            <input className={cx(input, mono, nameProblem && name && "border-bad")} value={name} onChange={(e) => setName(asName(e.target.value))} />
           </Field>
           <div className="flex flex-col gap-1">
             <span className="flex items-center justify-between"><span className={H}>Add this to hearth.yaml</span>
@@ -231,8 +234,8 @@ ${envRows.map((r) => `        ${r.name.trim()}: env:${r.from.trim() || r.name.tr
               {found && <span className="text-[12px] text-ok">{found}</span>}
             </div>
           )}
-          <Field label="Name" hint={nameProblem ?? `callers reach it at /plugins/${name || "<name>"}${at ? at.path : "/"} with their hearth key`}>
-            <input className={cx(input, mono, nameProblem && name && "border-bad")} value={name} onChange={(e) => setName(e.target.value.toLowerCase())} />
+          <Field label="Name" bad={!!name && nameProblem !== null} hint={nameProblem ?? `callers reach it at /plugins/${name || "<name>"}${at ? at.path : "/"} with their hearth key`}>
+            <input className={cx(input, mono, nameProblem && name && "border-bad")} value={name} onChange={(e) => setName(asName(e.target.value))} />
           </Field>
           <p className="text-[11px] text-dim">Nothing is written until you review it. hearth reads plugins at startup, so a new one starts after a restart.</p>
         </section>
@@ -272,7 +275,7 @@ export function AddPlugin({ onClose }: { onClose: () => void }) {
 
   const taken = new Set([...Object.keys((file?.doc?.plugins as Record<string, unknown> | undefined) ?? {}), ...(pl?.plugins ?? []).map((p) => p.name)]);
   const unwired = found ? Object.entries(found.needs).filter(([slot, n]) => !n.optional && !slots[slot]).map(([slot]) => slot) : [];
-  const nameProblem = !name ? "give it a name" : !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) ? "lowercase letters, digits and dashes" : taken.has(name) ? `${name} is already a plugin` : null;
+  const nameProblem = !name ? "give it a name" : !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) ? "a name starts with a letter or digit, and is lowercase letters, digits and dashes" : taken.has(name) ? `${name} is already a plugin` : null;
   const all = found ? Object.entries(found.kinds).flatMap(([k, st]) => (st ?? []).map((s) => `${k}:${s}`)) : [];
   const blocking = all.some((h) => h.endsWith(":request") || h.endsWith(":routed") || h.endsWith(":parallel") || h.endsWith(":response"));
   const liveHook = (h: string) => { const [k, s] = h.split(":"); return !!pl?.liveKinds.includes(k!) && !!pl.liveStages.includes(s as PluginStage); };
@@ -486,8 +489,8 @@ export function AddPlugin({ onClose }: { onClose: () => void }) {
 
               <section className="flex flex-col gap-2">
                 <div className="text-[11px] font-semibold uppercase tracking-wide text-dim">Name</div>
-                <Field label="Name" hint={nameProblem ?? "how hearth.yaml, routers and the logs refer to it"}>
-                  <input className={cx(input, mono, nameProblem && name && "border-bad")} value={name} onChange={(e) => setName(e.target.value.toLowerCase())} />
+                <Field label="Name" bad={!!name && nameProblem !== null} hint={nameProblem ?? "how hearth.yaml, routers and the logs refer to it"}>
+                  <input className={cx(input, mono, nameProblem && name && "border-bad")} value={name} onChange={(e) => setName(asName(e.target.value))} />
                 </Field>
               </section>
             </>
