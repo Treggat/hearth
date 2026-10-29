@@ -18,7 +18,13 @@ import { join } from "node:path";
 
 import { ConfigError, loadConfig, parseConfig } from "../src/config.js";
 import { silentLogger } from "../src/log.js";
+import { rpcAnswer } from "../src/mcp.js";
 import { createNode } from "../src/server.js";
+
+// A served server's answer is matched to its request by id, also when it sends a number id back as a string.
+assert.equal(rpcAnswer('{"jsonrpc":"2.0","id":"1","result":{}}', 1)?.id, "1");
+assert.equal(rpcAnswer('data: {"jsonrpc":"2.0","id":2,"result":{}}\n', 2)?.id, 2);
+assert.equal(rpcAnswer('{"jsonrpc":"2.0","id":"12","result":{}}', 1), null);
 
 // --- config -----------------------------------------------------------------
 const base = { version: 3, name: "t", backends: { main: { url: "http://127.0.0.1:1", serves: ["m"] } }, models: { m: { backend: "main" } } };
@@ -74,9 +80,12 @@ import { createInterface } from "node:readline";
 const say = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\\n");
 let inits = 0;
 let refused = null;
+const notes = [];
 createInterface({ input: process.stdin }).on("line", (line) => {
   const m = JSON.parse(line);
   if (m.id === 900) { refused = m.error?.message ?? null; return; }
+  if (m.method?.startsWith("notifications/note")) { notes.push(m.params.n); return; }
+  if (m.method === "tools/call" && m.params.name === "notes") return say({ id: m.id, result: { content: [{ type: "text", text: notes.join(",") }] } });
   if (m.method === "initialize") { inits++; return say({ id: m.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "run-tools", version: "1.0" } } }); }
   if (m.method === "notifications/initialized") return say({ method: "roots/list", id: 900 });
   if (m.method === "tools/list") return say({ id: m.id, result: { tools: [{ name: "echo" }, { name: "inits" }] } });
@@ -153,6 +162,13 @@ try {
 
   const strid = await rpc({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "strid", arguments: {} } });
   assert.deepEqual([strid.status, strid.body!.id, strid.body!.result!.content![0]!.text], [200, 11, "id came back as a string"], "a program that sends the id back as a string is still answered");
+  // A batch reaches the program in its own order: the request sees the note before it and not the one after.
+  const batch = await fetch(`${url}/plugins/runner/mcp`, { method: "POST", headers: { Authorization: "Bearer k-app", "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify([
+    { jsonrpc: "2.0", method: "notifications/note", params: { n: 1 } },
+    { jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "notes", arguments: {} } },
+    { jsonrpc: "2.0", method: "notifications/note", params: { n: 2 } },
+  ]) });
+  assert.equal(((await batch.json()) as { result: { content: { text: string }[] } }[])[0]!.result.content[0]!.text, "1", "notifications and requests keep their order in a batch");
 
   const get = await fetch(`${url}/plugins/runner/mcp`, { headers: { Authorization: "Bearer k-app" } });
   assert.equal(get.status, 405, "no stream of its own to open");
