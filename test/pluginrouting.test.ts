@@ -6,6 +6,7 @@
  *   - "as asked" lets a plugin request through to its plugin; `refuse` turns it away with the step's words
  *   - a step that names a plugin sends the request there; a step that names a model is passed over
  *   - on a model request, a step that names a plugin is passed over
+ *   - a name a router gives a plugin, that is no plugin's own, reaches the plugin its step names
  *   - with no rule for MCP or API, a router's flow for every other name decides: running as itself lets plugins
  *     through, refusing refuses them
  */
@@ -78,6 +79,7 @@ routers:
         steps:
           - {when: {variant: [tools]}, to: {asked: true}}
           - {when: {variant: [old-search]}, to: {plugin: crawl}}
+          - {when: {variant: [web-get]}, to: {plugin: crawl}}
           - {when: {variant: [crawl]}, to: {model: m}}
           - {to: {refuse: "only the tools are open to you"}}
       rest: {inputs: ["*"], steps: [{to: {asked: true}}]}
@@ -117,13 +119,18 @@ try {
   assert.deepEqual(await call("/plugins/old-search/q", "k-picky"), { status: 200, body: { at: "/crawl/q" } }, "a step that names a plugin sends it there");
   const passed = await call("/plugins/crawl/x", "k-picky");
   assert.equal(passed.status, 403);
-  assert.match(passed.body.error!, /step 3 sends to a model.*only the tools are open to you/, "a step that names a model is passed over, and the refusal says so");
+  assert.match(passed.body.error!, /step 4 sends to a model.*only the tools are open to you/, "a step that names a model is passed over, and the refusal says so");
+
+  // A name the router gives a plugin, that no plugin has, is asked of it as API:<name> or MCP:<name>.
+  assert.deepEqual(await call("/plugins/web-get/page", "k-picky"), { status: 200, body: { at: "/crawl/page" } }, "a router's own name for a plugin reaches it");
+  assert.deepEqual(await call("/plugins/web-put/page", "k-picky"), { status: 403, body: { error: "only the tools are open to you" } }, "a name no step gives is refused in the router's words");
+  assert.equal((await call("/plugins/web-put/page", "k-app")).status, 404, "on rules that run names as asked, a name no plugin has is not found");
 
   // On a model request, the step that names a plugin is passed over and the model runs.
   const chat = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { Authorization: "Bearer k-app", "Content-Type": "application/json" }, body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }) });
   assert.equal(chat.status, 200);
   assert.match(JSON.stringify(await chat.json()), /from the model/);
-  assert.ok(!got.some((u) => u.startsWith("/crawl/") && u !== "/crawl/x" && u !== "/crawl/q"), "the plugin never got the model request");
+  assert.ok(!got.some((u) => u.startsWith("/crawl/") && u !== "/crawl/x" && u !== "/crawl/q" && u !== "/crawl/page"), "the plugin never got the model request");
 } finally {
   await node.close();
   backend.close();

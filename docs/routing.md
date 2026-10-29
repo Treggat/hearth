@@ -339,12 +339,15 @@ routers:
         steps:
           - when: { variant: [search] }
             to: { asked: true }              # the plugin it names
-          - when: { variant: [old-search] }
-            to: { plugin: search }           # another plugin, under the old name
+          - when: { variant: [web-search] }
+            to: { plugin: search }           # a name of the router's own: /plugins/web-search/ goes to search
           - to: { refuse: "only search is open to partners" }
       rest: { inputs: ["*"], steps: [{ to: { asked: true } }] }
 ```
 
+- A name that is no plugin's own is asked as `API:<name>`, then `MCP:<name>`, so a router can give its callers
+  names of its own and decide which plugin answers each; a request by a plugin's own name is then the router's
+  to refuse, like any other.
 - `{ asked: true }` lets it through to the plugin it names, and `{ plugin: name }` sends it to another;
   `refuse` turns it away (403, with the step's words). A step that sends to a model or a peer is passed over.
 - A model request passes over a step that names a plugin, so such a step cannot be a flow's last.

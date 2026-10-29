@@ -2074,18 +2074,22 @@ export function createNode(cfg: HearthConfig, baseLog: Logger, opts: { plugins?:
     const m = /^\/plugins\/([^/]+)(\/.*)?$/.exec(c.path);
     // The caller's router decides, as it does for a model: the request is asked of it as MCP:<name> or API:<name>.
     // With no rule for MCP or API, its flow for every other name decides: one that runs a name as itself lets
-    // plugins through, and one that refuses refuses them until a rule for MCP or API is added.
-    let name = m?.[1] ?? "";
-    const kind = plugins.kindOf(name);
-    const rules = rulesFor(c.caller);
-    if (kind !== null) {
-      const r = resolve(`${kind}:${name}`, { ...worldFor(c.caller, Object.keys(cfg.scheduler.lanes)[0]!, undefined, rules, headersOf(req)), plugin: name });
-      if (r.plugin === undefined) {
-        log.info("plugin.refused", { plugin: name, caller: c.caller, reason: r.reason });
-        json(res, 403, { error: r.reason });
-        return;
-      }
-      name = r.plugin;
+    // plugins through, and one that refuses refuses them until a rule for MCP or API is added. A name that is no
+    // plugin's may be a router's own name for one, so it is asked as either type, and the plugin a step names answers.
+    const asked = m?.[1] ?? "";
+    const kind = plugins.kindOf(asked);
+    const world = { ...worldFor(c.caller, Object.keys(cfg.scheduler.lanes)[0]!, undefined, rulesFor(c.caller), headersOf(req)), plugin: asked };
+    let name: string | null = null;
+    let refused: string | null = null;
+    for (const as of kind !== null ? [kind] : (["API", "MCP"] as const)) {
+      const r = resolve(`${as}:${asked}`, world);
+      if (r.plugin !== undefined && plugins.kindOf(r.plugin) !== null) { name = r.plugin; break; }
+      if (r.plugin === undefined) refused ??= r.reason;
+    }
+    if (name === null) {
+      if (refused !== null) log.info("plugin.refused", { plugin: asked, caller: c.caller, reason: refused });
+      json(res, refused !== null ? 403 : 404, { error: refused ?? `no plugin named ${asked} serves an API here, and no rule gives that name to one` });
+      return;
     }
     const to = plugins.serve(name);
     if ("why" in to) {
