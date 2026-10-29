@@ -6,7 +6,7 @@
 import { ChevronDown, ChevronRight, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
-import { lineDiff, opsBetween, type Op } from "./diff.js";
+import { keyLines, lineDiff, opsBetween, type Op } from "./diff.js";
 import { FIELDS, fieldAt, humanMs, scopeOf, seedOf, type Field, type Ref, type Scope } from "../fields.js";
 import { changed, choose, useEdit } from "./editStore.js";
 import { go, request, RequestError, toast, useStore } from "./store.js";
@@ -628,7 +628,8 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
   const status = useStore((s) => s.data!.config);
   const pending = useEdit(changed);
   const [file, setFile] = useState<File | null>(null);
-  const [tab, setTab] = useState<string>("backends");
+  const [tab, setTab] = useState<string>(() => (useStore.getState().yamlAt ? "yaml" : "backends"));
+  const yamlBox = useRef<HTMLTextAreaElement>(null);
   const [drafts, setDrafts] = useState<Record<string, unknown>>({});
   const [renames, setRenames] = useState<Record<string, Op[]>>({});
   const [text, setText] = useState("");
@@ -648,6 +649,21 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
     }
   };
   useEffect(() => { void load(); }, []);
+  // Asked to open on a key: once the text is in, select its lines and scroll them near the top.
+  useEffect(() => {
+    const at = useStore.getState().yamlAt;
+    const box = yamlBox.current;
+    if (!at || !file || !box) return;
+    useStore.setState({ yamlAt: null });
+    const span = keyLines(box.value, at);
+    if (!span) return;
+    const lines = box.value.split("\n");
+    const start = lines.slice(0, span.from).reduce((n, l) => n + l.length + 1, 0);
+    const end = start + lines.slice(span.from, span.to + 1).join("\n").length;
+    box.focus({ preventScroll: true });
+    box.setSelectionRange(start, end);
+    box.scrollTop = Math.max(0, span.from * parseFloat(getComputedStyle(box).lineHeight) - 40);
+  }, [file, tab]);
   const dirty = Object.keys(drafts).length > 0 || (file !== null && text !== file.text);
   // An edit made elsewhere moves the hash; follow it unless there is unsaved work here.
   useEffect(() => { if (file && status.hash !== file.hash && !dirty) void load(); }, [status.hash]);
@@ -764,7 +780,7 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
                 </Refs.Provider>
               </div>
             ) : (
-              <textarea spellCheck={false} value={text} onChange={(e) => setText(e.target.value)}
+              <textarea ref={yamlBox} spellCheck={false} value={text} onChange={(e) => setText(e.target.value)}
                         onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); if (text !== file.text) void review({ text }); } }}
                         className="min-h-0 flex-1 resize-none bg-transparent p-4 font-mono text-[12px] leading-5 outline-none" />
             )}

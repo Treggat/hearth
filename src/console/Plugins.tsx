@@ -11,7 +11,7 @@ import { Review, type File, type Plan } from "./config.js";
 import { showRouter } from "./editStore.js";
 import { modelsOfKind } from "./flowNodes.js";
 import type { PluginStage, PluginView, PluginsView } from "./types.js";
-import { go, pausePlugin, refresh, request, toast, useStore } from "./store.js";
+import { go, openYaml, pausePlugin, refresh, request, toast, useStore } from "./store.js";
 import { Button, Card, cx, mono, Switch } from "./ui.js";
 
 const NO_MODELS: string[] = [];
@@ -202,7 +202,7 @@ function Panel({ p, pv, onClose, onWire }: { p: PluginView; pv: PluginsView; onC
         <section className="flex flex-col gap-1">
           <div className={H}>Its own settings</div>
           <span className="text-dim">Under <code className={mono}>plugins.{p.name}.config</code> in hearth.yaml, read at startup.</span>
-          <button className="self-start text-accent underline" onClick={() => go("config")}>Open Config</button>
+          <button className="self-start text-accent underline" onClick={() => openYaml(["plugins", p.name])}>Open in hearth.yaml</button>
         </section>
       </div>
     </aside>

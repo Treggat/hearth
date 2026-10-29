@@ -42,6 +42,8 @@ interface State {
   askKey: ((key: string | null) => void) | null;
   /** The plugin open on the Plugins page. */
   plugin: string | null;
+  /** A key the Config page opens on in the hearth.yaml tab, as its path, until it has been shown. */
+  yamlAt: string[] | null;
   /** A key just minted or rotated: its plaintext, to be shown once and then let go. */
   fresh: { label: string; key: string; rotated?: boolean } | null;
 }
@@ -56,6 +58,7 @@ export const useStore = create<State>(() => ({
   page: pageOf(),
   sel: null,
   plugin: null,
+  yamlAt: null,
   fresh: null,
   toast: null,
   askKey: null,
@@ -68,6 +71,8 @@ export const go = (page: Page) => {
 export const select = (sel: Sel) => useStore.setState({ sel });
 /** Open a plugin on the Plugins page, from wherever it was named. */
 export const openPlugin = (name: string) => { go("plugins"); useStore.setState({ plugin: name }); };
+/** Open hearth.yaml on the Config page with this key's lines picked out, for settings that have no form there. */
+export const openYaml = (path: string[]) => { go("config"); useStore.setState({ yamlAt: path }); };
 
 let toastSeq = 0;
 export function toast(tone: "ok" | "bad", text: string): void {

@@ -1,4 +1,4 @@
-/** Line diffs for the review step, and the smallest set of path ops that turns one value into another. */
+/** Line diffs for the review step, the smallest set of path ops that turns one value into another, and where a key sits in the file. */
 
 export type Line = { kind: " " | "+" | "-" | "…"; text: string };
 
@@ -59,4 +59,40 @@ export function opsBetween(from: unknown, to: unknown, path: (string | number)[]
     return ops;
   }
   return [{ path, value: to }];
+}
+
+/**
+ * The lines a key's block takes in YAML text, from its own line to the last line under it, 0-based. A path
+ * the text does not spell out in block style stops at the deepest key it does, so the reader lands near it.
+ * Null when not even the first key is there.
+ */
+export function keyLines(text: string, path: string[]): { from: number; to: number } | null {
+  const lines = text.split("\n");
+  const indent = (s: string) => s.length - s.trimStart().length;
+  const blank = (s: string) => s.trim() === "" || s.trimStart().startsWith("#");
+  const end = (at: number) => {
+    let last = at;
+    for (let i = at + 1; i < lines.length && (blank(lines[i]!) || indent(lines[i]!) > indent(lines[at]!)); i++) if (!blank(lines[i]!)) last = i;
+    return last;
+  };
+  let found: { from: number; to: number } | null = null;
+  let from = 0, to = lines.length - 1, above = -1;
+  for (const key of path) {
+    const named = (l: string) => [key, `"${key}"`, `'${key}'`].some((k) => l.trimStart().startsWith(k) && /^\s*:(\s|$)/.test(l.trimStart().slice(k.length)));
+    let at = -1;
+    let depth = -1;
+    for (let i = from; i <= to; i++) {
+      const l = lines[i]!;
+      if (blank(l) || indent(l) <= above) continue;
+      // Only the keys directly under the parent: the first one sets how deep they sit.
+      if (depth === -1) depth = indent(l);
+      if (indent(l) === depth && named(l)) { at = i; break; }
+    }
+    if (at === -1) break;
+    found = { from: at, to: end(at) };
+    above = indent(lines[at]!);
+    from = at + 1;
+    to = found.to;
+  }
+  return found;
 }
