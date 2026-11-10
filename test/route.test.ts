@@ -8,10 +8,10 @@
  */
 import assert from "node:assert/strict";
 
-import { parseConfig } from "../src/config.js";
-import { silentLogger } from "../src/log.js";
-import { PeerRegistry, type PeerCapacity } from "../src/peers.js";
-import { decide } from "../src/route.js";
+import { parseConfig } from "../src/config/config.js";
+import { silentLogger } from "../src/observe/log.js";
+import { PeerRegistry, type PeerCapacity } from "../src/peers/peers.js";
+import { decide } from "../src/routing/route.js";
 import { parseV1 } from "./v1.js";
 
 const base = {
@@ -38,10 +38,10 @@ const idle: PeerCapacity = {
 function registry(cfg: ReturnType<typeof parseConfig>, up: Record<string, PeerCapacity | null>) {
   const r = new PeerRegistry(cfg, silentLogger);
   const inner = r as unknown as {
-    status: Map<string, Record<string, unknown>>;
+    peers: Map<string, { status: Record<string, unknown> }>;
   };
   for (const [name, cap] of Object.entries(up)) {
-    const s = inner.status.get(name);
+    const s = inner.peers.get(name)?.status;
     if (!s) throw new Error(`no such peer ${name}`);
     s.up = cap !== null;
     s.capacity = cap;

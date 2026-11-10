@@ -16,8 +16,8 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError } from "../src/config.js";
-import { silentLogger } from "../src/log.js";
+import { ConfigError } from "../src/config/read.js";
+import { silentLogger } from "../src/observe/log.js";
 import { createNode, type HearthNode } from "../src/server.js";
 import { parseV1 } from "./v1.js";
 
@@ -84,7 +84,7 @@ const cfg = parseV1({
   name: "me",
   backends: [{ name: "swap", url: be.url(), kind: "none" }],
   models: {
-    [SEAT]: { backend: "swap" },
+    [SEAT]: { backend: "swap", efforts: { none: { chat_template_kwargs: { enable_thinking: false } } } },
     "seat-low": { backend: "swap", as: SEAT, params: { reasoning_effort: "low", temperature: 0.1 } },
     "seat-off": { backend: "swap", as: SEAT, params: { reasoning_effort: "none" } },
     nice: { backend: "swap", as: HIDDEN },
@@ -99,6 +99,11 @@ await node.pool.first().state.refresh();
   assert.deepEqual(cfg.models["seat-low"]!.params, { reasoning_effort: "low", temperature: 0.1 });
   assert.equal(cfg.models["seat-low"]!.as, SEAT, "params rides alongside as");
   assert.equal(cfg.models[SEAT]!.params, null, "a plain route carries no params");
+  assert.deepEqual(cfg.models[SEAT]!.efforts, { none: { chat_template_kwargs: { enable_thinking: false } } });
+  assert.equal(cfg.models["seat-low"]!.efforts, undefined, "absent efforts stay absent");
+  const base = { name: "x", backend: { url: be.url() } };
+  assert.throws(() => parseV1({ ...base, models: { m: { efforts: { none: { model: "other" } } } } }), ConfigError, "a level is checked like params");
+  assert.throws(() => parseV1({ ...base, models: { m: { efforts: "none" } } }), ConfigError, "must be an object");
 }
 
 // --- config: the keys a request cannot function without are refused ----------
@@ -155,6 +160,34 @@ await node.pool.first().state.refresh();
   assert.equal(sent.model, SEAT);
   assert.equal(sent.reasoning_effort, "none");
   assert.equal("temperature" in sent, false, "one id's params do not bleed into another's");
+  assert.deepEqual(sent.chat_template_kwargs, { enable_thinking: false }, "the seat's efforts answer the effort the id stamped");
+}
+
+// --- efforts: the effort a client asks for turns into the seat's own switch --
+{
+  await chat(url, { model: SEAT, messages: [], reasoning_effort: "none", chat_template_kwargs: { enable_thinking: true } });
+  assert.deepEqual(be.seen.at(-1)!.body.chat_template_kwargs, { enable_thinking: false }, "the stamp wins over the client's");
+  await chat(url, { model: SEAT, messages: [], reasoning_effort: "low" });
+  assert.equal("chat_template_kwargs" in be.seen.at(-1)!.body, false, "a level with no entry stamps nothing");
+  await chat(url, { model: "seat-low", messages: [], reasoning_effort: "none" });
+  assert.equal("chat_template_kwargs" in be.seen.at(-1)!.body, false, "the id's params set the effort the stamp follows");
+  const lent = node.pool.models.outboundBody("seat-off", { model: "seat-off", messages: [] }, "their-seat");
+  assert.equal("chat_template_kwargs" in lent, false, "a peer's seat is not ours: our template switch stays home");
+}
+
+// --- efforts on the id itself travel with the job, as its params do ---------
+{
+  const n4 = createNode(
+    parseV1({
+      name: "me",
+      backends: [{ name: "swap", url: be.url(), kind: "none" }],
+      models: { [SEAT]: { backend: "swap" }, "seat-quick": { backend: "swap", as: SEAT, efforts: { none: { thinking: { type: "disabled" } } } } },
+    }),
+    silentLogger,
+  );
+  const lent = n4.pool.models.outboundBody("seat-quick", { model: "seat-quick", messages: [], reasoning_effort: "none" }, "their-seat");
+  assert.deepEqual(lent.thinking, { type: "disabled" }, "the id means the same thing wherever it lands");
+  await n4.close();
 }
 
 // --- the plain id is completely unaffected ----------------------------------
@@ -169,19 +202,19 @@ await node.pool.first().state.refresh();
 // --- pool: one place owns the body rewrite ----------------------------------
 {
   const body = { model: "seat-low", messages: [], reasoning_effort: "high" };
-  const out = node.pool.outboundBody("seat-low", body);
+  const out = node.pool.models.outboundBody("seat-low", body);
   assert.equal(out.model, SEAT);
   assert.equal(out.reasoning_effort, "low");
   assert.notEqual(out, body, "a stamped body is a copy");
   const plain = { model: SEAT, messages: [] };
-  assert.equal(node.pool.outboundBody(SEAT, plain), plain, "identity for a route without as or params");
-  assert.equal(node.pool.for("seat-low").name, "swap", "resolution follows the alias");
+  assert.equal(node.pool.models.outboundBody(SEAT, plain), plain, "identity for a route without as or params");
+  assert.equal(node.pool.models.for("seat-low").name, "swap", "resolution follows the alias");
 
   // Addressed by the peer's id, still stamped. A `-low` turn that spilled over
   // came back at full effort otherwise — and at low effort again the moment
   // fallbackLocal brought it home, which is the same id answering twice
   // differently for a reason the caller cannot see.
-  const lent = node.pool.outboundBody("seat-low", body, "their-seat");
+  const lent = node.pool.models.outboundBody("seat-low", body, "their-seat");
   assert.equal(lent.model, "their-seat", "a peer is addressed in ITS vocabulary");
   assert.equal(lent.reasoning_effort, "low", "params travel with the job");
 }

@@ -22,12 +22,13 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError, parseConfig } from "../src/config.js";
-import { silentLogger } from "../src/log.js";
-import { PeerRegistry, type PeerCapacity } from "../src/peers.js";
-import { decide } from "../src/route.js";
+import { parseConfig } from "../src/config/config.js";
+import { ConfigError } from "../src/config/read.js";
+import { silentLogger } from "../src/observe/log.js";
+import { PeerRegistry, type PeerCapacity } from "../src/peers/peers.js";
+import { decide } from "../src/routing/route.js";
 import { createNode, type HearthNode } from "../src/server.js";
-import { cleanStats, fitOutput, mergeStats, needsOf, statsFromModels, statsFromProps, unfit } from "../src/stats.js";
+import { cleanStats, fitOutput, mergeStats, needsOf, statsFromModels, statsFromProps, unfit } from "../src/routing/stats.js";
 import { parseV1 } from "./v1.js";
 
 /* ------------------------------------------------------------ reading props */
@@ -298,9 +299,9 @@ const peerCap = (ctx: number | null): PeerCapacity => ({
 
 function registry(cfg: ReturnType<typeof parseConfig>, up: Record<string, PeerCapacity | null>) {
   const r = new PeerRegistry(cfg, silentLogger);
-  const inner = r as unknown as { status: Map<string, Record<string, unknown>> };
+  const inner = r as unknown as { peers: Map<string, { status: Record<string, unknown> }> };
   for (const [name, cap] of Object.entries(up)) {
-    const s = inner.status.get(name)!;
+    const s = inner.peers.get(name)!.status;
     s.up = cap !== null;
     s.capacity = cap;
     s.lastOkAt = cap !== null ? Date.now() : null;

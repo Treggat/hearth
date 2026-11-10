@@ -8,16 +8,16 @@ import {
   applyNodeChanges, Background, BaseEdge, Controls, getBezierPath, Handle, Position, ReactFlow,
   type Edge, type EdgeProps, type Node, type NodeProps, type ReactFlowInstance,
 } from "@xyflow/react";
-import { CircuitBoard, Cloud, Cpu, Flame, Globe, KeyRound, Monitor, Plus, Redo2, RotateCcw, Save, Server, Split, Undo2, Users, Waypoints } from "lucide-react";
+import { CircuitBoard, Cloud, Cpu, Flame, Globe, KeyRound, Monitor, Plug, Plus, Redo2, RotateCcw, Save, Server, Split, Undo2, Users, Waypoints } from "lucide-react";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Rail } from "./Rail.js";
-import type { Backend, Node as NetNode, Resource, UiData } from "./types.js";
+import type { Backend, Node as NetNode, Resource, UiData } from "../observe/uidata.js";
 import { NEW, NewDialog, Refs, refsOf, Review } from "./config.js";
 import { BAYS, bayRoom, callersIn, draftView, EVERYONE, list, movedBay, movedHardware, obj, ordered, put, routerFor, usersOf, withCaller, callerChoices, paneChoices, restacked, STACK, unstacked } from "./draft.js";
 import { change, chooseAt, dirty, edits, follow, loadDraft, redo, revert, review, showRouter, undo, useEdit, addRouter, askAt } from "./editStore.js";
 import { Menu, VersionsButton, openVersions } from "./editor.js";
-import { control, go, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
+import { control, go, openPlugin, request, restartNode, select, toast, useStore, mintKey, revokeKey, rotateKey } from "./store.js";
 import { Button, cx, Dialog, Dot, type Tone } from "./ui.js";
 
 /** `tags`: hardware a backend uses besides the group it sits in. `tip`: what the status dot is saying. */
@@ -228,7 +228,7 @@ function ProviderDialog({ taken, onClose, onCreate }: { taken: string[]; onClose
 
 /** A card or CPU: the frame its backends sit in, so "runs on" needs no line. */
 type Chip = { name: string; tone: Tone; busy: boolean; sub: string };
-type Group = { /** What a backend let go here is given: this hardware, on this machine. */ drop?: { resource: string; server: string }; /** It can be dragged onto another machine. */ moves?: boolean; title: string; sub: string; icon: ReactNode; hot: boolean; selected?: boolean; tip?: string; chips?: Chip[]; picked?: string };
+type Group = { /** What a backend let go here is given: this hardware, on this machine. */ drop?: { resource: string; server: string }; /** It can be dragged onto another machine. */ moves?: boolean; title: string; sub: string; icon: ReactNode; hot: boolean; selected?: boolean; tip?: string; chips?: Chip[]; picked?: string; /** Fed from above: how far from its right edge the line comes in, in px. */ up?: number };
 
 const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
   return (
@@ -238,6 +238,7 @@ const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
       data.selected && "ring-2 ring-accent/25",
     )}>
       <Handle type="target" position={Position.Left} />
+      {data.up !== undefined && <Handle type="target" id="up" position={Position.Top} isConnectable={false} style={{ left: "auto", right: data.up, transform: "translate(50%, -50%)" }} />}
       <div className={cx("flex items-center gap-2 px-3 pt-2 text-[11px]", data.moves && "cursor-grab")} title={data.moves ? "Drag it onto another machine: what runs on it goes too" : undefined}>
         <span className={data.hot ? "text-ok" : "text-dim"}>{data.icon}</span>
         <span className="font-semibold uppercase tracking-wide">{data.title}</span>
@@ -275,13 +276,13 @@ const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<Group>>) {
 });
 
 /** One machine: the frame around the backends on it. Drawn only once a config names another machine. */
-type Machine = { title: string; sub: string; /** The machine a backend let go here is put on. */ drop?: { server: string } };
+type Machine = { title: string; sub: string; /** The machine a backend let go here is put on. */ drop?: { server: string }; /** In place of the server icon. */ icon?: ReactNode };
 
 const MachineNode = memo(function MachineNode({ data }: NodeProps<Node<Machine>>) {
   return (
     <div className="h-full w-full rounded-3xl border border-line bg-panel/40">
       <div className="flex items-center gap-2 px-4 pt-2.5 text-[12px]">
-        <Server size={13} className="text-dim" />
+        {data.icon ?? <Server size={13} className="text-dim" />}
         <span className="font-semibold">{data.title}</span>
         <span className="truncate text-dim">{data.sub}</span>
       </div>
@@ -756,6 +757,56 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
     });
     py += block + GAP;
   });
+  // Plugins that serve an API hang under the hub: callers reach them through this node, as they reach a backend.
+  const serving = (d.plugins?.plugins ?? []).filter((p) => p.serves !== null || p.run !== null);
+  if (serving.length > 0) {
+    // A Plugins frame holding a group for each kind that has plugins, as a machine holds its hardware: Services, and
+    // MCP servers. One group alone is two boxes wide; side by side, each is one. Either way the frame ends at the
+    // hub's right edge and grows down, so it never reaches the machines on the right. A line goes from the hub into
+    // each group, its requests as dots, entering near the group's right edge so it stays clear of the peers' column.
+    const groups = [
+      { id: "services", title: "Services", items: serving.filter((p) => p.mcp === null), tip: "Plugins that serve an API of their own, at /plugins/<name>/. Callers reach each one through this node, with the same keys as the models." },
+      { id: "mcp", title: "MCP", items: serving.filter((p) => p.mcp !== null), tip: "MCP servers, served or run by this node, at /plugins/<name>/mcp. Callers list and call their tools with the same keys as the models." },
+    ].filter((g) => g.items.length > 0);
+    const cols = groups.length > 1 ? 1 : Math.min(groups[0]!.items.length, 2);
+    const wide = PAD * 2 + cols * W + (cols - 1) * GAP;
+    const tallOf = (n: number) => { const rows = Math.ceil(n / cols); return HEAD + PAD + rows * H + (rows - 1) * GAP; };
+    const inner = groups.length * wide + (groups.length - 1) * FRAME.gap;
+    const tall = Math.max(...groups.map((g) => tallOf(g.items.length)));
+    // Below the hub and below the last peer, however many peers there are.
+    const peersBottom = peers.length ? mid + (blocks.reduce((a, b) => a + b, 0) + GAP * (peers.length - 1)) / 2 : -Infinity;
+    const top = Math.max(mid + H / 2 + 72, peersBottom + 56);
+    nodes.push({
+      id: "plugins", type: "machine", position: { x: X.self + W + PAD + FRAME.pad - (inner + FRAME.pad * 2), y: top }, style: { width: inner + FRAME.pad * 2, height: FRAME.head + tall + FRAME.pad },
+      data: { title: "Plugins", sub: "", icon: <Plug size={13} className="text-dim" /> } satisfies Machine,
+    });
+    groups.forEach((g, gi) => {
+      const jobs = g.items.flatMap((p) => p.live);
+      const down = g.items.every((p) => p.state !== "running" || p.paused);
+      nodes.push({
+        id: g.id, type: "hardware", parentId: "plugins", extent: "parent", position: { x: FRAME.pad + gi * (wide + FRAME.gap), y: FRAME.head }, style: { width: wide, height: tallOf(g.items.length) },
+        data: { title: g.title, icon: <Plug size={13} />, hot: jobs.length > 0, sub: "", tip: g.tip, up: PAD * 2 } satisfies Group,
+      });
+      edges.push({ id: `e:${g.id}`, source: hub, sourceHandle: "down", target: g.id, targetHandle: "up", type: "flow", data: { jobs, pulses: pulsesFor(`e:${g.id}`, jobs, who ? 2 : 1), dashed: down } });
+      g.items.forEach((p, n) => {
+        const out = p.state !== "running";
+        const at = `/plugins/${p.name}${p.mcp ? p.mcp.path : "/"}`;
+        const mcp = p.mcp;
+        const said = mcp?.error ? (mcp.error === "starting" || mcp.error === "checking" ? mcp.error : "not answering") : mcp?.tools != null ? `${mcp.tools} tools` : null;
+        // The last row fills from the right, under the hub, as the first rows do.
+        const row = Math.floor(n / cols);
+        const col = cols - 1 - (n % cols);
+        nodes.push({
+          id: `service:${p.name}`, type: "card", parentId: g.id, extent: "parent", position: { x: PAD + col * (W + GAP), y: HEAD + row * (H + GAP) },
+          data: {
+            title: p.name, icon: <Plug size={14} />, tone: out ? "bad" : p.paused ? "warn" : mcp?.error && said === "not answering" ? "warn" : "ok",
+            sub: out ? (p.error ?? "did not start") : p.paused ? "paused" : [at, said, p.served.calls ? `${p.served.calls} served${p.served.errors ? `, ${p.served.errors} failed` : ""}` : null].filter(Boolean).join(" · "),
+            tip: `${at} goes to ${p.run ?? p.serves}.${mcp?.error && said === "not answering" ? ` Its MCP server: ${mcp.error}.` : ""}${p.fallback ? ` When it cannot answer, ${p.fallback.plugin} does.` : ""} Click to open it on the Plugins page.`,
+          } satisfies Card,
+        });
+      });
+    });
+  }
   return { nodes, edges };
 }
 
@@ -938,6 +989,8 @@ export function Topology() {
         else if (kind === "self" || kind === "peer" || kind === "backend") select({ kind, id });
         else if (kind === "resource") select({ kind, id: id.split("/").pop()! });
         else if (kind === "machine" && id) select({ kind, id });
+        else if (kind === "service") openPlugin(id);
+        else if (n.id === "plugins") go("plugins");
       }}
       onPaneClick={() => select(null)}
       // A right-click on the empty part of the picture offers what the strip over it does, where the pointer is.

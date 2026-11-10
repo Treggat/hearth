@@ -17,9 +17,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError } from "../src/config.js";
+import { ConfigError } from "../src/config/read.js";
 import { parseV1 } from "./v1.js";
-import { silentLogger } from "../src/log.js";
+import { silentLogger } from "../src/observe/log.js";
 import { createNode } from "../src/server.js";
 
 /** A llama-swap stand-in: /running is ours to set, POST bodies are recorded, `status` is what it answers. */
@@ -116,7 +116,7 @@ try {
     assert.equal(swap.resident(), "trial", "so its resident is the seat, whatever order the URL reports");
     assert.deepEqual(swap.catalog(), ["main", "trial"], "nor as something it could load");
     assert.ok(side.loaded().includes("rerank-gpu"), "the sidecar still sees itself");
-    assert.ok(node.pool.loaded().includes("rerank"), "and it is still warm to the node, under the id it is advertised as");
+    assert.ok(node.pool.models.loaded().includes("rerank"), "and it is still warm to the node, under the id it is advertised as");
   }
 
   // --- THE POINT: a follow id rides the seat, never the sidecar -------------------------

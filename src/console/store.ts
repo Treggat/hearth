@@ -4,7 +4,8 @@
  */
 import { create } from "zustand";
 
-import type { UiData } from "./types.js";
+import { pageFor } from "./knobs.js";
+import type { UiData } from "../observe/uidata.js";
 
 const KEY_STORE = "hearth.apikey";
 const storedKey = (): string | null => {
@@ -18,10 +19,10 @@ const forgetKey = (): void => {
   try { localStorage.removeItem(KEY_STORE); } catch { /* private mode */ }
 };
 
-export const PAGE_IDS = ["topology", "routing", "plugins", "models", "lending", "keys", "queue", "logs", "config"] as const;
+export const PAGE_IDS = ["topology", "routing", "plugins", "models", "lending", "keys", "scheduler", "logs", "config"] as const;
 export type Page = (typeof PAGE_IDS)[number];
-/** The page the address names; anything else is the first one. */
-export const pageOf = (): Page => PAGE_IDS.find((p) => p === location.hash.slice(1)) ?? "topology";
+/** The page the address names, an old `#queue` link included; anything else is the first one. */
+export const pageOf = (): Page => PAGE_IDS.find((p) => p === pageFor(location.hash.slice(1))) ?? "topology";
 export type Sel = { kind: "self" | "peer" | "backend" | "resource" | "machine"; id: string } | null;
 type Toast = { tone: "ok" | "bad"; text: string; id: number } | null;
 
@@ -42,6 +43,8 @@ interface State {
   askKey: ((key: string | null) => void) | null;
   /** The plugin open on the Plugins page. */
   plugin: string | null;
+  /** A key the Config page opens on in the hearth.yaml tab, as its path, until it has been shown. */
+  yamlAt: string[] | null;
   /** A key just minted or rotated: its plaintext, to be shown once and then let go. */
   fresh: { label: string; key: string; rotated?: boolean } | null;
 }
@@ -56,6 +59,7 @@ export const useStore = create<State>(() => ({
   page: pageOf(),
   sel: null,
   plugin: null,
+  yamlAt: null,
   fresh: null,
   toast: null,
   askKey: null,
@@ -68,6 +72,8 @@ export const go = (page: Page) => {
 export const select = (sel: Sel) => useStore.setState({ sel });
 /** Open a plugin on the Plugins page, from wherever it was named. */
 export const openPlugin = (name: string) => { go("plugins"); useStore.setState({ plugin: name }); };
+/** Open hearth.yaml on the Config page with this key's lines picked out, for settings that have no form there. */
+export const openYaml = (path: string[]) => { go("config"); useStore.setState({ yamlAt: path }); };
 
 let toastSeq = 0;
 export function toast(tone: "ok" | "bad", text: string): void {
@@ -234,7 +240,7 @@ export async function evict(model: string): Promise<void> {
 }
 
 /** Mint a key into hearth.yaml. The plaintext comes back once, in this result. */
-export async function mintKey(label: string, models: string[] | null, more: { expires?: string; limits?: { requestsPerMinute?: number; tokensPerDay?: number; dollarsPerDay?: number } } = {}): Promise<string | null> {
+export async function mintKey(label: string, models: string[] | null, more: { expires?: string; limits?: { requestsPerMinute?: number; tokensPerDay?: number; dollarsPerDay?: number }; router?: string } = {}): Promise<string | null> {
   try {
     const d = await request<{ key: string }>("POST", "/keys/mint", { label, ...(models !== null && models.length > 0 ? { models } : {}), ...more });
     useStore.setState({ fresh: { label, key: d.key } });
@@ -260,6 +266,17 @@ export async function rotateKey(label: string): Promise<string | null> {
 }
 /** Let go of the key that was being shown. */
 export const doneWithKey = () => useStore.setState({ fresh: null });
+
+/** Change a key's router, lane or limits. The file judges them, and a refusal says why. */
+export async function updateKey(label: string, set: Record<string, unknown>, done: string): Promise<void> {
+  try {
+    await request("POST", "/keys/update", { label, ...set });
+    toast("ok", done);
+    await refresh();
+  } catch (e) {
+    toast("bad", (e as Error).message);
+  }
+}
 
 /** Revoke a key by label; it stops authenticating at once. */
 export async function revokeKey(label: string): Promise<void> {

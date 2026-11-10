@@ -3,7 +3,9 @@
 **Status: partly built.** Chat requests run `request`, `routed`, `log` and `error` hooks for both kinds of
 plugin, with the guarantees below.
 Plugins are placed on routing lines or on every line, with model slots, and the console has a Plugins
-page and plugin blocks on the Routing map (C10, C11, C8; Try and per-request records are not built). The other stages, the other request kinds and plugins on peers' requests are
+page and plugin blocks on the Routing map (C10, C11, C8; Try and per-request records are not built). A
+plugin that `serves` an API is answered at `/plugins/<name>/*` ([A plugin that serves an API](#a-plugin-that-serves-an-api));
+the console shows it under the router on the Topology map and on the Plugins page. Plugin pages are not built. The other stages, the other request kinds and plugins on peers' requests are
 not built yet (tracking: #191); requests of other kinds run no plugins.
 
 A plugin changes or watches what passes through hearth: it can rewrite a request before it runs, keep a
@@ -74,7 +76,8 @@ between them:
 | `log` | after the last byte | read the exchange | no, runs in the background |
 | `error` | a backend, peer or plugin failed | read | no |
 
-Separately, a plugin may answer `routes` (requests to `/plugins/<name>/*`, its own API or page) and
+Separately, a plugin may answer `routes` (requests to `/plugins/<name>/*`, its own API or page; an
+http plugin's API is built, as [`serves`](#a-plugin-that-serves-an-api)) and
 `events` (queue, peer and eviction events, a superset of what `actions:` see).
 
 ### Streamed replies
@@ -304,26 +307,25 @@ this request, and `line`, the flow and step it was placed on (`null` for an `eve
 
 ## Writing a `code` plugin
 
-```ts
-import { definePlugin } from "@vcvzgbzz/hearth/plugin";
+A plugin is an ES module whose default export has `apiVersion`, `kinds` and `setup`:
 
-export default definePlugin({
-  name: "redact-emails",
+```js
+export default {
   apiVersion: 1,
   kinds: { chat: ["routed"] },            // hearth never calls it for anything else
   setup(ctx) {
     return { routed: async (r) => ({ body: redact(r.body) }) };
   },
-});
+};
 ```
 
-`setup` receives `ctx.config` (its settings), `ctx.models.chat / embed / rerank` (calls into hearth's
-scheduler, marked internal, below), `ctx.log`, `ctx.store` (a small key-value store per plugin),
-`ctx.metrics` and `ctx.every(ms, fn)`.
+`setup` receives `ctx.name`, `ctx.config` (its settings), `ctx.log` and `ctx.internal` (`url` and `token`, to
+call hearth's `/v1` model routes as internal traffic, below). It returns the hooks, plus an optional `stop`.
 
 ## Writing an `http` plugin
 
-hearth sends one POST per hook, with `Authorization: Bearer <key>` when the plugin sets `key` (`env:NAME`):
+hearth sends one POST per hook, with `Authorization: Bearer <key>` when the plugin sets `key` (`env:NAME`), and
+the plugin's `headers` when it sets them; it reads `<use>/manifest` the same way:
 
 ```json
 {
@@ -339,13 +341,130 @@ hearth sends one POST per hook, with `Authorization: Bearer <key>` when the plug
 ```
 
 and expects `{ "decision": { … } }` back. An `http` plugin states its kinds and stages at
-`GET {url}/manifest`, which hearth reads at startup and holds it to. Only the fields in `reads` are sent. `log` and `error` calls are
-not answered. `internal.token` lets the plugin call hearth's `/v1` back as internal traffic, during a hook or later
+`GET {url}/manifest`, which hearth reads at startup and holds it to. A service that does not answer then is asked again every 30 seconds, so it can come up after hearth does; until it does, `/healthz` says `degraded`. Only the fields in `reads` are sent, and `headers` never includes the caller's `authorization`, `cookie` or `x-api-key`. `log` and `error` calls are
+not answered. `internal.token` lets the plugin call hearth's `/v1` model routes back as internal traffic, during a hook or later
 (a memory service extracting in the background); it is the plugin's alone and changes when hearth restarts.
 
 A plugin with a page of its own serves it under its URL and declares it; hearth adds a sidebar entry and
 proxies the page at `/plugins/<name>/`, checking the operator's login itself and passing who is viewing
 in headers. The page is shown in a sandboxed frame, so it never runs with the console's own access.
+
+## A plugin that serves an API
+
+Some services are a destination, not a step on the way to a model: a web crawler, a search index, an MCP
+server. `serves` puts one behind hearth's door, so callers reach it with the same keys as the models and
+the operator sees it beside the other plugins:
+
+```yaml
+plugins:
+  crawler:
+    serves: http://crawler:8080          # its own API, answered at /plugins/crawler/*
+    trust: http
+    key: env:CRAWLER_TOKEN               # what the service expects; optional
+  maps:
+    serves: https://maps.example.com/v1
+    trust: http
+    headers:                             # for a service that takes its key in a header of its own
+      X-Api-Key: env:MAPS_API_KEY
+  tools:
+    serves: http://tools:3100            # an MCP server: /plugins/tools/mcp
+    trust: http
+```
+
+- **`/plugins/<name>/<path>`** goes to `<serves>/<path>` with the query, method, headers and body as sent,
+  and the service's answer comes back as it is written. The service has 3 seconds to accept the connection and
+  `backendDefaults.firstByteMs` to start answering (502 if it does not); after that there is no deadline, so a
+  stream it holds open (server-sent events, an MCP session) stays open until one side closes it. The connect
+  deadline is short so a host that is gone fails, or falls back, at once; a service on the network accepts in
+  milliseconds.
+- **Callers are let in as on `/v1`**: this machine, or one of `apiKeys`. A peer never is, and neither is a key
+  scoped to `models:`. The caller's router then decides, as it does for a model: the request is asked of it
+  as `API:<name>` (or `MCP:<name>`), so it can let a plugin through, send it to another, or refuse it. With
+  no rule for `API` or `MCP`, its flow for every other name decides: a router that refuses names it has no
+  type for refuses plugins too.
+  See [Plugins on the router](routing.md#plugins-on-the-router).
+- **The caller's key stays here.** The service is sent the plugin's `key` as a bearer token instead, when it
+  has one, and who is calling in `x-hearth-caller` (`local` or `key:<label>`), which a caller cannot set.
+- **`headers` are sent on every call** to the service: the passthrough, the MCP check, and a hook service's
+  `/manifest` and hook calls. Each replaces a caller's header of the same name, and a value may be `env:NAME`.
+  They are for a service that reads its key from somewhere other than `Authorization`, so `key` can be left
+  out; a header named `Authorization` takes the place of `key`.
+- **`use` is optional.** A plugin that only serves hooks nothing, so hearth reads no `/manifest` from it and
+  any service works as it is. With `use` as well, it does both, and a plugin that failed to start serves
+  nothing (503).
+- A paused plugin answers 503, an unknown name 404, and a service that cannot be reached 502. The Plugins
+  status counts the requests served and the ones that failed (`served`).
+- **In the console** each one is a box under the router on the Topology map, in a Plugins frame, since callers
+  reach it through this node as they reach a backend; a click opens it on the Plugins page, which says where
+  its path goes and how many requests it has served.
+
+### A fallback
+
+`fallback` names another plugin that answers when this one cannot, as a backend route's `fallback` does for a
+model. The fallback serves the same API and is sent the same request: the same method, path, query and body.
+It is set on the plugin, and the caller's router is asked about it as about the plugin itself (below).
+
+```yaml
+plugins:
+  crawler:
+    serves: http://crawler:8080
+    trust: http
+    fallback: crawler-2                  # or { plugin: crawler-2 }
+  crawler-2:
+    serves: http://crawler-2:8080
+    trust: http
+```
+
+- **It is asked when the plugin cannot answer**: it cannot be reached (within 3 seconds) or does not start answering in time, it
+  answers 5xx or 429, or it is paused or did not start. A 4xx is the plugin's answer and is passed on. A
+  plugin that has begun answering is not replaced partway.
+- **One hop.** The fallback answers with its own API; its own `fallback` is not followed.
+- **The caller's router decides about the fallback too.** It is asked about the fallback as about any plugin
+  ([Plugins on the router](routing.md#plugins-on-the-router)); a caller it would not send to the fallback gets the
+  plugin's own failure (502), so a fallback is never a way past a refusal.
+- Only a plugin that serves an API other than MCP has a fallback, and only such a plugin is one.
+- The log says `plugin.fallback` with why; the Routing map draws "↳ falls back to" on the plugin's box, and
+  the Plugins page sets it.
+
+## A plugin that speaks MCP
+
+An MCP server is a plugin too, in either of two ways:
+
+```yaml
+plugins:
+  tools:
+    serves: http://tools:3100        # an MCP server already on the network
+    trust: http
+    key: env:TOOLS_TOKEN
+    mcp: true                        # its endpoint is /mcp; or give the path: mcp: /v2/mcp
+  search:
+    run:                             # a program hearth starts, spoken to over stdin and stdout
+      command: npx
+      args: [-y, some-mcp-server]
+      env: { SEARCH_API_KEY: env:SEARCH_API_KEY }
+    trust: code                      # it runs on this machine: the same opt-in as code
+```
+
+- **Served** (`serves` with `mcp`): requests go through as for any served API. hearth also makes the handshake
+  a client would (`initialize`, then `tools/list`, with the plugin's `key` and `headers`) at startup and every minute after,
+  ends the session it opened, and shows the server's name and how many tools it has, or why it did not answer.
+  A failed check is shown, never a reason to stop forwarding.
+- **Run** (`run`): hearth starts the program when it starts, initializes it once, and answers
+  `/plugins/<name>/mcp` as MCP's streamable HTTP does without a stream: a JSON answer for each request, 202 for
+  a notification, and 405 for the GET that would open a stream. Every caller shares the one program: a caller's
+  `initialize` is answered from hearth's own, with a session id, and every request is given an id of its own on
+  the way in, so two callers using the same id each get their own answer. A caller's notifications are
+  accepted and go no further: the ids the program knows are hearth's, so a caller's `cancelled` or `progress`
+  would name another caller's request. A request the program makes of its
+  caller (sampling, roots) is refused. A program that exits is started again, after one second, then longer
+  each time it exits again, up to a minute.
+- The program sees the `env` its entry gives it, and of hearth's own environment only what it needs to find
+  and cache its files (`PATH`, `HOME`, `TMPDIR`). The console shows its command line, never its `env`, so a
+  secret belongs in `env`, not in `args`.
+- Callers are let in as for a served API: this machine or one of `apiKeys`.
+- **In the console** MCP servers have a group of their own beside Services in the Plugins frame, each box with
+  its tool count; with both groups present, each is one box wide. The Plugins page shows the server's name, its
+  tools and when it was last asked.
 
 ## Guarantees
 
@@ -373,8 +492,10 @@ request goes: the same page that decides the model shows what happens to the req
   the models it needs and what is wired into them, the lines it is placed on, and how it is doing. A
   plugin's panel has its model slots (each offering only models of its kind), the lines it is on with a
   link to each on the Routing map, what it is sent, its failure policy, a pause switch, and a settings
-  form drawn from the settings its manifest describes. **Add plugin** checks a service's `/manifest`,
-  then writes the entry through the usual review; code plugins are added in the file by hand.
+  form drawn from the settings its manifest describes. **Add plugin** adds an API, an MCP server on the
+  network (checked by its handshake first: `POST /plugins/probe` with `mcp: <path>`), or a hook service
+  (checked at its `/manifest`), and writes the entry through the usual review. Code plugins, and MCP servers
+  hearth runs, are added in the file by hand; for the latter the dialog writes out the entry to add.
 - **On the Routing map** a plugin is a block on a line, between the rule and the model: request in on
   the left, changed request out on the right, its model slots underneath with lines to the models wired
   into them. Plugins that only watch hang off a dashed tap after the model. `everyLine` plugins are a
@@ -401,6 +522,7 @@ request goes: the same page that decides the model shows what happens to the req
 | C9 | Request kinds: on the request context, `kind:` on backend routes and models, the per-request gate, checks at load, body shapes per kind. | medium |
 | C10 | Placement: `plugins:` on flow steps, run on the requests the step decides; `everyLine`; the line's kind checked against the plugin's when the config loads. | medium |
 | C11 | Model slots: `needs` in the manifest, `models` on the plugin and the step, `kind:` on models, `models` in every hook. | medium |
+| C12 | `serves`: an http plugin's own API forwarded at `/plugins/<name>/*`, streaming both ways. Built. | small |
 | C8 | Console: the Plugins page, plugin blocks and model slots on the Routing map, the palette and refused drops, plugin effects in Try, the per-request record, plugin pages proxied into the sidebar. | large |
 
 ## Order of work

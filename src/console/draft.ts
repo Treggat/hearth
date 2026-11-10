@@ -7,7 +7,7 @@
  * place in Routing.tsx's layout.
  */
 import { opsBetween, type Op } from "./diff.js";
-import type { Backend, Flow, Node as NetNode, Resource, Routing, UiData } from "./types.js";
+import type { Backend, Flow, Node as NetNode, Resource, Routing, UiData } from "../observe/uidata.js";
 
 export type Doc = Record<string, unknown>;
 
@@ -22,10 +22,20 @@ export function put(doc: Doc, section: string, id: string, value: unknown): Doc 
   return { ...doc, [section]: value === undefined ? rest : { ...obj(doc[section]), [id]: value } };
 }
 
+/** The places on peers a line can send to, matching a search: each peer as itself (it gets the id asked for)
+ *  when its name matches, and each model it lends by the id this node knows it as. */
+export function peerChoices(draft: Record<string, unknown>, q: string): { peer: string; model: string | null }[] {
+  const hit = (s: string) => s.toLowerCase().includes(q.trim().toLowerCase());
+  return Object.entries(obj(draft.peers)).flatMap(([peer, p]) => [
+    ...(hit(peer) ? [{ peer, model: null }] : []),
+    ...Object.keys(obj(obj(p).models)).filter((m) => hit(peer) || hit(m)).map((model) => ({ peer, model })),
+  ]);
+}
+
 /** Somewhere a request can run: a model here, or a peer's copy of one (null: the id asked for). */
 export type End = { kind: "model"; model: string } | { kind: "peer"; peer: string; model: string | null };
 /** A step's `to`, read the same way whether it came from the file or from the running node. */
-export type To = End | { kind: "flow"; flow: string } | { kind: "fastest"; of: End[] } | { kind: "refuse"; why: string } | { kind: "asked" } | { kind: "unset" };
+export type To = End | { kind: "flow"; flow: string } | { kind: "fastest"; of: End[] } | { kind: "refuse"; why: string } | { kind: "asked" } | { kind: "plugin"; plugin: string } | { kind: "unset" };
 
 /** The input that stands for every name no other flow takes. */
 export const ANY = "*";
@@ -35,6 +45,7 @@ export function toOf(raw: unknown): To {
   const o = obj(raw);
   if (typeof o.refuse === "string") return { kind: "refuse", why: o.refuse };
   if (o.asked === true) return { kind: "asked" };
+  if (typeof o.plugin === "string") return { kind: "plugin", plugin: o.plugin };
   if (typeof o.flow === "string") return { kind: "flow", flow: o.flow };
   if (Array.isArray(o.fastest)) return { kind: "fastest", of: o.fastest.map(toOf).filter((e): e is End => e.kind === "model" || e.kind === "peer") };
   if (typeof o.peer === "string") return { kind: "peer", peer: o.peer, model: text(o.model) || null };
@@ -50,6 +61,7 @@ export function rawTo(to: To): unknown {
     case "fastest": return { fastest: to.of.map(rawTo) };
     case "refuse": return { refuse: to.why };
     case "asked": return { asked: true };
+    case "plugin": return { plugin: to.plugin };
     default: return "";
   }
 }
@@ -63,6 +75,7 @@ export function toText(to: To): string {
     case "fastest": return `fastest of ${to.of.length}`;
     case "refuse": return "refuse it";
     case "asked": return "its own model";
+    case "plugin": return `plugin ${to.plugin}`;
     default: return "nowhere yet";
   }
 }
@@ -108,7 +121,8 @@ export function draftView(doc: Doc, live: UiData): UiData {
   const routing: Record<string, Routing> = {};
   for (const [id, m] of Object.entries(obj(doc.models))) {
     const wire = text(obj(m).as) || id;
-    const backend = text(obj(m).backend) || backends.find((b) => (b.serves ?? []).includes(wire))?.name;
+    // Only a declared `serves` speaks here, as on the server: what a quiet backend discovered can list a model another declares.
+    const backend = text(obj(m).backend) || Object.entries(obj(doc.backends)).find(([, b]) => list(obj(b).serves).includes(wire))?.[0];
     // Where the draft cannot say which backend serves a name, what the running node worked out still stands.
     routing[id] = { ...live.routing?.[id], ...(backend ? { backend } : {}) };
   }
@@ -464,13 +478,14 @@ export function withDo(doc: Doc, flow: string, i: number, action: string, on: bo
 /** A plugin placed on a step, as the file writes it: its name, or `{ use, models }` with the models this line wires. */
 export type Placed = { name: string; models: Record<string, string> };
 
-/** The plugins a step places, in the order they run. */
+/** The plugins a step places, in the order they run: as the file writes them, or as the node reports them (`{ name, models }`). */
 export function placedOn(step: { plugins?: unknown }): Placed[] {
   if (!Array.isArray(step.plugins)) return [];
   return step.plugins.flatMap((p): Placed[] => {
     if (typeof p === "string") return [{ name: p, models: {} }];
     const o = obj(p);
-    return typeof o.use === "string" ? [{ name: o.use, models: Object.fromEntries(Object.entries(obj(o.models)).filter((e): e is [string, string] => typeof e[1] === "string")) }] : [];
+    const name = typeof o.use === "string" ? o.use : typeof o.name === "string" ? o.name : null;
+    return name === null ? [] : [{ name, models: Object.fromEntries(Object.entries(obj(o.models)).filter((e): e is [string, string] => typeof e[1] === "string")) }];
   });
 }
 
@@ -589,6 +604,7 @@ export const NODES: Record<string, NodeKind> = {
   refuse: { opens: (id) => ({ kind: "flow", id: lineOf(id).flow }) },
   model: { lands: (id) => ({ kind: "model", model: id }) },
   peer: { lands: (id) => ({ kind: "peer", peer: id, model: null }) },
+  plugin: { lands: (id) => ({ kind: "plugin", plugin: id }) },
   action: { lands: (id) => ({ kind: "action", action: id }), opens: (id) => ({ kind: "action", id }) },
 };
 
@@ -623,16 +639,18 @@ export function spread(boxes: Box[], carry: Map<string, string[]> = new Map(), g
 
 /**
  * Where each of `ends` sits in its column: beside the middle of the lines that reach it, in that
- * order, `step` apart at least, so lines run across and seldom cross. `from` is where each line leaves.
+ * order, `step` apart at least (or the room each one takes), so lines run across and seldom cross.
+ * `from` is where each line leaves.
  */
-export function beside(ends: string[], from: (end: string) => number[], step: number): Map<string, number> {
+export function beside(ends: string[], from: (end: string) => number[], step: number | ((end: string) => number)): Map<string, number> {
   const mid = (id: string) => { const ys = from(id); return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Infinity; };
+  const room = typeof step === "number" ? () => step : step;
   const out = new Map<string, number>();
   let next = 0;
   for (const [id, y] of ends.map((id) => [id, mid(id)] as const).sort((a, b) => a[1] - b[1])) {
-    const at = Math.max(next, Number.isFinite(y) ? Math.round(y - step / 2) : next);
+    const at = Math.max(next, Number.isFinite(y) ? Math.round(y - room(id) / 2) : next);
     out.set(id, at);
-    next = at + step;
+    next = at + room(id);
   }
   return out;
 }
@@ -914,8 +932,18 @@ export function factsOf(doc: Doc, live: UiData): Facts {
   const routesOf = (backend: string): { path: string; model?: string }[] => (Array.isArray(obj(obj(doc.backends)[backend]).routes)
     ? (obj(obj(doc.backends)[backend]).routes as unknown[]).map((r) => ({ path: text(obj(r).path), ...(text(obj(r).model) ? { model: text(obj(r).model) } : {}) }))
     : (self?.backends ?? []).find((b) => b.name === backend)?.routes ?? []);
+  // A model that something says is chat (a context window, declared or seen, or a server it emulates) stays chat
+  // on a backend with paths, unless a route names it: an image backend's llama-swap can also serve a chat model.
+  const chatty = (name: string): boolean => {
+    const m = obj(obj(doc.models)[name]);
+    return text(m.emulate) !== "" || typeof obj(m.stats).context === "number" || typeof self?.stats?.[name]?.context === "number";
+  };
+  const named = (backend: string, name: string): boolean => {
+    const wire = text(obj(obj(doc.models)[name]).as) || name;
+    return routesOf(backend).some((r) => r.model === wire);
+  };
   return {
-    kind: (name) => { const on = owner(name); return on !== undefined && paths(on) ? "paths" : "chat"; },
+    kind: (name) => { const on = owner(name); return on !== undefined && paths(on) && (named(on, name) || !chatty(name)) ? "paths" : "chat"; },
     paths: (name) => {
       const on = owner(name);
       const wire = text(obj(obj(doc.models)[name]).as) || name;
@@ -1050,3 +1078,18 @@ export const GROUP = { head: 26, foot: 20 };
 /** What the headings and feet above line `i` add to a rule box's height; with no `i`, all of them. */
 export const groupRows = (steps: { when?: unknown }[], i = steps.length): number =>
   groupsOf(steps).reduce((px, g) => px + (g.from <= i ? GROUP.head : 0) + (g.foot && g.to < i ? GROUP.foot : 0), 0);
+
+/**
+ * An MCP server's address, split as the entry holds it: what it serves, and the path under that where MCP answers.
+ * The last segment of the path is the MCP path, so `https://host/api/mcp` is `https://host/api` and `/mcp`.
+ */
+export const splitMcp = (url: string): { serves: string; path: string } | null => {
+  try {
+    const u = new URL(url.trim());
+    const segs = u.pathname.split("/").filter(Boolean);
+    const last = segs.pop();
+    return { serves: `${u.origin}${segs.length ? `/${segs.join("/")}` : ""}`, path: last ? `/${last}` : "/" };
+  } catch {
+    return null;
+  }
+};

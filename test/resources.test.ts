@@ -23,11 +23,11 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { silentLogger } from "../src/log.js";
-import { BackendState } from "../src/backend.js";
-import { BackendPool } from "../src/pool.js";
-import { ResourceArbiter } from "../src/resources.js";
-import { Scheduler } from "../src/scheduler.js";
+import { silentLogger } from "../src/observe/log.js";
+import { BackendState } from "../src/queue/backend.js";
+import { BackendPool } from "../src/queue/pool.js";
+import { ResourceArbiter } from "../src/queue/resources.js";
+import { Scheduler } from "../src/queue/scheduler.js";
 import { createNode } from "../src/server.js";
 import { parseV1 } from "./v1.js";
 
@@ -497,7 +497,7 @@ console.log("resources.test.ts ok");
   assert.equal(cfg.resources.gpu0!.shared, false, "shared is opt-in");
 
   const p = new BackendPool(cfg, silentLogger);
-  const byName = (n: string) => p.resources().find((r) => r.name === n)!;
+  const byName = (n: string) => p.hardware.resources().find((r) => r.name === n)!;
 
   // Still DISPLAYED — the whole point. The console must be able to draw what a
   // sidecar runs on.
@@ -538,8 +538,8 @@ console.log("resources.test.ts ok");
     name: "bare",
     backends: [{ name: "a", url: "http://127.0.0.1:1", serves: ["m"], resources: ["gpuX"] }],
   }), silentLogger);
-  assert.equal(bare.resources()[0]!.kind, "gpu", "undeclared is a gpu");
-  assert.equal(bare.resources()[0]!.shared, false, "and exclusive");
+  assert.equal(bare.hardware.resources()[0]!.kind, "gpu", "undeclared is a gpu");
+  assert.equal(bare.hardware.resources()[0]!.shared, false, "and exclusive");
 }
 
 // kind is validated at startup, not discovered as a wrong icon weeks later.

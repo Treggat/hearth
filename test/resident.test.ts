@@ -11,9 +11,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { ConfigError } from "../src/config.js";
-import { silentLogger } from "../src/log.js";
-import { BackendPool } from "../src/pool.js";
+import { ConfigError } from "../src/config/read.js";
+import { silentLogger } from "../src/observe/log.js";
+import { BackendPool } from "../src/queue/pool.js";
 import { parseV1 } from "./v1.js";
 
 const tick = () => new Promise((r) => setImmediate(r));
@@ -53,11 +53,11 @@ const config = (url: string) => parseV1({
   const held = gate();
   void p.get("memory")!.scheduler.submit({ lane: "chat", model: "memory", caller: "t" }, () => held.wait());
   await tick();
-  assert.equal(p.resources().find((r) => r.name === "gpu1")!.holder, null, "a rerank does not hold the card");
+  assert.equal(p.hardware.resources().find((r) => r.name === "gpu1")!.holder, null, "a rerank does not hold the card");
   let rendered = false;
   await p.get("render")!.scheduler.submit({ lane: "chat", model: "image", caller: "t" }, async () => { rendered = true; });
   assert.equal(rendered, true, "a render starts while the resident is busy: it never waits on it");
-  assert.ok(p.resources().find((r) => r.name === "gpu1")!.backends.includes("memory"), "but it is drawn on the card");
+  assert.ok(p.hardware.resources().find((r) => r.name === "gpu1")!.backends.includes("memory"), "but it is drawn on the card");
   held.open();
   await sleep(120);
 }

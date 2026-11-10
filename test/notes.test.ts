@@ -6,8 +6,9 @@
  */
 import assert from "node:assert/strict";
 
-import { ConfigError } from "../src/config.js";
-import { cleanStats, NOTE_MAX } from "../src/stats.js";
+import { ConfigError } from "../src/config/read.js";
+import { cleanStats } from "../src/routing/stats.js";
+import { NOTE_MAX } from "../src/config/models.js";
 import { parseV1 } from "./v1.js";
 
 const base = { backend: { url: "http://x:1" } };

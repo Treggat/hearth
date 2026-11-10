@@ -16,8 +16,8 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { silentLogger } from "../src/log.js";
-import { BackendPool } from "../src/pool.js";
+import { silentLogger } from "../src/observe/log.js";
+import { BackendPool } from "../src/queue/pool.js";
 import { createNode } from "../src/server.js";
 import { parseV1 } from "./v1.js";
 
@@ -490,7 +490,7 @@ side.close();
     name: "discovering",
     backends: [{ name: "a", url: only.url() }],
   }), silentLogger);
-  assert.equal(discovering.certainlyUnknown("anything"), false,
+  assert.equal(discovering.models.certainlyUnknown("anything"), false,
     "an undeclared backend could serve anything, so nothing is certain");
   only.close();
 }

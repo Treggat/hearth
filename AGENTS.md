@@ -5,38 +5,62 @@ comment is read by strangers. Write for them.
 
 ## Where things are
 
-- `src/server.ts`: every HTTP route, its auth, and the passthrough
-- `src/scheduler.ts`, `src/pool.ts`, `src/resources.ts`: admission, per-backend
-  queues, shared hardware
-- `src/route.ts`, `src/peers.ts`: local vs peer routing, peer health
-- `src/tailscale.ts`: asks the local tailscaled which tailnet machine a
-  caller is, for peers bound with `tailnet`
-- `src/actions.ts`: what a flow step can set off beside routing; one entry
-  per kind
-- `src/plugins.ts`: loading plugins and running their hooks: the kind gate,
-  timeouts, `onError` / `onFail`, the pause after repeated failures, the
-  tokens that mark a plugin's own calls as internal
-- `src/config.ts`, `src/fields.ts`, `src/configfile.ts`: parsing, the settings
-  table, live edits to hearth.yaml
-- `src/kinds.ts`: what each backend `kind` supports
-- `src/anthropic.ts`: a backend that speaks the Messages API: the request and
-  the answer rewritten each way
-- `src/messages.ts`: the `/v1/messages` door, the same rewrite the other way
-  round, for a client that speaks the Messages API
-- `src/report.ts`: `hearth report`, the one-file bug report with secrets
-  scrubbed
-- `src/updates.ts`: the daily npm check behind the console's "newer hearth"
-  notice (`updateCheck`)
+`src/` is grouped by what each part decides. A request comes in through `routes/`, `access/` says
+whether it may run, `routing/` says where, `queue/` says when, and `wire/` does the talking.
+
+- `src/server.ts`: the route table (every path, its auth), turning a credential into a caller,
+  and the HTTP server's lifecycle (request ids, cross-origin and rebinding guards, the drain)
+- `src/cli.ts`, `src/index.ts`: the `hearth` command, and the library surface
+- `src/routes/`: what each route does, one file per area; each takes the `RouteContext` in
+  `routes/context.ts` and returns its handlers
+- `src/access/`: who is calling (`callers.ts`: api keys, peer tokens, operator sessions), what
+  they are held to before they queue (`limits.ts`, `admit.ts`), the operator login
+  (`login.ts`), and the sliding-window rate limit (`window.ts`)
+- `src/routing/`: where a request goes: `route.ts` decides, from the live state in `world.ts`;
+  `actions.ts` is what a step can set off; `stats.ts` is what a model can take against what a
+  request needs; `reach.ts` is who can reach what, for the console
+- `src/queue/`: when it runs: `scheduler.ts` (admission per backend), `pool.ts` (the backends
+  and their queues, and what they can take), `models.ts` (which backend serves a model, and what it is
+  called on each side), `hardware.ts` (backends taking turns on shared hardware: evictions, residents, holds), `resources.ts` (whose turn each resource is), `backend.ts` (one backend's state),
+  `kinds.ts` (what each backend `kind` does; its names and the facts config checks are
+  `config/kinds.ts`), `keytally.ts` (a key's jobs across backends)
+- `src/peers/`: peer health and capacity (`peers.ts`), lending terms (`lending.ts`), the
+  lending/borrowing switches (`controls.ts`), and which tailnet machine a caller is
+  (`tailscale.ts`)
+- `src/wire/`: talking to backends and clients: `upstream.ts` (outbound HTTP), `http.ts`
+  (bodies, error envelopes, relaying), `anthropic.ts` (a backend that speaks the Messages
+  API), `messages.ts` (the `/v1/messages` door), `emulate.ts`, `multipart.ts`, and the
+  answer cache (`answers.ts`)
+- `src/config/`: `config.ts` (`HearthConfig`, `parseConfig`, `loadConfig`), and beside it one
+  file per section, each with its types and the code that reads them (`backends.ts`, `flows.ts`,
+  `models.ts`, `plugins.ts`, `keys.ts`, `peers.ts`, `canary.ts`, `kinds.ts`; `read.ts` is the field readers
+  and `ConfigError` they share); `fields.ts` (the settings table the parser and the console both read),
+  `configfile.ts` (live edits to hearth.yaml), `derived.ts` (a value derived from the live config, rebuilt when
+  a key it reads is replaced), `migrate.ts`, `yamlq.ts`
+- `src/plugins/`: loading plugins and running their hooks (`plugins.ts`: the kind gate,
+  timeouts, `onError` / `onFail`, the pause after repeated failures, internal tokens), and MCP
+  (`mcp.ts`: checking a served endpoint, running a server over stdin and stdout)
+- `src/observe/`: what the node records and reports: `log.ts`, `requestlog.ts`, `history.ts`,
+  `usage.ts`, `canary.ts`, `views.ts` (builds the console's data), `uidata.ts` (the shape of
+  that data: the one contract the server and the page are both compiled against), `report.ts` (`hearth report`, with
+  secrets scrubbed), `updates.ts` (the daily npm check behind "newer hearth")
+- `src/ui.ts`: serves the console's built page
+- `src/errors.ts`: every error a request can end with, and the status `refusalOf` answers it with;
+  imports nothing, so any layer can throw one
 - `src/console/`: the React status page and config editor (built to `dist/`).
-  The Lending page is `Lending.tsx`; the recent-requests rail beside the
+  The Lending page is `Lending.tsx`; the Keys page is `Keys.tsx`; the recent-requests rail beside the
   Topology map is `Rail.tsx`; the Plugins page is
   `Plugins.tsx` and its Add plugin dialog `AddPlugin.tsx` (plugin blocks on the
-  routing map are in `flowNodes.tsx`); the ASCII smoke behind the Queue, Models,
-  Keys and Lending pages, and behind the sidebar beside the maps, is
-  `Smoke.tsx`, and what the node's load does to its fire is `fire.ts`. The
-  routing map is `Routing.tsx` (layout),
-  `flowNodes.tsx` (one view per kind of node) and `draft.ts` (`NODES`: what
-  drawing a line from or onto each kind changes in the file)
+  routing map are in `flowNodes.tsx`; plugins that serve an API are boxes under
+  the router on the Topology map, in `Topology.tsx`); the Scheduler page is
+  `Scheduler.tsx` (the lane board and the inspector), the tabs under the board
+  and their inspectors are `Sections.tsx`, its logic is `knobs.ts`, and its draft of hearth.yaml, which outlives a walk to
+  another page, is `schedStore.ts`; the ASCII smoke behind the Scheduler, Models, Keys and
+  Lending pages, and behind the sidebar beside the maps, is `Smoke.tsx`, and
+  what the node's load does to its fire is `fire.ts`. The routing map is
+  `Routing.tsx` (layout), `flowNodes.tsx` (one view per kind of node) and
+  `draft.ts` (`NODES`: what drawing a line from or onto each kind changes in the
+  file)
 - `test/`: one `*.test.ts` per area; run one with `npx tsx test/<name>.test.ts`
   (`npm run build:console` first for anything that serves the page)
 
@@ -57,20 +81,20 @@ comment is read by strangers. Write for them.
 - A behaviour change comes with a test in `test/*.test.ts` that fails without it.
   New files are picked up by the glob; there is no list to edit.
 - Config fixtures in v1 shape go through `parseV1` from `test/v1.ts`.
-- A new config key is declared in `src/fields.ts`, the one table the parser and
+- A new config key is declared in `src/config/fields.ts`, the one table the parser and
   the console editor both read, or the parser rejects it. If it applies without
-  a restart, add it to `LIVE_KEYS` in `src/configfile.ts`.
+  a restart, add it to `LIVE_KEYS` in `src/config/configfile.ts`.
 - Update every doc your change makes wrong, in the same PR. Search for the
   names you touched (`grep -rn <name> README.md docs/ src/`) rather than trusting
   memory. The places that describe behaviour:
   - `docs/configuration.md`: the config table, one row per setting in
-    `src/fields.ts`
+    `src/config/fields.ts`
   - `docs/endpoints.md`: the endpoint table, one row per route in
     `src/server.ts`
   - the other pages under `docs/`, and `README.md`, which is the pitch, the
     quick start and the index to them: any section or example that shows what
     you changed
-  - `src/fields.ts`: each setting's one-line `desc`, which the console shows
+  - `src/config/fields.ts`: each setting's one-line `desc`, which the console shows
   - `src/cli.ts`: the `hearth init` starter config and the command usage lines
   - `AGENTS.md`: the file map and these rules, if you move or add files
 

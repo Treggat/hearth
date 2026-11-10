@@ -9,9 +9,9 @@
  */
 import assert from "node:assert/strict";
 
-import { parseConfig } from "../src/config.js";
-import { addPlace, applyOps, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, movedBay, movedHardware, BAYS, tidied, arranged, TEMPLATES, restOf, withDo, withRest, placedOn, withPlugin, movePlugin, wireSlot, type Doc, type Landing, type To, callerChoices, paneChoices, copiedRouter, restacked, unstacked, STACK } from "../src/console/draft.js";
-import type { UiData } from "../src/console/types.js";
+import { parseConfig } from "../src/config/config.js";
+import { peerChoices, addPlace, applyOps, dropPlace, orderOf, raisePlace, thenTry, pastedAll, put, wholes, directTo, draftView, factsOf, nodeOf, opsOf, placed, pointStep, problems, rawTo, rebase, refusal, routeId, toOf, toText, unchecked, linesRunning, removed, renamed, scoped, unscoped, followed, summary, routeTyped, withCaller, callersIn, routerFor, usersOf, spread, beside, bayRoom, added, retyped, ordered, movedName, movedBay, movedHardware, BAYS, tidied, arranged, TEMPLATES, restOf, withDo, withRest, placedOn, withPlugin, movePlugin, wireSlot, type Doc, type Landing, type To, callerChoices, paneChoices, copiedRouter, restacked, unstacked, STACK } from "../src/console/draft.js";
+import type { UiData } from "../src/observe/uidata.js";
 
 const doc = (): Doc => ({
   servers: { box: { host: "10.0.0.5" } },
@@ -100,6 +100,11 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   assert.equal(directTo("image", { inputs: ["image"], steps: [{ to: "chat", do: ["note"] }] }), null);
 
   const live = { net: { nodes: [{ name: "me", self: true, up: true, free: 1, slots: 1, queued: 0 }] }, routing: {} } as unknown as UiData;
+  // A model one backend declares is placed there, though a backend that declares nothing discovered it too.
+  const both = { ...live, net: { nodes: [{ ...live.net.nodes[0], backends: [{ name: "big", serves: ["chat", "side"] }, { name: "small", serves: ["side"] }] }] }, routing: { side: { backend: "small" } } } as unknown as UiData;
+  const placedOn = { backends: { big: { url: "http://a" }, small: { url: "http://b", serves: ["side"] } }, models: { side: {}, chat: {} } };
+  assert.equal(draftView(placedOn, both).routing?.side?.backend, "small");
+  assert.equal(draftView({ ...placedOn, backends: { big: { url: "http://a" }, small: { url: "http://b" } } }, both).routing?.side?.backend, "small");
   assert.deepEqual(draftView(acting, live).actions, { note: { kind: "log", says: "{asked} ran as {model}" }, tell: { kind: "call", says: "http://127.0.0.1:9/hook" } });
 
   // Taking an action away takes it off every line that ran it, so what is left still loads.
@@ -341,6 +346,15 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   // A model only a route names (a path with no name in it) is not chat either.
   const filmed = factsOf({ ...withFacts, backends: { ...(withFacts.backends as object), film: { url: "http://127.0.0.1:8", kind: "none", routes: [{ path: "/generate", model: "film-model", lane: "chat" }] } } }, live);
   assert.equal(filmed.kind("film-model"), "paths");
+  // A chat model on that kind of backend (one llama-swap serving image models and an LLM) is still chat when something
+  // says so; one a route names keeps its paths whatever it declares.
+  const mixed = factsOf({
+    ...withFacts,
+    backends: { ...(withFacts.backends as object), swap2: { url: "http://127.0.0.1:7", kind: "none", serves: ["pic", "talk", "talk2", "named"], routes: [{ path: "/upstream/{model}/generate", lane: "batch" }, { path: "/sing", model: "named" }] } },
+    models: { ...(withFacts.models as object), talk: { stats: { context: 81920 } }, talk2: { emulate: "llama-server" }, named: { stats: { context: 4096 } } },
+  }, live);
+  assert.deepEqual([mixed.kind("pic"), mixed.kind("talk"), mixed.kind("talk2"), mixed.kind("named")], ["paths", "chat", "chat", "paths"]);
+  assert.equal(refusal(null, to("talk"), mixed), null, "a chat line may end on the backend's chat model");
   // A rule that takes a path may end at any model here, one whose backend declares no path included, but never at a peer.
   assert.equal(refusal(null, to("paint"), facts, true), null);
   assert.equal(refusal(null, to("chat"), facts, true), null);
@@ -423,6 +437,8 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   // Ends sit level with the lines that reach them, in that order, never closer than a step; one no line reaches goes last.
   const from: Record<string, number[]> = { low: [300, 340], high: [20], mid: [40], none: [] };
   assert.deepEqual(Object.fromEntries(beside(["low", "high", "mid", "none"], (id) => from[id]!, 50)), { high: 0, mid: 50, low: 295, none: 345 });
+  // A taller end takes its own room, so the one under it keeps clear.
+  assert.deepEqual(Object.fromEntries(beside(["low", "high", "mid", "none"], (id) => from[id]!, (id) => (id === "high" ? 80 : 50))), { high: 0, mid: 80, low: 295, none: 345 });
   // A box of one caller is as wide as the card under it, its chip in the middle: cards under two such boxes side by side stay clear.
   const [chip, edge, card, gap] = [{ w: 150, h: 30, gap: 6, cols: 2 }, { head: 24, pad: 10 }, 200, 12];
   const one = bayRoom(1, chip, edge, card);
@@ -547,6 +563,15 @@ const outlet = (d: Doc, node: string, handle: string | null) => nodeOf(node).kin
   const off = withPlugin(withPlugin(wired, "r", 0, "a", false)!, "r", 0, "b", false)!;
   assert.equal(step(off).plugins, undefined, "none left takes the key away");
   assert.equal(directTo("x", { inputs: ["x"], steps: [{ to: "m", plugins: ["a"] }] }), null, "a line with plugins is drawn as a rule");
+  assert.deepEqual(placedOn({ plugins: [{ name: "a", models: { embed: "e" } }] }), [{ name: "a", models: { embed: "e" } }], "the node's own report of a line reads the same");
+}
+
+// A peer lending several models offers each of them by name, not only "whatever was asked for".
+{
+  const doc = { peers: { far: { url: "http://far", models: { chat: "their-chat", voice: "their-voice" } } } };
+  assert.deepEqual(peerChoices(doc, ""), [{ peer: "far", model: null }, { peer: "far", model: "chat" }, { peer: "far", model: "voice" }]);
+  assert.deepEqual(peerChoices(doc, "voi"), [{ peer: "far", model: "voice" }], "a search for a model finds it on its peer");
+  assert.deepEqual(rawTo({ kind: "peer", peer: "far", model: "voice" }), { peer: "far", model: "voice" }, "and the line names it");
 }
 
 console.log("draft.test.ts ok");

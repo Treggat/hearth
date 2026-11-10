@@ -1,6 +1,6 @@
 /**
  * A slice of rising smoke, lit by a fanned sheet of light and drawn in ASCII,
- * behind the Queue, Models, Keys and Lending pages. The busier the node, the
+ * behind the Scheduler, Models, Keys and Lending pages. The busier the node, the
  * thicker and quicker it rises, the warmer the coals glow under it, and the
  * more embers come off them.
  * WebGL2 in two passes: the first works out, for each character cell, how
@@ -18,7 +18,7 @@
 import { useEffect, useRef } from "react";
 import { fire, seedOf } from "./fire.js";
 import { useStore } from "./store.js";
-import type { UiData } from "./types.js";
+import type { UiData } from "../observe/uidata.js";
 
 // Least ink first. The smoke is punctuation only: anything heavier clumps into blocks where it is
 // dense and fights the page, and a dash reads as a ruled line. The fire ends in two shades, so

@@ -3,16 +3,17 @@
  * file it would write, shown as a diff with what needs a restart, and only then is it written.
  * The form knows each setting from fields.ts: its type, default and what it does.
  */
-import { ChevronDown, ChevronRight, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { ArrowRight, ChevronDown, ChevronRight, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
-import { lineDiff, opsBetween, type Op } from "./diff.js";
-import { FIELDS, fieldAt, humanMs, scopeOf, seedOf, type Field, type Ref, type Scope } from "../fields.js";
+import { keyLines, lineDiff, opsBetween, type Op } from "./diff.js";
+import { FIELDS, fieldAt, humanMs, scopeOf, seedOf, type Field, type Ref, type Scope } from "../config/fields.js";
 import { changed, choose, useEdit } from "./editStore.js";
 import { go, request, RequestError, toast, useStore } from "./store.js";
 import { Button, Card, cx, Dialog, mono, Pill, Switch } from "./ui.js";
 
-export type File = { text: string; hash: string; doc: Record<string, unknown> | null };
+import type { File } from "../observe/uidata.js";
+export type { File };
 export type Plan = { before: string; after: string; restartPending: string[]; /** Write it, under a name for the list of versions when one was typed. */ commit: (name?: string) => Promise<void>; /** Offer to name this version. */ naming?: boolean; /** What it changes, a line per thing, in the map's words. */ summary?: string[]; /** What the button that writes says. */ verb?: string; /** Things worth knowing before writing: the file loads, but may not do what was meant. */ notes?: string[] };
 export type Err = { message: string; path: string | null };
 type Path = (string | number)[];
@@ -25,7 +26,7 @@ const SECTIONS: { key: string; label: string; hint: string; list?: true }[] = [
   { key: "models", label: "Models & routes", hint: "Per-model routing, aliases, slots and parameters." },
   { key: "flows", label: "Rules", hint: "Where requests go: the types each rule takes, and its lines in order (`flows:` in the file). The Routing page draws these." },
   { key: "actions", label: "Actions", hint: "What a flow's step can set off beside routing: a log line, or a call to a URL. A step names them under `do:`." },
-  { key: "scheduler", label: "Lanes & queues", hint: "Lane priorities and ceilings, queue limits." },
+  { key: "scheduler", label: "Lanes & queues", hint: "Every scheduler setting is on the Scheduler page." },
   { key: "peers", label: "Peers", hint: "One entry per friend: how to reach them, the tokens each side presents, what you borrow." },
   { key: "lending", label: "Lending", hint: "What peers may run here, and how much of it." },
   { key: "node", label: "Node", hint: "Name, listen address, backend defaults, borrowing, keys and limits." },
@@ -43,6 +44,15 @@ export const NEW: Record<string, { noun: string; scope: Scope; keys: string[]; l
   actions: { noun: "action", scope: "action", keys: ["log", "call"] },
   "scheduler.lanes": { noun: "lane", scope: "lane", keys: ["priority"] },
 };
+
+/**
+ * What stands where a section's form would be, when that section is edited on a page of its own:
+ * the one sentence saying where it went, and the button that opens it.
+ */
+export const ELSEWHERE: Record<string, { where: string; go: () => void }> = {
+  scheduler: { where: "Lanes, order and limits now live on the Scheduler page", go: () => go("scheduler") },
+};
+const OTHER_PAGE = new Set(Object.keys(ELSEWHERE));
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const fmt = (path: Path) => path.map((p, i) => (typeof p === "number" ? `[${p}]` : i ? `.${p}` : p)).join("");
@@ -222,6 +232,8 @@ export function Value({ name, v, path, onChange, err, compact }: {
 }): ReactNode {
   const bad = err?.path === fmt(path);
   const f = fieldAt(path);
+  // A section edited on a page of its own draws no controls here, and takes nothing that changes it.
+  if (path.length === 1 && typeof path[0] === "string" && OTHER_PAGE.has(path[0])) return null;
   if (isObj(v)) return <Obj v={v} path={path} onChange={onChange} err={err} compact={compact} />;
   if (Array.isArray(v) && (v.some(isObj) || (NEW[fmt(path)]?.list && v.length === 0))) {
     const spec = NEW[fmt(path)];
@@ -628,7 +640,8 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
   const status = useStore((s) => s.data!.config);
   const pending = useEdit(changed);
   const [file, setFile] = useState<File | null>(null);
-  const [tab, setTab] = useState<string>("backends");
+  const [tab, setTab] = useState<string>(() => (useStore.getState().yamlAt ? "yaml" : "backends"));
+  const yamlBox = useRef<HTMLTextAreaElement>(null);
   const [drafts, setDrafts] = useState<Record<string, unknown>>({});
   const [renames, setRenames] = useState<Record<string, Op[]>>({});
   const [text, setText] = useState("");
@@ -648,6 +661,21 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
     }
   };
   useEffect(() => { void load(); }, []);
+  // Asked to open on a key: once the text is in, select its lines and scroll them near the top.
+  useEffect(() => {
+    const at = useStore.getState().yamlAt;
+    const box = yamlBox.current;
+    if (!at || !file || !box) return;
+    useStore.setState({ yamlAt: null });
+    const span = keyLines(box.value, at);
+    if (!span) return;
+    const lines = box.value.split("\n");
+    const start = lines.slice(0, span.from).reduce((n, l) => n + l.length + 1, 0);
+    const end = start + lines.slice(span.from, span.to + 1).join("\n").length;
+    box.focus({ preventScroll: true });
+    box.setSelectionRange(start, end);
+    box.scrollTop = Math.max(0, span.from * parseFloat(getComputedStyle(box).lineHeight) - 40);
+  }, [file, tab]);
   const dirty = Object.keys(drafts).length > 0 || (file !== null && text !== file.text);
   // An edit made elsewhere moves the hash; follow it unless there is unsaved work here.
   useEffect(() => { if (file && status.hash !== file.hash && !dirty) void load(); }, [status.hash]);
@@ -736,7 +764,7 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
               </div>
               <div className="ml-auto flex gap-2">
                 {versions}
-                {sec ? (
+                {sec && ELSEWHERE[tab] ? null : sec ? (
                   <>
                     <Button disabled={!(tab in drafts)} onClick={() => { const { [tab]: _, ...rest } = drafts; setDrafts(rest); const { [tab]: _r, ...rn } = renames; setRenames(rn); setErr(null); }}><RotateCcw size={13} />revert</Button>
                     <Button tone="primary" disabled={!(tab in drafts)} onClick={() => saveSection(tab)}><Save size={13} />review & save</Button>
@@ -750,7 +778,15 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
               </div>
             </div>
             {err && !inline && <div className="border-b border-line bg-bad/10 px-4 py-2 text-bad">{err.message}</div>}
-            {sec ? (
+            {sec && ELSEWHERE[tab] ? (
+              <div className="flex min-h-0 flex-1 items-center justify-center p-4">
+                <div className="flex max-w-md flex-col items-center gap-3 text-center">
+                  <div className="font-medium">{ELSEWHERE[tab]!.where}</div>
+                  <div className="text-[12px] leading-5 text-dim">These settings belong to the work the node is holding, so they are edited beside the jobs they change. Every change there is reviewed like any other, and says whether it applies at once.</div>
+                  <Button tone="primary" onClick={ELSEWHERE[tab]!.go}>open Scheduler<ArrowRight size={13} /></Button>
+                </div>
+              </div>
+            ) : sec ? (
               <div className="min-h-0 flex-1 overflow-auto p-4">
                 <Refs.Provider value={refsOf(merged, catalog)}>
                 <Renamer.Provider value={(path, to) => setRenames((r) => ({ ...r, [tab]: [...(r[tab] ?? []), { path, rename: to }] }))}>
@@ -764,7 +800,7 @@ export function Config({ versions }: { versions?: ReactNode } = {}) {
                 </Refs.Provider>
               </div>
             ) : (
-              <textarea spellCheck={false} value={text} onChange={(e) => setText(e.target.value)}
+              <textarea ref={yamlBox} spellCheck={false} value={text} onChange={(e) => setText(e.target.value)}
                         onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); if (text !== file.text) void review({ text }); } }}
                         className="min-h-0 flex-1 resize-none bg-transparent p-4 font-mono text-[12px] leading-5 outline-none" />
             )}
