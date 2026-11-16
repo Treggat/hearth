@@ -121,7 +121,8 @@ export class Limits {
     for (const [model, row] of Object.entries(this.usage.byModel(caller, days))) {
       const p = this.cfg.models[model]?.price;
       const cached = Math.min(row.cached ?? 0, row.in);
-      if (p) cost += ((row.in - cached) * p.in + cached * (p.cached ?? p.in) + row.out * p.out) / 1_000_000;
+      const written = Math.min(row.written ?? 0, row.in - cached);
+      if (p) cost += ((row.in - cached - written) * p.in + cached * (p.cached ?? p.in) + written * (p.cacheWrite ?? p.in) + row.out * p.out) / 1_000_000;
     }
     return { ...this.usage.total(caller, days), cost };
   }
@@ -136,6 +137,20 @@ export class Limits {
   capOf(caller: string, model: string): number | undefined {
     const r = this.callers.ruleOf(caller);
     return r !== null && (r.maxConcurrent > 0 || r.models[model]?.maxConcurrent !== undefined) ? undefined : callerCap(null, this.cfg);
+  }
+
+  /** Is this key running as many jobs as it may, here and on peers together? */
+  keyAtLimit(caller: string): boolean {
+    const total = this.callers.ruleOf(caller)?.maxConcurrent ?? 0;
+    return total > 0 && this.pool.tally.full(caller, "", { total, model: 0 });
+  }
+
+  /** The cap on a local caller's peer work: off-box work cannot wait, so a key's own limit refuses there, else the node's cap does. */
+  peerCapOf(caller: string, model: string): { maxPerCaller?: number; maxPerModel?: number } {
+    const r = this.callers.ruleOf(caller);
+    const total = r?.maxConcurrent ?? 0;
+    const one = r?.models[model]?.maxConcurrent ?? 0;
+    return { maxPerCaller: total > 0 ? total : callerCap(null, this.cfg), ...(one > 0 ? { maxPerModel: one } : {}) };
   }
 
   /**

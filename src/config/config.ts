@@ -38,6 +38,8 @@ export interface HearthConfig {
   callers: Record<string, string>;
   /** Plugins by name, in the order they run within a stage. */
   plugins: Record<string, PluginDecl>;
+  /** How many plugins in a row a request may reach before it is refused `508 Loop Detected`. */
+  pluginsMaxHops: number;
   /** Whether a chat answer carries `x-hearth-model`, the id it ran as. */
   modelHeader: boolean;
   /** Ask the npm registry once a day whether a newer hearth is out, for the console to say so. */
@@ -604,7 +606,8 @@ export function parseConfig(raw: unknown): HearthConfig {
   const actions = actionDecls(root.actions);
   // A removed key is refused, not ignored: ignoring it would close the page's port with no word why.
   const plugins = pluginDecls(root.plugins);
-  const routers = routerDecls(root.routers, (raw) => flowDecls(raw, lanes, peers, actions, backends.flatMap((b) => b.routes.map((r) => r.path)), plugins), plugins);
+  const paths = backends.flatMap((b) => b.routes.map((r) => r.path));
+  const routers = routerDecls(root.routers, (raw) => flowDecls(raw, lanes, peers, actions, paths, plugins), plugins);
   return {
     name: str(root.name, "name", "hearth"),
     // Set by loadConfig, which is the only caller that knows one.
@@ -613,8 +616,9 @@ export function parseConfig(raw: unknown): HearthConfig {
     historyFile: str(root.historyFile, "historyFile", "") || null,
     layout: layoutDecl(root.layout),
     modelHeader: bool(root.modelHeader, "modelHeader", true),
+    pluginsMaxHops: count(root.pluginsMaxHops, "pluginsMaxHops", 3, 1),
     updateCheck: bool(root.updateCheck, "updateCheck", true),
-    flows: flowDecls(root.flows, lanes, peers, actions, backends.flatMap((b) => b.routes.map((r) => r.path)), plugins),
+    flows: flowDecls(root.flows, lanes, peers, actions, paths, plugins),
     routers,
     callers: callerDecls(root.callers, routers),
     plugins,

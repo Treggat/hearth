@@ -82,7 +82,7 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `models.<id>.pool` | unset | token budget shared by this model's running turns: `tokens`, and `output` to cap what each turn reserves. See [One backend, models with different ceilings](backends.md#one-backend-models-with-different-ceilings) |
 | `models.<id>.stats` | unset | what the model takes, for one that hasn't loaded or a backend that can't say: `context`, `vision`, `tools`, `thinking`, `effort`, `quant`. See [Knowing what a borrowed model can take](sharing.md#knowing-what-a-borrowed-model-can-take) |
 | `models.<id>.shareAfterMs` | unset | a turn joins this model's running turns only once each has run this long, so two turns started together do not both pay for sharing the card. Only matters where `concurrency` is above 1 |
-| `models.<id>.price` | unset | `{ in, out, cached? }`: what a million tokens sent to it and answered by it cost, in dollars; `cached` is the price of input the provider read from its prompt cache, where it reports that, and is `in` when unset. Usage is then shown as spend on the Keys page, `/usage` lists the prices, and a key's `limits.dollarsPerDay` counts it. Spend is worked out from the token counts at the price set now |
+| `models.<id>.price` | unset | `{ in, out, cached?, cacheWrite? }`: what a million tokens sent to it and answered by it cost, in dollars; `cached` is the price of input the provider read from its prompt cache, and `cacheWrite` of input it wrote to it, where it reports that; each is `in` when unset. Usage is then shown as spend on the Keys page, `/usage` lists the prices, and a key's `limits.dollarsPerDay` counts it. Spend is worked out from the token counts at the price set now |
 | `models.<id>.cacheMs` | `0` | keep an answer this long and give it to an identical request without running it. Identical means the same model and every request field the same. Shared by every caller, held in memory, and lost on restart. 0 keeps none. See [Keeping answers](models.md#keeping-answers) |
 | `models.<id>.videoTokens` | `49152` | what one video costs this model when checking a request fits its context window. Size it from the seat: frames sampled per clip × tokens per frame |
 | `peers.<name>` | — | one entry per friend: `url` and `token` to borrow from them, `accept` to lend to them, or both |
@@ -106,13 +106,13 @@ which rewrites it in place, comments kept, with the original saved beside it.
 | `operator` | unset | the console login, `{user, passHash}`. Written by the console's first-run setup or `hearth set-operator`; applies live; see [The console](console.md#the-console) |
 | `maxBodyBytes` | `33554432` | largest accepted request body |
 | `shutdownGraceMs` | `30000` | how long a shutdown waits for requests already in flight. `0` destroys them |
-| `routers.<name>` | none | A rulebook besides `flows:`: `flows` in the same shape, `plugins` to turn an `everyLine` plugin `off` or give a plugin its own `config`, and `strict: true` so a request runs on the model its line names or fails. See [Routers](routing.md#routers). |
-| `plugins.<name>` | none | Code (`trust: code`, `use: file:` or `npm:<pkg>@<exact version>`) or a service (`trust: http`, `use:` its URL) that reads or changes chat requests on their way to a model, and reads the finished exchange. It runs where a flow step places it, or on every request with `everyLine: true`. A service may also `serves` its own API (its URL), answered at `/plugins/<name>/*`, and then needs no `use`; see [A plugin that serves an API](plugins.md#a-plugin-that-serves-an-api). `mcp` says that API speaks MCP (`true`, or its path); `run` (`command`, `args`, `env`, `cwd`, with `trust: code`) has hearth start an MCP server itself; see [A plugin that speaks MCP](plugins.md#a-plugin-that-speaks-mcp). Also `models` (its model slots, wired), `integrity`, `key` (for a service: sent as a bearer token, `env:NAME`), `headers` (for a service: sent on every call beside or instead of `key`, for one that takes its key in a header of its own; a value may be `env:NAME`), `fallback` (another plugin that serves the same API and answers when this one cannot; see [A fallback](plugins.md#a-fallback)), `kinds`, `when`, `timeoutMs`, `onError` (`skip`, `refuse`), `onFail` (`refuse`, `flag`), `locked`, `required`, `reads`, `config`. Loaded at startup; `hearth serve --no-plugins` starts with none. See [Plugins](plugins.md). |
+| `routers.<name>` | none | A rulebook besides `flows:`: `flows` in the same shape, `plugins` to turn an `everyLine` plugin `off` or give a plugin its own `config`, and `strict: true` so a request runs on the model or plugin its line names or fails. See [Routers](routing.md#routers). |
+| `plugins.<name>` | none | Code (`trust: code`, `use: file:` or `npm:<pkg>@<exact version>`) or a service (`trust: http`, `use:` its URL) that reads or changes chat requests on their way to a model, and reads the finished exchange. It runs where a flow step places it, or on every request with `everyLine: true`. A service may also `serves` its own API (its URL), answered at `/plugins/<name>/*`, and then needs no `use`; see [A plugin that serves an API](plugins.md#a-plugin-that-serves-an-api). `mcp` says that API speaks MCP (`true`, or its path); `run` (`command`, `args`, `env`, `cwd`, with `trust: code`) has hearth start an MCP server itself; see [A plugin that speaks MCP](plugins.md#a-plugin-that-speaks-mcp). Also `models` (its model slots, wired), `integrity`, `key` (for a service: sent as a bearer token, `env:NAME`), `headers` (for a service: sent on every call beside or instead of `key`, for one that takes its key in a header of its own; a value may be `env:NAME`), `fallback` (another plugin of the same API that answers when this one cannot, one hop; see [A fallback](plugins.md#a-fallback)), `kinds`, `when`, `timeoutMs`, `onError` (`skip`, `refuse`), `onFail` (`refuse`, `flag`), `locked`, `required`, `reads`, `config`. A `trust: code` plugin whose `setup` returns `{ adapt }` is an adapter a flow line names with `adapt:` (see [Adapter plugins](plugins.md#adapter-plugins)). Loaded at startup; `hearth serve --no-plugins` starts with none. See [Plugins](plugins.md). |
 | `callers.<who>` | none | Which rulebook a caller goes by: an api key's label, `local`, or `*` for everyone else, each to a name under `routers:` or `default`. |
 | `layout.<node>` | none | `{ x, y }`: where the console's topology draws a node you placed. Written by [its editor](console.md#editing-on-the-graph); nodes without one are laid out. An order you put things in (the Router's types, the topology's boxes of callers) is kept here too, as a rank in `y` |
 | `modelHeader` | `true` | send `x-hearth-model` on every chat answer: the id the request ran as. See [Flows](routing.md#flows) |
 | `updateCheck` | `true` | ask the npm registry once a day, and when `hearth serve` starts, whether a newer hearth is out; the console says so and the log has an `update.available` line. The request names the package and nothing else. Applies live |
-| `historyFile` | unset | a file that keeps the console's day of history, its recent log lines and the month of usage per caller across restarts, written every minute and at shutdown. Unset keeps them in memory. A file written by a later hearth is set aside as `<file>.v<n>` and a fresh one started |
+| `historyFile` | unset | a file that keeps the console's day of history, its recent log lines and request records, and the month of usage per caller across restarts, written every minute and at shutdown. Unset keeps them in memory. A file written by a later hearth is set aside as `<file>.v<n>` and a fresh one started |
 | `tailscaleSocket` | `/var/run/tailscale/tailscaled.sock` | where this machine's tailscaled local API answers. Read only to check a peer that sets `tailnet` |
 | `stateFile` | unset | a console sidecar from an earlier version. If it exists at startup its contents are written into the config and it is renamed `.migrated` |
 
@@ -176,8 +176,8 @@ apiKeys:
 ```
 
 `limits.maxConcurrent` is how many jobs a key may run at once over every model
-and backend. It is the one limit that does not refuse: more wait in line, and
-other callers pass them. `limits.models` gives a model its own `maxConcurrent`,
+and backend, work sent to a peer included. It is the one limit that does not
+refuse: more wait in line here, never on a peer, and other callers pass them. `limits.models` gives a model its own `maxConcurrent`,
 `tokensPerDay` and `requestsPerMinute`, beside the key's. A model is named by
 the id its job runs as, not the type asked for, and an id no longer reached does
 nothing. `lane` queues the key's chat requests in that lane, over the lane a
@@ -187,8 +187,8 @@ holds its chat work.
 
 These hold what a key asks for through `/v1`, for clients that behave. They are
 not a security boundary: a key with no `models` list is a full local caller, and
-can reach the rest of the node, `/upstream/<model>` included, past its router
-and limits. A key that must be kept to a list needs `models`.
+can reach the rest of the node, `/upstream/<model>` included, past its router;
+a request there that names a model is still held to the key's limits. A key that must be kept to a list needs `models`.
 
 ```yaml
 apiKeys:

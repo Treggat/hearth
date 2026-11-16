@@ -614,7 +614,8 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
     y += HEAD + PAD + away.length * H + (away.length - 1) * GAP + 24;
   }
   const mid = Math.max(y - 24, H) / 2;
-  const local = d.q.jobs.filter((j) => j.state === "running").map((j) => j.id);
+  // A plugin's requests pass through here as a model's do.
+  const local = [...d.q.jobs.filter((j) => j.state === "running").map((j) => j.id), ...(d.plugins?.plugins ?? []).flatMap((p) => p.live.map((j) => j.id))];
   if (who) {
     // Drawn only: nothing in the file is it.
     nodes.push({
@@ -680,8 +681,13 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
   if (who) {
     // A request from someone not drawn (a key with no label) is one of everyone else's.
     const named = who.callers.map((c) => c.name);
-    const mine = (c: string) => d.q.jobs.filter((j) => j.state === "running" && !j.offbox
-      && (c === EVERYONE ? !named.includes(j.caller) && !named.includes(j.caller.replace(/^key:/, "")) : j.caller === c || j.caller === `key:${c}`)).map((j) => j.id);
+    // A plugin's requests leave their caller and go by its router too, so their dots run the whole way.
+    const asked = [
+      ...d.q.jobs.filter((j) => j.state === "running" && !j.offbox),
+      ...(d.plugins?.plugins ?? []).flatMap((p) => p.live),
+    ];
+    const mine = (c: string) => asked.filter((j) =>
+      c === EVERYONE ? !named.includes(j.caller) && !named.includes(j.caller.replace(/^key:/, "")) : j.caller === c || j.caller === `key:${c}`).map((j) => j.id);
     // One nobody uses yet waits to the left of the frame.
     let spare = 0;
     for (const name of [null, ...ranks]) {
@@ -781,7 +787,7 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
       data: { title: "Plugins", sub: "", icon: <Plug size={13} className="text-dim" /> } satisfies Machine,
     });
     groups.forEach((g, gi) => {
-      const jobs = g.items.flatMap((p) => p.live);
+      const jobs = g.items.flatMap((p) => p.live.map((j) => j.id));
       const down = g.items.every((p) => p.state !== "running" || p.paused);
       nodes.push({
         id: g.id, type: "hardware", parentId: "plugins", extent: "parent", position: { x: FRAME.pad + gi * (wide + FRAME.gap), y: FRAME.head }, style: { width: wide, height: tallOf(g.items.length) },
@@ -793,13 +799,15 @@ function layout(d: UiData, sel: { kind: string; id: string } | null, who: Who = 
         const at = `/plugins/${p.name}${p.mcp ? p.mcp.path : "/"}`;
         const mcp = p.mcp;
         const said = mcp?.error ? (mcp.error === "starting" || mcp.error === "checking" ? mcp.error : "not answering") : mcp?.tools != null ? `${mcp.tools} tools` : null;
+        // Lit while it answers, as a backend is while it runs.
+        const busy = !out && p.live.length > 0;
         // The last row fills from the right, under the hub, as the first rows do.
         const row = Math.floor(n / cols);
         const col = cols - 1 - (n % cols);
         nodes.push({
           id: `service:${p.name}`, type: "card", parentId: g.id, extent: "parent", position: { x: PAD + col * (W + GAP), y: HEAD + row * (H + GAP) },
           data: {
-            title: p.name, icon: <Plug size={14} />, tone: out ? "bad" : p.paused ? "warn" : mcp?.error && said === "not answering" ? "warn" : "ok",
+            title: p.name, icon: <Plug size={14} />, tone: out ? "bad" : busy ? "accent" : p.paused ? "warn" : mcp?.error && said === "not answering" ? "warn" : "ok", busy,
             sub: out ? (p.error ?? "did not start") : p.paused ? "paused" : [at, said, p.served.calls ? `${p.served.calls} served${p.served.errors ? `, ${p.served.errors} failed` : ""}` : null].filter(Boolean).join(" · "),
             tip: `${at} goes to ${p.run ?? p.serves}.${mcp?.error && said === "not answering" ? ` Its MCP server: ${mcp.error}.` : ""}${p.fallback ? ` When it cannot answer, ${p.fallback.plugin} does.` : ""} Click to open it on the Plugins page.`,
           } satisfies Card,
@@ -826,8 +834,8 @@ export const held = (fresh: Node[], now: Node[], dragging: string | null): Node[
 
 /** Arrive fitted, and never drawn too small to read: a big picture is panned across, not squinted at. `top` is what a strip over the picture covers. */
 export function arrive(rf: ReactFlowInstance, top = 84): void {
-  setTimeout(() => {
-    void rf.fitView({ padding: 0.06, minZoom: 0.7, maxZoom: 1 });
+  setTimeout(async () => {
+    await rf.fitView({ padding: 0.06, minZoom: 0.7, maxZoom: 1 });
     // A picture too big to fit starts from its top left, clear of the strip above it, not from its middle.
     const box = rf.getNodesBounds(rf.getNodes());
     const v = rf.getViewport();
@@ -908,9 +916,9 @@ export function Topology() {
         <Plus size={12} />provider
       </button>
       <VersionsButton />
-      {/* The hint gives way to whatever the strip has to say, so it stays one row. */}
-      {!isDirty && waiting.length === 0 && <span className="truncate text-[11px] text-dim max-xl:hidden">Click anything for its settings. Drag a backend onto hardware or to another place in it, hardware onto a machine, or a caller onto a router.</span>}
-      <div className="ml-auto flex items-center gap-2">
+      {/* The hint gives way to whatever the strip has to say, and takes only the room the buttons leave, so it never wraps them. */}
+      {!isDirty && waiting.length === 0 && <span className="min-w-0 flex-1 truncate text-[11px] text-dim max-xl:hidden">Click anything for its settings. Drag a backend onto hardware or to another place in it, hardware onto a machine, or a caller onto a router.</span>}
+      <div className="ml-auto flex flex-wrap items-center gap-2">
         {/* What is published but not running yet stays said until the restart that applies it. */}
         {waiting.length > 0 && !isDirty && (
           <span className="flex items-center gap-2 text-[12px] text-warn">published, not running yet: restart to apply {waiting.join(", ")}

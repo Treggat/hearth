@@ -1,12 +1,13 @@
 /** The pages beside the topology, and the inspector sheet that opens over it. */
-import { ChevronRight, Trash2, X } from "lucide-react";
+import { ChevronRight, Link2, Trash2, X } from "lucide-react";
 import { Fragment, useEffect, useState } from "react";
 
 import type { UiData, Used } from "../observe/uidata.js";
+import { short } from "./count.js";
 import { Refs, refsOf, Value } from "./config.js";
 import { draftView, isObj, obj, put } from "./draft.js";
 import { change, useEdit } from "./editStore.js";
-import { control, doneWithKey, evict, go, select, useStore, warm } from "./store.js";
+import { control, copyLink, doneWithKey, evict, go, select, useLink, useStore, warm, type Sel } from "./store.js";
 import { ago, Button, Card, cx, Dialog, Empty, mono, Pill, Switch, type Tone } from "./ui.js";
 
 const selfOf = (d: UiData) => d.net.nodes.find((n) => n.self)!;
@@ -70,6 +71,19 @@ export function Inspector() {
   const draft = useEdit((s) => s.draft);
   const err = useEdit((s) => s.err);
   const editable = draft !== null;
+  const settled = useEdit((s) => s.draft !== null || s.unread !== null);
+  // `self`, or `<kind>:<name>`; something only in the draft can be linked once the draft is read.
+  useLink(sel ? [sel.kind === "self" ? "self" : `${sel.kind}:${sel.id}`] : [], settled, ([at = ""]) => {
+    const [kind = "", ...rest] = at.split(":");
+    const id = rest.join(":");
+    const d = draft ? draftView(draft, live) : live;
+    const backends = selfOf(d).backends ?? [];
+    const found: Record<string, boolean> = {
+      self: id === "", peer: d.net.nodes.some((n) => !n.self && n.name === id), backend: backends.some((b) => b.name === id),
+      resource: (d.net.resources ?? []).some((r) => r.name === id), machine: id !== "" && (id in obj(draft?.servers) || backends.some((b) => b.server === id)),
+    };
+    select(found[kind] === true ? { kind: kind as NonNullable<Sel>["kind"], id: kind === "self" ? selfOf(d).name : id } : null);
+  });
   if (!sel) return null;
   // What is drawn is the draft where there is one, so something added or moved can be opened before it is published.
   const d = draft ? draftView(draft, live) : live;
@@ -160,10 +174,10 @@ export function Inspector() {
   }
 
   return (
-    <aside className={cx("shrink-0 overflow-auto border-l border-line bg-panel p-4 max-md:absolute max-md:inset-y-0 max-md:right-0 max-md:z-10", isObj(entry) ? "w-[440px]" : "w-[340px]")}>
+    <aside className={cx("shrink-0 overflow-auto border-l border-line bg-panel p-4 max-xl:absolute max-xl:inset-y-0 max-xl:right-0 max-xl:z-10 max-xl:max-w-full max-xl:shadow-xl", isObj(entry) ? "w-[440px]" : "w-[340px]")}>
       <div className="mb-2 flex items-center">
         <div>
-          <div className="text-[11px] uppercase tracking-wide text-dim">{sel.kind === "self" ? "this node" : sel.kind === "resource" ? "hardware" : sel.kind}</div>
+          <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-dim">{sel.kind === "self" ? "this node" : sel.kind === "resource" ? "hardware" : sel.kind}{navigator.clipboard && <button className="hover:text-fg" aria-label="copy a link to this" title="copy a link to this" onClick={copyLink}><Link2 size={12} /></button>}</div>
           <div className="text-base font-semibold">{title}</div>
         </div>
         {/* What it is doing is here; what it is set to is the same node's settings. */}
@@ -228,11 +242,11 @@ export function Models() {
   const state = (m: string): [Tone, string] =>
     types.has(m) ? ["accent", "type"] : hosted.has(m) ? ["dim", "hosted"]
     : d.net.readyNow.includes(m) ? ["ok", "warm"] : (d.net.unknownWarm ?? []).includes(m) ? ["dim", "unknown"] : ["info", "cold"];
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string[]>([]);
   const act = (k: string, fn: () => Promise<void>): void => {
-    if (busy !== null) return;
-    setBusy(k);
-    void fn().finally(() => setBusy(null));
+    if (busy.includes(k)) return;
+    setBusy((b) => [...b, k]);
+    void fn().finally(() => setBusy((b) => b.filter((x) => x !== k)));
   };
   return (
     <Card className="overflow-hidden">
@@ -253,26 +267,27 @@ export function Models() {
             const [tone, word] = state(m);
             const stats = self.stats?.[m];
             const lent = d.configuredShare.includes(m);
+            const doing = busy.includes(`warm:${m}`) ? "warming…" : busy.includes(`evict:${m}`) ? "evicting…" : null;
             return (
               <tr key={m} className="border-b border-line/60 last:border-0 hover:bg-muted/40">
                 <td className={cx("px-4 py-2", mono)}>{m}</td>
                 <td className="px-2 py-2"><Pill tone={tone}>{word}</Pill></td>
                 <td className="px-2 py-2">
                   {local.has(m) && !types.has(m) && !hosted.has(m) ? (
-                    <button disabled={busy !== null}
+                    <button disabled={doing !== null}
                             onClick={() => {
                               if (word === "warm" && !confirm(`Evict ${m}? It leaves the card and the next request for it pays the reload.`)) return;
                               act(word === "warm" ? `evict:${m}` : `warm:${m}`, word === "warm" ? () => evict(m) : () => warm(m));
                             }}
                             className={cx("h-6 rounded-md border border-line px-2 text-[12px] hover:bg-muted hover:text-fg disabled:opacity-40", word === "warm" ? "text-dim" : "text-accent")}>
-                      {word === "warm" ? "evict" : "warm"}
+                      {doing ?? (word === "warm" ? "evict" : "warm")}
                     </button>
                   ) : <span className="text-dim">—</span>}
                 </td>
                 <td className="px-2 py-2 text-dim">{types.has(m) ? "a routing rule" : where(m).join(", ")}</td>
                 <td className="tabular px-2 py-2 text-dim">{stats?.context ? `${Math.round(stats.context / 1024)}k` : "—"}</td>
                 <td className="px-2 py-2">
-                  {local.has(m) && !hosted.has(m)
+                  {local.has(m) && !types.has(m) && !hosted.has(m)
                     ? <span className="flex items-center gap-2">
                         <Switch label={`lend ${m}`} on={lent} onChange={(on) => void control({ share: { [m]: on } }, on ? `lending ${m}` : `holding ${m}`)} />
                         {lentOnlyTo(d, m).length > 0 && <span className="text-[12px] text-dim" title="lent by that peer's own list, on the Lending page">to {lentOnlyTo(d, m).join(", ")}</span>}
@@ -302,8 +317,7 @@ export function Models() {
 const lentOnlyTo = (d: UiData, model: string): string[] =>
   d.configuredShare.includes(model) ? [] : (d.ledger ?? []).filter((l) => l.own?.includes("models") && !l.terms?.off && l.terms?.models.includes(model)).map((l) => l.peer);
 
-/** A count as a person reads it: 950, 12.4k, 3.1M. */
-export const short = (n: number): string => (n < 1000 ? String(n) : n < 1_000_000 ? `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k` : `${(n / 1_000_000).toFixed(1)}M`);
+export { short };
 
 /** Dollars as a person reads them: cents for small sums, whole dollars for large ones. */
 export const money = (n: number): string => `$${n < 10 ? n.toFixed(2) : n < 1000 ? n.toFixed(0) : short(Math.round(n))}`;
@@ -312,7 +326,7 @@ export const money = (n: number): string => `$${n < 10 ? n.toFixed(2) : n < 1000
 export function UsedCell({ used }: { used?: Used }) {
   if (!used || used.requests === 0) return <span className="text-dim">—</span>;
   return (
-    <span title={`${used.requests} requests, ${used.failed} failed · ${used.in} tokens in${used.cached ? ` (${used.cached} read from cache)` : ""}, ${used.out} out`}>
+    <span title={`${used.requests} requests, ${used.failed} failed · ${used.in} tokens in${used.cached ? ` (${used.cached} read from cache)` : ""}${used.written ? ` (${used.written} written to cache)` : ""}, ${used.out} out`}>
       {short(used.requests)} <span className="text-dim">req ·</span> {short(used.in)} <span className="text-dim">in /</span> {short(used.out)} <span className="text-dim">out</span>
       {(used.cost ?? 0) > 0 && <span title="at the prices the models carry now"> <span className="text-dim">·</span> {money(used.cost!)}</span>}
       {used.failed > 0 && <span className="text-bad"> · {short(used.failed)} failed</span>}
